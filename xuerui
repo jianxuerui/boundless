@@ -2,12 +2,13 @@
 
 # 脚本名称：MyAwesomeScript - 通用管理模板
 # 作者：你的名字/你的推特账号
-# 版本：1.0
+# 版本：2.0 - 引入混沌模式
 # 描述：这是一个多功能 Bash 脚本模板，用于展示脚本的结构和交互模式。
-#      你可以基于此模板创建你自己的个性化管理脚本，例如管理自定义服务、
-#      运行定期任务、或者作为某个应用程序的启动/停止/更新器。
+#      本次更新加入一个“混沌模式”，用于模拟系统资源争夺、自我强化和类学习行为。
+#      极具实验性质，请务必在安全的测试环境中使用！
 
 # 设置脚本在遇到错误时退出
+# 注意：在“混沌模式”中，一些错误（如stress-ng进程被杀死）可能被预期或处理，不会直接退出整个脚本
 set -e
 
 # =========================================================================
@@ -16,7 +17,6 @@ set -e
 # 你的应用程序或任务的主目录
 MY_APP_DIR="$HOME/my_awesome_app"
 # 应用程序或任务的主要执行文件（例如：一个可执行文件或另一个脚本）
-# 如果你的程序在 MY_APP_DIR 内部有复杂启动逻辑，这里可以留空或指向 start.sh
 MY_APP_EXEC_PATH="$MY_APP_DIR/run_app.sh"
 # 后台进程的 PID 文件，用于管理周期性任务
 PERIODIC_TASK_PID_FILE="/tmp/my_awesome_script_periodic.pid"
@@ -27,6 +27,18 @@ SCREEN_SESSION_NAME="my_awesome_session"
 # 你的应用程序可能用到的额外数据目录（例如：配置、日志、数据）
 MY_APP_DATA_DIR="$MY_APP_DIR/data"
 MY_APP_CONFIG_FILE="$MY_APP_DIR/config.conf"
+
+# === 混沌模式常量 ===
+CHAOS_MODE_PID_FILE="/tmp/my_awesome_script_chaos.pid"
+CHAOS_POWER_FILE="$HOME/.my_awesome_script_chaos_power" # 存储混沌模式的力量值
+INITIAL_POWER=1
+MAX_POWER=20           # 混沌模式的最大力量值
+REGEN_RATE=0.5         # 每次迭代力量增长速度 (0-1)
+DEGEN_RATE=0.1         # 每次失败力量衰减速度 (0-1)
+BASE_INTERVAL=10       # 混沌模式基本检查间隔秒数
+MIN_INTERVAL=3         # 最小间隔，避免过于频繁
+MAX_CHAOS_AGENTS=5     # 最大并发混沌代理（模拟分化）
+STRESS_TEST_DURATION=10 # 单次stress-ng测试时长（秒）
 
 # =========================================================================
 # 颜色定义 - 用于在终端输出中增加可读性
@@ -54,6 +66,17 @@ pause_and_return() {
     read -r
 }
 
+# 辅助函数：检查 stress-ng 是否安装
+check_stress_ng() {
+    if ! command -v stress-ng &> /dev/null; then
+        log_message "${RED}警告：stress-ng 命令未安装！${NC}"
+        log_message "${YELLOW}混沌模式功能将受限，或回退到效率较低的纯 Bash 资源消耗。${NC}"
+        log_message "${CYAN}建议安装：sudo apt install stress-ng 或 sudo yum install stress-ng${NC}"
+        return 1
+    fi
+    return 0
+}
+
 # 辅助函数：启动你的应用程序在一个新的 screen 会话中
 start_app_in_screen() {
     log_message "${YELLOW}正在尝试启动应用程序 '$SCREEN_SESSION_NAME' 会话...${NC}"
@@ -62,9 +85,6 @@ start_app_in_screen() {
         log_message "${RED}错误：无法找到应用程序目录 ($MY_APP_DIR)。请确保已执行选项 1 初始化。${NC}"
         return 1
     fi
-
-    # 切换到应用程序目录 (如果你的执行脚本需要上下文路径)
-    # cd "$MY_APP_DIR" || { log_message "${RED}错误：无法切换到 $MY_APP_DIR 目录。${NC}"; return 1; }
 
     # 终止现有的 screen 会话（如果存在）
     if screen -list | grep -q "$SCREEN_SESSION_NAME"; then
@@ -159,7 +179,8 @@ view_logs() {
     log_message "${YELLOW}=== 查看日志文件 ===${NC}"
     echo -e "${GREEN}1. 查看脚本自身管理日志 ($SCRIPT_LOG_FILE)${NC}"
     echo -e "${GREEN}2. 进入应用程序 Screen 会话 ($SCREEN_SESSION_NAME) 查看实时输出${NC}"
-    echo -e "${YELLOW}请输入您的选择（1-2）：${NC}"
+    echo -e "${GREEN}3. 查看应用程序日志 ($MY_APP_DIR/app.log)${NC}"
+    echo -e "${YELLOW}请输入您的选择（1-3）：${NC}"
     read -r log_choice
 
     case $log_choice in
@@ -180,6 +201,15 @@ view_logs() {
             else
                 log_message "${RED}错误：未找到名为 '$SCREEN_SESSION_NAME' 的 screen 会话。${NC}"
                 log_message "${YELLOW}请确保已通过选项 1 或 3 启动应用程序。${NC}"
+            fi
+            ;;
+        3)
+            if [ -f "$MY_APP_DIR/app.log" ]; then
+                log_message "${CYAN}正在显示应用程序日志 ($MY_APP_DIR/app.log)，按 Ctrl+C 停止。${NC}"
+                tail -f "$MY_APP_DIR/app.log"
+            else
+                log_message "${RED}错误：应用程序日志文件 ($MY_APP_DIR/app.log) 不存在。${NC}"
+                log_message "${YELLOW}请确保应用程序已启动并产生日志。${NC}"
             fi
             ;;
         *)
@@ -270,6 +300,8 @@ update_my_app() {
 
     # 禁用周期性任务，防止更新时其启动旧版本
     disable_periodic_task
+    # 禁用混沌模式（如果开启）
+    disable_chaos_mode # 更新时不希望它还在压榨系统
 
     # 停止 screen 会话
     if screen -list | grep -q "$SCREEN_SESSION_NAME"; then
@@ -307,12 +339,14 @@ update_my_app() {
 
 # 功能：卸载并清理你的应用程序/服务
 uninstall_my_app() {
-    echo -e "${RED}警告：此操作将终止 '$SCREEN_SESSION_NAME' screen 会话，删除所有周期性任务，并删除 $MY_APP_DIR 目录下的所有文件！${NC}"
+    echo -e "${RED}警告：此操作将终止 '$SCREEN_SESSION_NAME' screen 会话，删除所有周期性任务，${NC}"
+    echo -e "${RED}并停止混沌模式（如果运行），最后删除 $MY_APP_DIR 目录下的所有文件！${NC}"
     echo -e "${YELLOW}这是${RED}不可逆${YELLOW}的操作。请务必确认！${NC}"
     echo -e "${YELLOW}是否继续？（y/n）${NC}"
     read -r confirm
     if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
         disable_periodic_task # 禁用所有周期性任务
+        disable_chaos_mode # 禁用混沌模式
 
         # 检查并终止 screen 会话
         if screen -list | grep -q "$SCREEN_SESSION_NAME"; then
@@ -350,6 +384,205 @@ uninstall_my_app() {
 }
 
 # =========================================================================
+# 混沌模式功能函数
+# =========================================================================
+
+# 获取或初始化混沌模式的力量值
+get_chaos_power() {
+    if [ -f "$CHAOS_POWER_FILE" ] && [[ "$(cat "$CHAOS_POWER_FILE")" =~ ^[0-9]+$ ]]; then
+        cat "$CHAOS_POWER_FILE"
+    else
+        echo "$INITIAL_POWER" > "$CHAOS_POWER_FILE"
+        echo "$INITIAL_POWER"
+    fi
+}
+
+# 设置混沌模式的力量值
+set_chaos_power() {
+    local new_power="$1"
+    # 限制力量值在 MIN_POWER 和 MAX_POWER 之间
+    if (( new_power < INITIAL_POWER )); then new_power=$INITIAL_POWER; fi
+    if (( new_power > MAX_POWER )); then new_power=$MAX_POWER; fi
+    echo "$new_power" > "$CHAOS_POWER_FILE"
+}
+
+# 停止所有由混沌模式可能产生的 stress-ng 进程
+cleanup_stress_processes() {
+    local pids=$(pgrep -f "stress-ng --chaos-agent" 2>/dev/null || true)
+    if [ -n "$pids" ]; then
+        log_message "${YELLOW}正在终止活跃的混沌代理 (stress-ng)...${NC}"
+        for pid in $pids; do
+            if ps -p "$pid" > /dev/null 2>&1; then
+                kill "$pid" 2>/dev/null || true
+            fi
+        done
+        sleep 1
+    fi
+}
+
+# 禁用混沌模式
+disable_chaos_mode() {
+    log_message "${YELLOW}正在检查并禁用混沌模式后台进程...${NC}"
+    if [ -f "$CHAOS_MODE_PID_FILE" ]; then
+        PID=$(cat "$CHAOS_MODE_PID_FILE")
+        if ps -p "$PID" > /dev/null 2>&1; then
+            kill "$PID" 2>/dev/null || true
+            log_message "${GREEN}已终止 PID $PID 对应的混沌模式进程。${NC}"
+        else
+            log_message "${YELLOW}混沌模式 PID 文件 ($PID) 存在，但主进程已不存在。${NC}"
+        fi
+        rm -f "$CHAOS_MODE_PID_FILE" || true
+    else
+        log_message "${YELLOW}未找到混沌模式的 PID 文件，无需禁用。${NC}"
+    fi
+    cleanup_stress_processes # 确保清理残留的 stress-ng
+    log_message "${YELLOW}混沌模式已停止。${NC}"
+}
+
+# 启用混沌模式（主循环）
+enable_chaos_mode() {
+    echo -e "${RED}警告：混沌模式将积极占用系统资源，可能导致系统不稳定甚至无响应！${NC}"
+    echo -e "${YELLOW}请在安全且可以接受数据丢失的虚拟机或测试系统上使用此功能！${NC}"
+    echo -e "${YELLOW}强烈建议您安装 'stress-ng' 命令以获得最佳模拟效果。${NC}"
+    echo -e "${RED}您确定要启用混沌模式吗？这可能需要强制重启系统！${NC}"
+    echo -e "${YELLOW}是否继续？（y/n）${NC}"
+    read -r confirm
+    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+        log_message "${YELLOW}混沌模式启用已取消。${NC}"
+        return 0
+    fi
+
+    disable_chaos_mode # 确保只运行一个实例
+    
+    local has_stress_ng=0
+    if check_stress_ng; then
+        has_stress_ng=1
+    fi
+
+    log_message "${GREEN}正在启动混沌模式后台进程...${NC}"
+    # 启动后台循环
+    (
+        log_message "--- 混沌模式已启动 on $(date) ---"
+        log_message "当前混沌力量值: $(get_chaos_power)"
+        
+        while true; do
+            CURRENT_POWER=$(get_chaos_power)
+            log_message "[$(date)] ${CYAN}混沌力量：$CURRENT_POWER${NC} - ${YELLOW}能量增长...${NC}"
+
+            # 模拟“学习”：随机调整力量
+            # 如果是成功迭代，力量值倾向于增加；如果是失败，力量值倾向于减少
+            RAND_SUCCESS_BOOST=$(awk -v rp="$REGEN_RATE" 'BEGIN {print rand()*rp}') # 随机0到REGEN_RATE之间
+            RAND_FAILURE_DROP=$(awk -v dp="$DEGEN_RATE" 'BEGIN {print rand()*dp}') # 随机0到DEGEN_RATE之间
+            
+            # 计算目标并发代理数（力量值越高，并发数越多）
+            TARGET_AGENTS=$(( (CURRENT_POWER * MAX_CHAOS_AGENTS / MAX_POWER) > 0 ? (CURRENT_POWER * MAX_CHAOS_AGENTS / MAX_POWER) : 1 ))
+            TARGET_AGENTS=$(( TARGET_AGENTS > MAX_CHAOS_AGENTS ? MAX_CHAOS_AGENTS : TARGET_AGENTS ))
+
+            ACTIVE_AGENTS=0
+            pids=$(pgrep -f "stress-ng --chaos-agent" 2>/dev/null || true)
+            if [ -n "$pids" ]; then
+                for pid in $pids; do
+                    if ps -p "$pid" > /dev/null 2>&1; then
+                        ACTIVE_AGENTS=$((ACTIVE_AGENTS + 1))
+                    fi
+                done
+            fi
+
+            # 决定要启动或停止多少个代理以达到目标
+            AGENTS_TO_ADJUST=$((TARGET_AGENTS - ACTIVE_AGENTS))
+            if (( AGENTS_TO_ADJUST > 0 )); then
+                log_message "${PURPLE}正在启动 ${AGENTS_TO_ADJUST} 个新的混沌代理... (当前活跃: $ACTIVE_AGENTS / 目标: $TARGET_AGENTS)${NC}"
+            elif (( AGENTS_TO_ADJUST < 0 )); then
+                log_message "${PURPLE}正在关闭 ${-AGENTS_TO_ADJUST} 个混沌代理... (当前活跃: $ACTIVE_AGENTS / 目标: $TARGET_AGENTS)${NC}"
+                # 随机终止多余的 stress-ng 进程
+                local kill_pids=$(pgrep -f "stress-ng --chaos-agent" | shuf | head -n ${-AGENTS_TO_ADJUST})
+                if [ -n "$kill_pids" ]; then
+                    for pid_to_kill in $kill_pids; do
+                        log_message "${YELLOW}终止混沌代理 PID $pid_to_kill${NC}"
+                        kill "$pid_to_kill" 2>/dev/null || true
+                    done
+                fi
+            fi
+
+            for i in $(seq 1 $TARGET_AGENTS); do
+                # 随机选择资源类型
+                resource_type_num=$((1 + RANDOM % 4))
+                resource_type=""
+                stress_command=""
+
+                case $resource_type_num in
+                    1) resource_type="CPU"
+                       workers=$(( CURRENT_POWER / 2 + 1 )) # 力量越高，核心越多
+                       stress_command="stress-ng --cpu $workers --cpu-method matrixprod --timeout ${STRESS_TEST_DURATION}s --metrics --quiet --perf -q --process-name 'stress-ng --chaos-agent-cpu'"
+                       ;;
+                    2) resource_type="RAM"
+                       mem_mb=$(( CURRENT_POWER * 50 + 100 )) # 力量越高，内存越多
+                       stress_command="stress-ng --vm 1 --vm-bytes ${mem_mb}M --timeout ${STRESS_TEST_DURATION}s --metrics --quiet --perf -q --process-name 'stress-ng --chaos-agent-mem'"
+                       ;;
+                    3) resource_type="IO"
+                       io_rate=$(( CURRENT_POWER * 20 + 100 )) # 力量越高，I/O速度越快
+                       stress_command="stress-ng --io 1 --timeout ${STRESS_TEST_DURATION}s --metrics --quiet --perf -q --process-name 'stress-ng --chaos-agent-io'"
+                       ;;
+                    4) resource_type="NET"
+                       net_conn=$(( CURRENT_POWER / 5 + 1 )) # 力量越高，连接越多
+                       stress_command="stress-ng --net-io $net_conn --timeout ${STRESS_TEST_DURATION}s --metrics --quiet --perf -q --process-name 'stress-ng --chaos-agent-net'"
+                       ;;
+                esac
+                
+                log_message "${CYAN}正在启动混沌代理：力量 ${CURRENT_POWER} 级别下的 $resource_type 压力。${NC}"
+                
+                # 在后台启动 stress-ng，并进行一些基本的“学习”
+                if (( has_stress_ng == 1 )); then
+                    (
+                        timeout "${STRESS_TEST_DURATION}s" "$stress_command" &> /dev/null
+                        EXIT_CODE=$?
+                        if (( EXIT_CODE == 0 )) || (( EXIT_CODE == 124 )); then # 0: 正常退出，124: timeout命令正常退出
+                            # 成功运行，增加力量（有随机性）
+                            NEW_POWER=$(awk -v cp="$CURRENT_POWER" -v rb="$RAND_SUCCESS_BOOST" 'BEGIN {print int(cp + (cp * rb))}')
+                            set_chaos_power "$NEW_POWER"
+                            log_message "${GREEN}混沌代理成功压榨 ${resource_type}！力量增长到 ${NEW_POWER}${NC}"
+                        else
+                            # 运行失败，减少力量（模拟学习和调整）
+                            NEW_POWER=$(awk -v cp="$CURRENT_POWER" -v dd="$RAND_FAILURE_DROP" 'BEGIN {print int(cp - (cp * dd))}')
+                            set_chaos_power "$NEW_POWER"
+                            log_message "${RED}混沌代理压榨 ${resource_type} 失败 (Exit $EXIT_CODE)！力量衰减到 ${NEW_POWER}${NC}"
+                        fi
+                    ) & # 每一个 stress-ng 作为一个独立的子进程在后台运行
+                else
+                    log_message "${RED}stress-ng 未安装，回退到简陋模式：仅模拟 CPU 负载${NC}"
+                    (
+                        # 简陋的 CPU 负载模拟
+                        END_TIME=$(( SECONDS + STRESS_TEST_DURATION ))
+                        while (( SECONDS < END_TIME )); do
+                            _ignored_var=$(( RANDOM * RANDOM )) # 无意义的计算
+                        done
+                        # 简单地每次成功都增加力量
+                        NEW_POWER=$(awk -v cp="$CURRENT_POWER" -v rb="$RAND_SUCCESS_BOOST" 'BEGIN {print int(cp + (cp * rb))}')
+                        set_chaos_power "$NEW_POWER"
+                        log_message "${GREEN}混沌代理 (简陋版) 模拟压榨 CPU 成功！力量增长到 ${NEW_POWER}${NC}"
+                    ) &
+                fi
+                sleep 0.1 # 短暂暂停，避免在主循环中同时启动太多
+            done
+
+            # 根据力量值动态调整休眠间隔，力量值越高，间隔越短，检查越频繁
+            # INTERVAL=$(awk -v bp="$BASE_INTERVAL" -v mp="$MAX_POWER" -v cp="$CURRENT_POWER" -v mi="$MIN_INTERVAL" 'BEGIN {val = bp - (bp * (cp / mp) * 0.8); if (val < mi) print mi; else print val}')
+            # 使用更平滑的逆向计算，确保最小值
+            INTERVAL=$(echo "scale=2; $BASE_INTERVAL - ($BASE_INTERVAL - $MIN_INTERVAL) * ($CURRENT_POWER / $MAX_POWER)" | bc -l)
+            if (( $(echo "$INTERVAL < $MIN_INTERVAL" | bc -l) )); then INTERVAL=$MIN_INTERVAL; fi
+
+            log_message "${YELLOW}等待 ${INTERVAL} 秒后再次迭代...${NC}"
+            sleep "$INTERVAL"
+        done
+    ) &
+    PID=$!
+    echo "$PID" > "$CHAOS_MODE_PID_FILE"
+    log_message "${GREEN}混沌模式已在后台启用 (PID: $PID)。请注意系统资源占用！${NC}"
+    log_message "${YELLOW}您可以通过选择菜单选项 6 (退出脚本) 或手动运行 '${NC}${CYAN}kill $PID${NC}${YELLOW}' 并运行 '${NC}${CYAN}pkill -f 'stress-ng --chaos-agent'${NC}${YELLOW}' 来终止它。${NC}"
+    pause_and_return
+}
+
+# =========================================================================
 # 主菜单循环 - 程序的入口点
 # =========================================================================
 while true; do
@@ -363,9 +596,12 @@ while true; do
     echo -e "${BLUE}3. 管理应用程序服务（手动启动/周期性检查）${NC}"
     echo -e "${BLUE}4. 更新我的应用程序/脚本${NC}"
     echo -e "${BLUE}5. 卸载/清理应用程序数据${NC}"
-    echo -e "${RED}6. 退出脚本${NC}"
+    echo -e "${RED}--- 危险实验区域 ---${NC}"
+    echo -e "${PURPLE}6. 启用混沌模式（模拟资源占用与自我强化）${NC}"
+    echo -e "${PURPLE}7. 禁用混沌模式${NC}"
+    echo -e "${RED}8. 退出脚本${NC}"
     echo -e "============================================"
-    echo -e "${YELLOW}请输入您的选择（1-6）：${NC}"
+    echo -e "${YELLOW}请输入您的选择（1-8）：${NC}"
     read -r choice
 
     case $choice in
@@ -389,11 +625,18 @@ while true; do
             pause_and_return
             ;;
         6)
+            enable_chaos_mode
+            ;;
+        7)
+            disable_chaos_mode
+            pause_and_return
+            ;;
+        8)
             log_message "${YELLOW}退出脚本...${NC}"
             exit 0
             ;;
         *)
-            log_message "${RED}无效的选择，请输入 1-6。${NC}"
+            log_message "${RED}无效的选择，请输入 1-8。${NC}"
             pause_and_return
             ;;
     esac
