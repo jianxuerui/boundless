@@ -54,7 +54,6 @@ CHAOS_REALM_SESSION="boundless_chaos_session"
 # 宇宙能量网 Screen 会话 (新增) - 全核常驻能量补充
 COSMIC_ENERGY_SESSION="cosmic_energy_flux_session"
 
-
 # === 心之状态持久化文件 (核心：执着与与道契合度) ===
 # 原 CHAOS_POWER_FILE -> 执着之度 (attachment_level)，数值越大，执着越深，外显混沌越剧烈
 ATTACHMENT_LEVEL_FILE="$HOME/.mind_attachment_level"
@@ -79,20 +78,188 @@ CYAN='\033[0;36m'   # 澄明之蓝
 NC='\033[0m'        # 无色之真
 
 # =========================================================================
-# 辅助函数 - 封装内观之旅的常用操作
+# 文本常量定义 - 统一管理所有用户可见文本
+# =========================================================================
+_MSG_RETURN_PROMPT="${YELLOW}按下 任意键 （或回车） 返回心门...${NC}"
+
+# 心之状态显示相关
+_MSG_STATUS_HEADER="${PURPLE}==【 当前心之状态 】==${NC}"
+_MSG_ATTACHMENT_LABEL="${PURPLE}『执着度』:${NC}"
+_MSG_ALIGNMENT_LABEL="${PURPLE}『与道契合』:${NC}"
+_MSG_STATUS_ENLIGHTENED="${GREEN}【 已入究竟觉者圆满之境 】${NC}"
+_MSG_STATUS_GREAT_GOOD="${BLUE}【 近大善之境 】${NC}"
+_MSG_STATUS_EMPTY_FORM="${CYAN}【 趋无相之境 】${NC}"
+_MSG_STATUS_PROGRESS="${YELLOW}【 精进修行途中 】${NC}"
+_MSG_STATUS_DISTRACTED="${RED}【 妄念纠缠 】${NC}"
+
+# 主菜单相关
+_MSG_MAIN_MENU_TITLE="${GREEN}=== 觉者无形之境 - 随心而动，寂然无碍 ===${NC}"
+_MSG_MAIN_MENU_OPT1="${BLUE}1. 『启』：开启灵性觉醒之旅 (初创心识之境，心生妄念)*${NC}"
+_MSG_MAIN_MENU_OPT2="${BLUE}2. 『观』：观照心境与外显之相 (察灵台，入混沌/能量网)${NC}"
+_MSG_MAIN_MENU_OPT3="${BLUE}3. 『导』：引导内观修行 (修金刚法，悟道德真)*${NC}"
+_MSG_MAIN_MENU_OPT4="${BLUE}4. 『勘』：勘修正法 (迭代心法，无所执故不旧)*${NC}"
+_MSG_MAIN_MENU_OPT5="${BLUE}5. 『绝』：究竟清净 (归于虚无，一切痕迹皆不存)*${NC}"
+_MSG_MAIN_MENU_OPT6="${PURPLE}6. 『启』：启动『动态混沌显化』(外显执着，系统忙碌)*${NC}"
+_MSG_MAIN_MENU_OPT6_1="${PURPLE}6.1. 『启』：接入『宇宙能量网』(全核驱动，生生不息)*${NC}"
+_MSG_MAIN_MENU_OPT7="${PURPLE}7. 『息』：止息所有『混沌显化』(平息妄动，还以清净)*${NC}"
+_MSG_MAIN_MENU_OPT8="${RED}8. 『寂』：永恒寂静 (退出此世显化)${NC}"
+_MSG_MAIN_MENU_PROMPT="${YELLOW}请随缘择一径（1-8），入此境...${NC}"
+_MSG_MAIN_MENU_INVALID_CHOICE="${RED}此径非我境，请重择。${NC}"
+_MSG_QUIT_MESSAGE="${YELLOW}心随缘灭，万象归寂... ${NC}"
+
+
+# 依赖检查相关
+_MSG_COMPAT_CHECK_START="${CYAN}=== 进行心之境兼容性检查... ===${NC}"
+_MSG_COMPAT_ERROR_PREFIX="${RED}错误：核心依赖『"
+_MSG_COMPAT_ERROR_SUFFIX="』未安装！${NC}"
+_MSG_COMPAT_INSTALL_HINT="${YELLOW}请安装此工具以确保脚本完整运行。建议："
+_MSG_WARN_STRESS_NG="${YELLOW}警告：『世间之磨』(stress-ng) 工具未安装！外部『混沌之相』和『宇宙能量网』将回退到简易CPU模拟模式。${NC}"
+_MSG_WARN_BC="${YELLOW}警告：『bc』工具未安装。混沌强度计算可能不精确，或在某些场景下导致错误。${NC}"
+_MSG_WARN_NPROC="${YELLOW}警告：『nproc』工具未安装。『宇宙能量网』将无法准确获取核心数，可能默认使用单核模拟。${NC}"
+_MSG_COMPAT_FAILED="${RED}=== 兼容性检查失败，部分核心依赖缺失。请安装后重试。 ===${NC}"
+_MSG_COMPAT_PASSED="${GREEN}=== 兼容性检查通过。心之境可正常显化。 ===${NC}"
+
+
+# 混沌与能量网相关
+_MSG_STOPPING_ALL_CHAOS="${YELLOW}正在使所有『混沌之界』及『宇宙能量网』归于寂静...${NC}"
+_MSG_CHAOS_SESSION_STOPPED="${GREEN}已令『%s』归于寂静。${NC}"
+_MSG_TERMINATING_STRESS_NG="${YELLOW}正在终止活跃的混沌代理 (stress-ng)...${NC}"
+_MSG_NO_ACTIVE_STRESS_NG="${YELLOW}未发现活跃的 stress-ng 混沌进程。${NC}"
+_MSG_CHAOS_FULL_STOPPED="${YELLOW}所有『混沌显化』已完全止息。${NC}"
+_MSG_STARTING_CHAOS_REALM="${YELLOW}正在尝试启动『混沌之界显化』(%s) ...${NC}"
+_MSG_CHAOS_PURE_MIND_NO_DISTURB="${GREEN}心识几近清净，混沌显化极微，几无干扰。无需启动显著波动。${NC}"
+_MSG_CHAOS_REALM_INTENSITY="${PURPLE}正在启动『混沌之界显化』，其烈度与心识『执着之度：%s』相符...${NC}"
+_MSG_CHAOS_SIM_WARNING="提示：此为模拟之『业力显现』，实际占用系统资源。体验毕，请于菜单停息之。"
+_MSG_CHAOS_REALM_START_FAILED="${RED}错误：启动『混沌之界显化』失败。请检查 screen 命令或权限。${NC}"
+_MSG_CHAOS_REALM_STARTED="${GREEN}『混沌之界显化』已在 screen 会话 '%s' 中开始涌动。${NC}"
+_MSG_CHAOS_SCREEN_HINT="您可通过选项 2.2 或运行 '${YELLOW}screen -r %s${NC}' 进入查看。『见诸相非相，即见如来』。"
+_MSG_SCREEN_DETACH_HINT="按 ${YELLOW}Ctrl+A${NC} 然后按 ${YELLOW}D${NC} 退出 screen 会话而不终止模拟。${NC}"
+
+_MSG_STARTING_COSMIC_ENERGY="${YELLOW}正在尝试接入『宇宙能量网』(%s) ...${NC}"
+_MSG_COSMIC_ENERGY_NO_NPROC_WARN="${YELLOW}警告：nproc 未安装，默认使用 1 个核心。${NC}"
+_MSG_COSMIC_ENERGY_FULL_CORE="${PURPLE}接入『宇宙能量网』：全核驱动 (%s 核)，源源不断生生不息...${NC}"
+_MSG_COSMIC_ENERGY_SIM_WARNING="提示：此为模拟『生态能量补充』，将持续占用CPU资源。${NC}"
+_MSG_COSMIC_ENERGY_START_FAILED="${RED}错误：启动『宇宙能量网』失败。请检查 screen 命令或权限。${NC}"
+_MSG_COSMIC_ENERGY_STARTED="${GREEN}『宇宙能量网』已在 screen 会话 '%s' 中持续运行。${NC}"
+_MSG_COSMIC_ENERGY_SCREEN_HINT="您可通过选项 2.2 或运行 '${YELLOW}screen -r %s${NC}' 进入查看。『有为供养无为，生生不息』。"
+
+# 周期性任务（心识自巡）相关
+_MSG_DISABLE_HEARTBEAT_START="${YELLOW}正在检查并禁用心之律动监测...${NC}"
+_MSG_HEARTBEAT_TERMINATING="终止心之律动监测 PID: %s"
+_MSG_HEARTBEAT_TERMINATED="${GREEN}已终止 PID %s 对应的心之律动监测。${NC}"
+_MSG_HEARTBEAT_GONE="${YELLOW}心之律动监测PID文件(%s)存在，但进程已消散。${NC}"
+_MSG_HEARTBEAT_NOT_FOUND="${YELLOW}未发现心之律动监测任务，无需禁用。${NC}"
+
+# 心识行动与状态
+_MSG_MIND_ACTION_START="${BLUE}心识发起行动：『%s』...${NC}"
+_MSG_MIND_REALM_CREATE_ERROR="${RED}错误：无法创建心识之境。请检查权限。${NC}"
+_MSG_PYTHON_EXEC_FAILED="${RED}错误：Python 心识核心显化执行失败。${NC}"
+_MSG_MIND_ACTION_COMPLETE="${GREEN}『%s』行动完成。${NC}"
+_MSG_MIND_STATE_UPDATE="${YELLOW}心识状态变动，正在调整『混沌之界显化』强度...${NC}"
+
+# 灵性觉醒之旅 (1)
+_MSG_SPIRITUAL_QUEST_START="${YELLOW}=== 开启灵性觉醒之旅 ===${NC}"
+_MSG_CREATE_MIND_REALM="${GREEN}正在为心识创建内观之境...${NC}"
+_MSG_MIND_REALM_CREATED="心识主目录已建立：%s"
+_MSG_LOAD_MIND_CORE="${YELLOW}正在载入《金刚经》与《道德经》心法入『心识核心显化』：%s...${NC}"
+_MSG_GRANT_CORE_PERMISSION_ERROR="${RED}错误：无法赋予心法执行之权能。请检查权限。${NC}"
+_MSG_CORE_SCRIPT_GENERATED="心识核心显化脚本已生成。"
+_MSG_INIT_MIND_REALM_DONE="${YELLOW}内观之境已备，心识初始。${NC}"
+_MSG_INIT_CONTEMPLATION_HINT="${CYAN}您可时常观照『灵台之日志』(选项 2.1)，或选择启动『混沌显化』(选项 6/6.1) 察看显相。${NC}"
+
+# 观照心境与外显之相 (2)
+_MSG_CONTEMPLATION_MENU_TITLE="${YELLOW}=== 观照心境与外显之相 ===${NC}"
+_MSG_CONTEMPLATION_OPT1="${GREEN}1. 观：『灵台之日志』(%s) - 察觉心念流转${NC}"
+_MSG_CONTEMPLATION_OPT2="${GREEN}2. 观：『混沌之界』或『宇宙能量网』显化 - 直视执着/能量流${NC}"
+_MSG_CONTEMPLATION_PROMPT="${YELLOW}请选择您的观照之法（1-2）：${NC}"
+_MSG_CONTEMPLATION_INVALID="${RED}非观照之法。${NC}"
+_MSG_DISPLAY_LOG_START="${CYAN}正显示灵台日志，心念之流。按 Ctrl+C 止。${NC}"
+_MSG_LOG_NOT_MANIFESTED="${RED}错误：灵台日志 (%s) 尚未显化。请先开启旅程。${NC}"
+_MSG_ACTIVE_MANIFEST_FOUND="${GREEN}找到活跃的『%s』显化，您将入此界观其显相。${NC}"
+_MSG_SCREEN_VIEW_COMMAND="您将进入 screen 会话，命令为：${YELLOW}screen -r %s${NC}"
+_MSG_NO_ACTIVE_MANIFEST="${RED}错误：『混沌之界』或『宇宙能量网』未见涌动。${NC}"
+_MSG_NO_ACTIVE_MANIFEST_HINT="${YELLOW}请通过『启』(选项 6 或 6.1) 启动显化。『凡所有相，皆是虚妄。若见诸相非相，则见如来』。${NC}"
+_MSG_SCREEN_ENTRY_ERROR="${RED}错误：无法进入 screen 会话。可能是权限问题或 screen 异常。${NC}"
+
+
+# 引导内观修行 (3)
+_MSG_INNER_PRACTICE_MENU_TITLE="${GREEN}引导内观修行子菜单${NC}"
+_MSG_INNER_PRACTICE_OPT1="1. 💡 金刚明心：应无所住而生其心 (降低执着，增长契合)"
+_MSG_INNER_PRACTICE_OPT2="2. 🕊️ 金刚布施：无所住而行世事 (降低执着，增长契合)"
+_MSG_INNER_PRACTICE_OPT3="3. 👀 金刚观照：见诸相非相，即见如来 (降低执着)"
+_MSG_INNER_PRACTICE_OPT4="4. 🌳 道德抱朴：返璞归真，抱朴守拙 (降低执着，显著增长契合)"
+_MSG_INNER_PRACTICE_OPT5="5. 🏞️ 道德无为：为无为，事无事，顺应自然 (显著降低执着，显著增长契合)"
+_MSG_INNER_PRACTICE_OPT6="6. 🌌 道德合道：与道合一，渐入佳境 (直接增加契合，小幅降低执着)"
+_MSG_INNER_PRACTICE_OPT7="7. 🧠 察：世间执着，自扰尘埃 (故意增加执着，非修行，反照其影响)"
+_MSG_INNER_PRACTICE_OPT8="8. 🧘‍♀️ 持续律动：心识自巡（启用自动周期性『应无所住』循环）"
+_MSG_INNER_PRACTICE_OPT9="9. 🚫 暂停律动：停止心识自巡"
+_MSG_INNER_PRACTICE_OPT0="0. 返回主菜单"
+_MSG_INNER_PRACTICE_PROMPT="${YELLOW}请选择您的修行法门：${NC}"
+_MSG_INNER_PRACTICE_INVALID="${RED}非修习之法。${NC}"
+_MSG_BEHOLD_QUESTION="${GREEN}欲观照何相之空性？(如：财富/名利/痛苦/自我)${NC}"
+_MSG_SIMPLICITY_QUESTION="${GREEN}欲抱朴守拙于何处？(如：烦恼/浮华/纷争/欲望)${NC}"
+_MSG_ALIGN_QUESTION="${GREEN}愿以何等信念契合于道？(如：信任/柔弱/清静/谦卑)${NC}"
+_MSG_DWELL_WARNING="${YELLOW}警告：此乃『尘缘造作』之法。执着将起，心生妄念！${NC}"
+_MSG_DWELL_QUESTION="${GREEN}心为何执？(如：财富/权力/名望/烦恼)${NC}"
+_MSG_HEARTBEAT_ENABLE="${YELLOW}启用『心识自巡』律动：心法自动周转（每15分钟一次），降低执着。${NC}"
+_MSG_HEARTBEAT_AUTO_TOUR_START="--- 『心识自巡』律动已启动于 %s ---"
+_MSG_HEARTBEAT_AUTO_TOUR_MESSAGE="[$(date)] ${YELLOW}心识自巡：进行一次『无所住生其心』法门。${NC}"
+_MSG_HEARTBEAT_PYTHON_FAIL="${RED}心识自巡：Python 调用失败。${NC}"
+_MSG_HEARTBEAT_WAIT_MESSAGE="[$(date)] ${YELLOW}等待 15 分钟（900秒）后再次自巡...${NC}"
+_MSG_HEARTBEAT_ENABLED="${GREEN}『心识自巡』已在后台启用 (PID: %s)。『念念无住，寂照不离』。${NC}"
+
+
+# 勘修正法 (4)
+_MSG_REFINE_TEACHING_TITLE="${GREEN}勘修正法：磨砺心法，推陈出新${NC}"
+_MSG_REFINE_TEACHING_NOT_ESTABLISHED="${RED}错误：心识之境 (%s) 尚未建立。请先选择选项 1 开启旅程。${NC}"
+_MSG_REFINE_TEACHING_WARN="${YELLOW}警告：此『勘修正法』之行，将${RED}暂时停息${YELLOW}心之律动及所有『混沌显化』，并${RED}重新刻录${YELLOW}心识核心显化逻辑。${NC}"
+_MSG_REFINE_TEACHING_CONFIRM_PROMPT="${YELLOW}是否继续勘修？（y/n）${NC}"
+_MSG_REFINE_TEACHING_CANCELLED="${YELLOW}『勘修正法』已暂缓。${NC}"
+_MSG_REFINE_TEACHING_QUIET_MIND="${YELLOW}心识入静，重修大道...${NC}"
+_MSG_REFINE_TEACHING_RELOADING_CORE="${YELLOW}正在重新载入最新的《金刚经》与《道德经》心法入『心识核心显化』：%s...${NC}"
+_MSG_REFINE_TEACHING_CORE_UPDATED="心识核心显化已随新心法『升级』。"
+_MSG_REFINE_TEACHING_COMPLETE="${GREEN}心法『勘修正法』完成，心识随之重焕。${NC}"
+_MSG_REFINE_TEACHING_HINT="${CYAN}您可通过选项 2 查看灵台日志，察觉新境，并可选择启动混沌显化。${NC}"
+
+# 究竟清净 (5)
+_MSG_ULTIMATE_EMPTINESS_WARN_1="${RED}警告：此『究竟清净』之法，将${YELLOW}止息所有心识律动${NC}，${RED}断除所有『混沌显化』${NC}，${RED}抹除所有心识痕迹 (%s 目录)！${NC}"
+_MSG_ULTIMATE_EMPTINESS_WARN_2="${YELLOW}此乃${RED}不可逆转${YELLOW}之径。心识若一旦回归『无物』之境，前途自化！${NC}"
+_MSG_ULTIMATE_EMPTINESS_CONFIRM_PROMPT="${YELLOW}是否究竟清净？（y/n）${NC}"
+_MSG_ULTIMATE_EMPTINESS_DELETING_REALM="${YELLOW}正在抹除心识之境 (%s)...${NC}"
+_MSG_ULTIMATE_EMPTINESS_REALM_CLEAN="${GREEN}心识之境已回归『空』。${NC}"
+_MSG_ULTIMATE_EMPTINESS_REALM_CLEAN_FAIL="${RED}错误：无法彻底清净心识之境，请手动察看权限。${NC}"
+_MSG_ULTIMATE_EMPTINESS_NO_REALM_TO_CLEAN="${YELLOW}心识之境本无显化，无需抹除。${NC}"
+_MSG_ULTIMATE_EMPTINESS_CLEANING_STATUS="${YELLOW}正在拂去心之『执着度』和『与道契合度』痕迹...${NC}"
+_MSG_ULTIMATE_EMPTINESS_STATUS_CLEAN="${GREEN}心之状态已彻底清零，不落痕迹。${NC}"
+_MSG_ULTIMATE_EMPTINESS_QUIETING_LOG="${YELLOW}正在平息灵台日志 (自我之语) ...${NC}"
+_MSG_ULTIMATE_EMPTINESS_LOG_QUIET="${GREEN}灵台日志已平息。${NC}"
+_MSG_ULTIMATE_EMPTINESS_COMPLETE="${GREEN}『究竟清净』之法已完成。诸相归于无，不落言诠。${NC}"
+_MSG_ULTIMATE_EMPTINESS_CANCELLED="${YELLOW}究竟清净之念暂缓。${NC}"
+
+
+# =========================================================================
+# 辅助函数 - 封装内观之旅的常用操作 (主要封装文本输出)
 # =========================================================================
 
 # 辅助函数：输出日志到文件并同时打印到控制台
 # 确保日志目录在任何 log_message 调用前就存在
 # (在脚本顶部进行一次性创建，以防首次日志写入前目录不存在)
 log_message() {
-    echo -e "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$CONSCIOUSNESS_LOG_FILE"
+    printf "[%s] %b\n" "$(date +'%Y-%m-%d %H:%M:%S')" "$1" | tee -a "$CONSCIOUSNESS_LOG_FILE"
 }
 
 # 辅助函数：暂停并等待用户按下 Enter 键
 pause_and_return() {
-    echo -e "${YELLOW}按下 任意键 （或回车） 返回心门...${NC}"
+    echo -e "$_MSG_RETURN_PROMPT"
     read -n 1 -s
+}
+
+# 辅助函数：显示通用的确认提示
+confirm_action() {
+    local prompt="$1"
+    echo -e "$prompt"
+    read -r confirm
+    [[ "$confirm" = "y" || "$confirm" = "Y" ]]
 }
 
 # 辅助函数：检查依赖命令是否存在
@@ -100,8 +267,8 @@ check_command() {
     local cmd="$1"
     local install_hint="$2"
     if ! command -v "$cmd" &> /dev/null; then
-        log_message "${RED}错误：核心依赖『$cmd』未安装！${NC}"
-        log_message "${YELLOW}请安装此工具以确保脚本完整运行。建议：$install_hint${NC}"
+        log_message "${_MSG_COMPAT_ERROR_PREFIX}$cmd${_MSG_COMPAT_ERROR_SUFFIX}"
+        log_message "${_MSG_COMPAT_INSTALL_HINT}$install_hint${NC}"
         return 1
     fi
     return 0
@@ -109,7 +276,7 @@ check_command() {
 
 # 脚本启动时的兼容性检查
 main_compatibility_check() {
-    log_message "${CYAN}=== 进行心之境兼容性检查... ===${NC}"
+    log_message "$_MSG_COMPAT_CHECK_START"
     local all_good=0
 
     # 检查 python3
@@ -124,50 +291,48 @@ main_compatibility_check() {
     
     # 检查 stress-ng
     if ! check_command "stress-ng" "sudo apt install stress-ng (或 yum/dnf/pacman)"; then
-        log_message "${YELLOW}警告：『世间之磨』(stress-ng) 工具未安装！外部『混沌之相』和『宇宙能量网』将回退到简易CPU模拟模式。${NC}"
+        log_message "$_MSG_WARN_STRESS_NG"
     fi
 
     # 检查 bc (用于浮点运算，某些极简系统可能没有)
     if ! check_command "bc" "sudo apt install bc (或 yum/dnf/pacman)"; then
-        log_message "${YELLOW}警告：『bc』工具未安装。混沌强度计算可能不精确，或在某些场景下导致错误。${NC}"
+        log_message "$_MSG_WARN_BC"
     fi
 
     # 检查 nproc (用于获取核心数)
     if ! check_command "nproc" "sudo apt install util-linux (或 procps, 一般系统自带)"; then
-        log_message "${YELLOW}警告：『nproc』工具未安装。『宇宙能量网』将无法准确获取核心数，可能默认使用单核模拟。${NC}"
+        log_message "$_MSG_WARN_NPROC"
         # 设置一个默认值，以防nproc不存在
         NUM_CPU_CORES=1
     else
         NUM_CPU_CORES=$(nproc)
     fi
 
-
     if [ "$all_good" -eq 1 ]; then
-        log_message "${RED}=== 兼容性检查失败，部分核心依赖缺失。请安装后重试。 ===${NC}"
+        log_message "$_MSG_COMPAT_FAILED"
         exit 1
     fi
-    log_message "${GREEN}=== 兼容性检查通过。心之境可正常显化。 ===${NC}"
+    log_message "$_MSG_COMPAT_PASSED"
 }
 
 # 辅助函数：停止所有类型的混沌显化（动态执着显化和宇宙能量网）
 disable_all_chaos_realms() {
-    log_message "${YELLOW}正在使所有『混沌之界』及『宇宙能量网』归于寂静...${NC}"
+    log_message "$_MSG_STOPPING_ALL_CHAOS"
 
     # 终止动态执着显化
     if screen -list | grep -q "$CHAOS_REALM_SESSION"; then
         screen -S "$CHAOS_REALM_SESSION" -X quit || true
-        log_message "${GREEN}已令『$CHAOS_REALM_SESSION』归于寂静。${NC}"
+        log_message "$(printf "$_MSG_CHAOS_SESSION_STOPPED" "$CHAOS_REALM_SESSION")"
     fi
 
     # 终止宇宙能量网显化
     if screen -list | grep -q "$COSMIC_ENERGY_SESSION"; then
         screen -S "$COSMIC_ENERGY_SESSION" -X quit || true
-        log_message "${GREEN}已令『$COSMIC_ENERGY_SESSION』归于寂静。${NC}"
+        log_message "$(printf "$_MSG_CHAOS_SESSION_STOPPED" "$COSMIC_ENERGY_SESSION")"
     fi
     
     # 确保清理残留的 stress-ng 进程，这里更通用地查找
-    log_message "${YELLOW}正在终止活跃的混沌代理 (stress-ng)...${NC}"
-    # 查找所有由本脚本会话可能启动的 stress-ng 进程
+    log_message "$_MSG_TERMINATING_STRESS_NG"
     local pids=$(pgrep -f "stress-ng" 2>/dev/null || true)
     if [ -n "$pids" ]; then
         for pid in $pids; do
@@ -178,18 +343,16 @@ disable_all_chaos_realms() {
         done
         sleep 1
     else
-        log_message "${YELLOW}未发现活跃的 stress-ng 混沌进程。${NC}"
+        log_message "$_MSG_NO_ACTIVE_STRESS_NG"
     fi
-    log_message "${YELLOW}所有『混沌显化』已完全止息。${NC}"
+    log_message "$_MSG_CHAOS_FULL_STOPPED"
 }
-
 
 # 辅助函数：启动心识体的混沌界显化（后台资源占用模拟，基于执着度动态调整）
 start_chaos_realm_manifest() {
-    # 启动前先停止所有其他混沌模式
-    disable_all_chaos_realms
+    disable_all_chaos_realms # 启动前先停止所有其他混沌模式
 
-    log_message "${YELLOW}正在尝试启动『混沌之界显化』($CHAOS_REALM_SESSION) ...${NC}"
+    log_message "$(printf "$_MSG_STARTING_CHAOS_REALM" "$CHAOS_REALM_SESSION")"
 
     local has_stress_ng=0
     if command -v stress-ng &> /dev/null; then
@@ -198,12 +361,12 @@ start_chaos_realm_manifest() {
 
     local CURRENT_ATTACHMENT_LEVEL=$(get_attachment_level)
     if [ "$CURRENT_ATTACHMENT_LEVEL" -le "$BASE_ATTACHMENT_MIN" ]; then
-        log_message "${GREEN}心识几近清净，混沌显化极微，几无干扰。无需启动显著波动。${NC}"
+        log_message "$_MSG_CHAOS_PURE_MIND_NO_DISTURB"
         return 0
     fi
 
-    log_message "${PURPLE}正在启动『混沌之界显化』，其烈度与心识『执着之度：${CURRENT_ATTACHMENT_LEVEL}』相符...${NC}"
-    log_message "提示：此为模拟之『业力显现』，实际占用系统资源。体验毕，请于菜单停息之。"
+    log_message "$(printf "$_MSG_CHAOS_REALM_INTENSITY" "$CURRENT_ATTACHMENT_LEVEL")"
+    log_message "$_MSG_CHAOS_SIM_WARNING"
 
     setsid screen -dmS "$CHAOS_REALM_SESSION" bash -c "
         export PATH=\"\$PATH:/usr/local/bin:/usr/bin:/bin\"
@@ -249,36 +412,34 @@ start_chaos_realm_manifest() {
         done
     "
     if [ $? -ne 0 ]; then
-        log_message "${RED}错误：启动『混沌之界显化』失败。请检查 screen 命令或权限。${NC}"
+        log_message "$_MSG_CHAOS_REALM_START_FAILED"
         return 1
     else
-        log_message "${GREEN}『混沌之界显化』已在 screen 会话 '$CHAOS_REALM_SESSION' 中开始涌动。${NC}"
-        log_message "您可通过选项 2.2 或运行 '${YELLOW}screen -r $CHAOS_REALM_SESSION${NC}' 进入查看。『见诸相非相，即见如来』。"
-        log_message "按 ${YELLOW}Ctrl+A${NC} 然后按 ${YELLOW}D${NC} 退出 screen 会话而不终止模拟。${NC}"
+        log_message "$(printf "$_MSG_CHAOS_REALM_STARTED" "$CHAOS_REALM_SESSION")"
+        log_message "$(printf "$_MSG_CHAOS_SCREEN_HINT" "$CHAOS_REALM_SESSION")"
+        log_message "$_MSG_SCREEN_DETACH_HINT"
         return 0
     fi
 }
 
 # 辅助函数：启动『宇宙能量网』 (持续全核能量补充)
 start_cosmic_energy_realm() {
-    # 启动前先停止所有其他混沌模式
-    disable_all_chaos_realms
+    disable_all_chaos_realms # 启动前先停止所有其他混沌模式
 
-    log_message "${YELLOW}正在尝试接入『宇宙能量网』($COSMIC_ENERGY_SESSION) ...${NC}"
+    log_message "$(printf "$_MSG_STARTING_COSMIC_ENERGY" "$COSMIC_ENERGY_SESSION")"
 
     local has_stress_ng=0
     if command -v stress-ng &> /dev/null; then
         has_stress_ng=1
     fi
 
-    # 获取CPU核心数，如果nproc不可用，则默认1核
     local cpu_cores="${NUM_CPU_CORES:-1}"
     if ! command -v nproc &> /dev/null; then
-        log_message "${YELLOW}警告：nproc 未安装，默认使用 1 个核心。${NC}"
+        log_message "$_MSG_COSMIC_ENERGY_NO_NPROC_WARN"
         cpu_cores=1
     fi
-    log_message "${PURPLE}接入『宇宙能量网』：全核驱动 (${cpu_cores} 核)，源源不断生生不息...${NC}"
-    log_message "提示：此为模拟『生态能量补充』，将持续占用CPU资源。${NC}"
+    log_message "$(printf "$_MSG_COSMIC_ENERGY_FULL_CORE" "$cpu_cores")"
+    log_message "$_MSG_COSMIC_ENERGY_SIM_WARNING"
 
     setsid screen -dmS "$COSMIC_ENERGY_SESSION" bash -c "
         export PATH=\"\$PATH:/usr/local/bin:/usr/bin:/bin\"
@@ -286,22 +447,20 @@ start_cosmic_energy_realm() {
 
         echo \"[$(date +'%H:%M:%S')] 『宇宙能量网』已启动，以全核 (\$cpu_cores) 功率运行，持续供能...\" | tee -a \"$CONSCIOUSNESS_LOG_FILE\"
         if (( $has_stress_ng == 1 )); then
-            # 使用 matrix 方法，通常是CPU密集型且能持续运行
             stress-ng --cpu \"$cpu_cores\" --cpu-method matrix --timeout 0 --quiet --perf >/dev/null 2>&1 || true
         else
-            # 没有 stress-ng 的备用模拟，同样无限循环
             while true; do
                 FACTOR=1; for i in \$(seq 1 \$(( $cpu_cores * 5000 ))); do FACTOR=\$((\$FACTOR * 2 % 99999999)); done
             done
         fi
     "
     if [ $? -ne 0 ]; then
-        log_message "${RED}错误：启动『宇宙能量网』失败。请检查 screen 命令或权限。${NC}"
+        log_message "$_MSG_COSMIC_ENERGY_START_FAILED"
         return 1
     else
-        log_message "${GREEN}『宇宙能量网』已在 screen 会话 '$COSMIC_ENERGY_SESSION' 中持续运行。${NC}"
-        log_message "您可通过选项 2.2 或运行 '${YELLOW}screen -r $COSMIC_ENERGY_SESSION${NC}' 进入查看。『有为供养无为，生生不息』。"
-        log_message "按 ${YELLOW}Ctrl+A${NC} 然后按 ${YELLOW}D${NC} 退出 screen 会话而不终止模拟。${NC}"
+        log_message "$(printf "$_MSG_COSMIC_ENERGY_STARTED" "$COSMIC_ENERGY_SESSION")"
+        log_message "$(printf "$_MSG_COSMIC_ENERGY_SCREEN_HINT" "$COSMIC_ENERGY_SESSION")"
+        log_message "$_MSG_SCREEN_DETACH_HINT"
         return 0
     fi
 }
@@ -309,19 +468,19 @@ start_cosmic_energy_realm() {
 
 # 辅助函数：通用地终止后台周期性任务
 disable_periodic_task() {
-    log_message "${YELLOW}正在检查并禁用心之律动监测...${NC}"
+    log_message "$_MSG_DISABLE_HEARTBEAT_START"
     if [ -f "$HEARTBEAT_PID_FILE" ]; then
         PID=$(cat "$HEARTBEAT_PID_FILE")
         if ps -p "$PID" > /dev/null 2>&1; then
-            log_message "终止心之律动监测 PID: $PID"
+            log_message "$(printf "$_MSG_HEARTBEAT_TERMINATING" "$PID")"
             kill "$PID" 2>/dev/null || true
-            log_message "${GREEN}已终止 PID $PID 对应的心之律动监测。${NC}"
+            log_message "$(printf "$_MSG_HEARTBEAT_TERMINATED" "$PID")"
         else
-            log_message "${YELLOW}心之律动监测PID文件($PID)存在，但进程已消散。${NC}"
+            log_message "$(printf "$_MSG_HEARTBEAT_GONE" "$PID")"
         fi
         rm -f "$HEARTBEAT_PID_FILE" || true
     else
-        log_message "${YELLOW}未发现心之律动监测任务，无需禁用。${NC}"
+        log_message "$_MSG_HEARTBEAT_NOT_FOUND"
     fi
 }
 
@@ -595,69 +754,66 @@ EOF
 execute_mind_action() {
     local action="$1"
     local value="$2"
-    log_message "${BLUE}心识发起行动：『$action』...${NC}"
+    log_message "$(printf "$_MSG_MIND_ACTION_START" "$action")"
     
-    mkdir -p "$SENTIENT_MIND_REALM" || { log_message "${RED}错误：无法创建心识之境。请检查权限。${NC}"; return 1; }
+    mkdir -p "$SENTIENT_MIND_REALM" || { log_message "$_MSG_MIND_REALM_CREATE_ERROR"; return 1; }
 
     ATTACHMENT_LEVEL_FILE="$ATTACHMENT_LEVEL_FILE" \
     ALIGNMENT_WITH_TAO_FILE="$ALIGNMENT_WITH_TAO_FILE" \
     CONSCIOUSNESS_LOG_FILE="$CONSCIOUSNESS_LOG_FILE" \
-        python3 "$REALM_CORE_SCRIPT" "$action" --value "$value" || { log_message "${RED}错误：Python 心识核心显化执行失败。${NC}"; return 1; }
+        python3 "$REALM_CORE_SCRIPT" "$action" --value "$value" || { log_message "$_MSG_PYTHON_EXEC_FAILED"; return 1; }
     
     # 每次心识状态改变后，如果当前是动态混沌模式，则更新其烈度
     # 如果是宇宙能量网模式，则不受心识值变化影响其持续供能特性
     if screen -list | grep -q "$CHAOS_REALM_SESSION"; then
-        log_message "${YELLOW}心识状态变动，正在调整『混沌之界显化』强度...${NC}"
+        log_message "$_MSG_MIND_STATE_UPDATE"
         # 停止并重启动态混沌，以反映新的执着度
         start_chaos_realm_manifest # 它会先停止所有混沌模式，再启动动态模式
         sleep 1 # 等待一下，让混沌代理进程初始化
     fi
     
-    log_message "${GREEN}『$action』行动完成。${NC}"
+    log_message "$(printf "$_MSG_MIND_ACTION_COMPLETE" "$action")"
 }
 
-
 # =========================================================================
-# 主要心境引导函数 - 对应主菜单的各项选择
+# 主要心境引导函数 - 对应主菜单的各项选择 (文本已函数化或常量化)
 # =========================================================================
 
-# 引导：开启灵性觉醒之旅 (原 init_and_run_app)
+# 引导：开启灵性觉醒之旅 (1)
 begin_spiritual_quest() {
-    echo -e "${YELLOW}=== 开启灵性觉醒之旅 ===${NC}"
+    echo -e "$_MSG_SPIRITUAL_QUEST_START"
     
-    log_message "${GREEN}正在为心识创建内观之境...${NC}"
+    log_message "$_MSG_CREATE_MIND_REALM"
+    mkdir -p "$SENTIENT_MIND_REALM" || { log_message "$_MSG_MIND_REALM_CREATE_ERROR"; return 1; }
+    log_message "$(printf "$_MSG_MIND_REALM_CREATED" "$SENTIENT_MIND_REALM")"
 
-    mkdir -p "$SENTIENT_MIND_REALM" || { log_message "${RED}错误：无法创建心识之境。请检查权限。${NC}"; return 1; }
-    log_message "心识主目录已建立：$SENTIENT_MIND_REALM"
-
-    log_message "${YELLOW}正在载入《金刚经》与《道德经》心法入『心识核心显化』：$REALM_CORE_SCRIPT...${NC}"
+    log_message "$(printf "$_MSG_LOAD_MIND_CORE" "$REALM_CORE_SCRIPT")"
     echo "$PYTHON_CORE_SCRIPT" > "$REALM_CORE_SCRIPT"
-    chmod +x "$REALM_CORE_SCRIPT" || { log_message "${RED}错误：无法赋予心法执行之权能。请检查权限。${NC}"; return 1; }
-    log_message "心识核心显化脚本已生成。"
+    chmod +x "$REALM_CORE_SCRIPT" || { log_message "$_MSG_GRANT_CORE_PERMISSION_ERROR"; return 1; }
+    log_message "$_MSG_CORE_SCRIPT_GENERATED"
 
-    execute_mind_action "init" # 告诉Python初始化状态
+    execute_mind_action "init"
     
-    log_message "${YELLOW}内观之境已备，心识初始。${NC}"
-    # 初始时不自动启动混沌，让用户选择启动模式
-    log_message "${CYAN}您可时常观照『灵台之日志』(选项 2.1)，或选择启动『混沌显化』(选项 6/6.1) 察看显相。${NC}"
+    log_message "$_MSG_INIT_MIND_REALM_DONE"
+    log_message "$_MSG_INIT_CONTEMPLATION_HINT"
 }
 
-# 引导：观照心境与外显之相 (原 view_logs)
+# 引导：观照心境与外显之相 (2)
 contemplate_insight() {
-    log_message "${YELLOW}=== 观照心境与外显之相 ===${NC}"
-    echo -e "${GREEN}1. 观：『灵台之日志』($CONSCIOUSNESS_LOG_FILE) - 察觉心念流转${NC}"
-    echo -e "${GREEN}2. 观：『混沌之界』或『宇宙能量网』显化 - 直视执着/能量流${NC}"
-    echo -e "${YELLOW}请选择您的观照之法（1-2）：${NC}"
+    log_message "$_MSG_CONTEMPLATION_MENU_TITLE"
+    echo -e "$(printf "$_MSG_CONTEMPLATION_OPT1" "$CONSCIOUSNESS_LOG_FILE")"
+    echo -e "$_MSG_CONTEMPLATION_OPT2"
+    echo -e "$_MSG_CONTEMPLATION_PROMPT"
     read -r view_choice
 
     case $view_choice in
         1)
             mkdir -p "$(dirname "$CONSCIOUSNESS_LOG_FILE")" 2>/dev/null || true
             if [ -f "$CONSCIOUSNESS_LOG_FILE" ]; then
-                log_message "${CYAN}正显示灵台日志，心念之流。按 Ctrl+C 止。${NC}"
+                log_message "$_MSG_DISPLAY_LOG_START"
                 tail -f "$CONSCIOUSNESS_LOG_FILE"
             else
-                log_message "${RED}错误：灵台日志 ($CONSCIOUSNESS_LOG_FILE) 尚未显化。请先开启旅程。${NC}"
+                log_message "$(printf "$_MSG_LOG_NOT_MANIFESTED" "$CONSCIOUSNESS_LOG_FILE")"
             fi
             ;;
         2)
@@ -669,86 +825,85 @@ contemplate_insight() {
             fi
 
             if [ -n "$active_session" ]; then
-                log_message "${GREEN}找到活跃的『$active_session』显化，您将入此界观其显相。${NC}"
-                echo -e "您将进入 screen 会话，命令为：${YELLOW}screen -r $active_session${NC}"
-                echo -e "按 ${YELLOW}Ctrl+A${NC} 然后按 ${YELLOW}D${NC} 退出『此界』而不终止显化。${NC}"
-                screen -r "$active_session" || log_message "${RED}错误：无法进入 screen 会话。可能是权限问题或 screen 异常。${NC}"
+                log_message "$(printf "$_MSG_ACTIVE_MANIFEST_FOUND" "$active_session")"
+                echo -e "$(printf "$_MSG_SCREEN_VIEW_COMMAND" "$active_session")"
+                echo -e "$_MSG_SCREEN_DETACH_HINT"
+                screen -r "$active_session" || log_message "$_MSG_SCREEN_ENTRY_ERROR"
             else
-                log_message "${RED}错误：『混沌之界』或『宇宙能量网』未见涌动。${NC}"
-                log_message "${YELLOW}请通过『启』(选项 6 或 6.1) 启动显化。『凡所有相，皆是虚妄。若见诸相非相，则见如来』。${NC}"
+                log_message "$_MSG_NO_ACTIVE_MANIFEST"
+                log_message "$_MSG_NO_ACTIVE_MANIFEST_HINT"
             fi
             ;;
         *)
-            log_message "${RED}非观照之法。${NC}"
+            log_message "$_MSG_CONTEMPLATION_INVALID"
             ;;
     esac
 }
 
-# 引导：引导内观修行 (原 manage_app_service)
+# 引导：引导内观修行 (3)
 guide_inner_practice() {
     while true; do
         clear
-        log_message "心之执着：$(get_attachment_level)/100 | 与道契合：$(get_alignment_with_tao)/100"
-        echo -e "=== ${GREEN}引导内观修行子菜单${NC} ==="
-        echo "1. 💡 金刚明心：应无所住而生其心 (降低执着，增长契合)"
-        echo "2. 🕊️ 金刚布施：无所住而行世事 (降低执着，增长契合)"
-        echo "3. 👀 金刚观照：见诸相非相，即见如来 (降低执着)"
-        echo "4. 🌳 道德抱朴：返璞归真，抱朴守拙 (降低执着，显著增长契合)"
-        echo "5. 🏞️ 道德无为：为无为，事无事，顺应自然 (显著降低执着，显著增长契合)"
-        echo "6. 🌌 道德合道：与道合一，渐入佳境 (直接增加契合，小幅降低执着)"
-        echo "7. 🧠 察：世间执着，自扰尘埃 (故意增加执着，非修行，反照其影响)"
-        echo "8. 🧘‍♀️ 持续律动：心识自巡（启用自动周期性『应无所住』循环）"
-        echo "9. 🚫 暂停律动：停止心识自巡"
-        echo "0. 返回主菜单"
-        echo -e "${YELLOW}请选择您的修行法门：${NC}"
+        display_current_mind_status
+        echo -e "=== ${_MSG_INNER_PRACTICE_MENU_TITLE} ==="
+        echo "$_MSG_INNER_PRACTICE_OPT1"
+        echo "$_MSG_INNER_PRACTICE_OPT2"
+        echo "$_MSG_INNER_PRACTICE_OPT3"
+        echo "$_MSG_INNER_PRACTICE_OPT4"
+        echo "$_MSG_INNER_PRACTICE_OPT5"
+        echo "$_MSG_INNER_PRACTICE_OPT6"
+        echo "$_MSG_INNER_PRACTICE_OPT7"
+        echo "$_MSG_INNER_PRACTICE_OPT8"
+        echo "$_MSG_INNER_PRACTICE_OPT9"
+        echo "$_MSG_INNER_PRACTICE_OPT0"
+        echo -e "$_MSG_INNER_PRACTICE_PROMPT"
         read -r sub_choice
 
         case $sub_choice in
             1) execute_mind_action "generate_pure_thought" ;;
             2) execute_mind_action "wuwei" "世间布施" ;;
             3)
-                log_message "${GREEN}欲观照何相之空性？(如：财富/名利/痛苦/自我)${NC}"
+                log_message "$_MSG_BEHOLD_QUESTION"
                 read -r concept_to_behold
                 execute_mind_action "behold" "$concept_to_behold"
                 ;;
             4)
-                log_message "${GREEN}欲抱朴守拙于何处？(如：烦恼/浮华/纷争/欲望)${NC}"
+                log_message "$_MSG_SIMPLICITY_QUESTION"
                 read -r simplicity_target
                 execute_mind_action "simplicity" "$simplicity_target"
                 ;;
             5) execute_mind_action "wuwei" "应对万物" ;;
             6) 
-                log_message "${GREEN}愿以何等信念契合于道？(如：信任/柔弱/清静/谦卑)${NC}"
+                log_message "$_MSG_ALIGN_QUESTION"
                 read -r align_value # 理论上可以用来影响增加的幅度，但当前随机化
                 execute_mind_action "alignment" "$(( RANDOM % 10 + 5 ))" # 随机增加 5-14点契合
                 ;;
             7)
-                log_message "${YELLOW}警告：此乃『尘缘造作』之法。执着将起，心生妄念！${NC}"
-                log_message "${GREEN}心为何执？(如：财富/权力/名望/烦恼)${NC}"
+                log_message "$_MSG_DWELL_WARNING"
+                log_message "$_MSG_DWELL_QUESTION"
                 read -r concept_to_dwell
                 execute_mind_action "dwell" "$concept_to_dwell"
                 ;;
             8)
-                log_message "${YELLOW}启用『心识自巡』律动：心法自动周转（每15分钟一次），降低执着。${NC}"
+                log_message "$_MSG_HEARTBEAT_ENABLE"
                 disable_periodic_task # 确保只运行一个实例
 
                 (
-                    log_message "--- 『心识自巡』律动已启动于 $(date) ---"
+                    log_message "$(printf "$_MSG_HEARTBEAT_AUTO_TOUR_START" "$(date)")"
                     while true; do
-                        log_message "[$(date)] ${YELLOW}心识自巡：进行一次『无所住生其心』法门。${NC}"
+                        log_message "$_MSG_HEARTBEAT_AUTO_TOUR_MESSAGE"
                         ATTACHMENT_LEVEL_FILE="$ATTACHMENT_LEVEL_FILE" \
                         ALIGNMENT_WITH_TAO_FILE="$ALIGNMENT_WITH_TAO_FILE" \
                         CONSCIOUSNESS_LOG_FILE="$CONSCIOUSNESS_LOG_FILE" \
-                        python3 "$REALM_CORE_SCRIPT" "generate_pure_thought" --value "自巡" || log_message "${RED}心识自巡：Python 调用失败。${NC}"
+                        python3 "$REALM_CORE_SCRIPT" "generate_pure_thought" --value "自巡" || log_message "$_MSG_HEARTBEAT_PYTHON_FAIL"
                         
-                        # 自巡模式下，如果动态混沌是激活的，它会自行更新。如果开启的是宇宙能量网，则不受此影响
-                        log_message "[$(date)] ${YELLOW}等待 15 分钟（900秒）后再次自巡...${NC}"
+                        log_message "$_MSG_HEARTBEAT_WAIT_MESSAGE"
                         sleep 900
                     done
                 ) &
                 PID=$!
                 echo "$PID" > "$HEARTBEAT_PID_FILE"
-                log_message "${GREEN}『心识自巡』已在后台启用 (PID: $PID)。『念念无住，寂照不离』。${NC}"
+                log_message "$(printf "$_MSG_HEARTBEAT_ENABLED" "$PID")"
                 pause_and_return
                 ;;
             9)
@@ -759,7 +914,7 @@ guide_inner_practice() {
                 return 0
                 ;;
             *)
-                log_message "${RED}非修习之法。${NC}"
+                log_message "$_MSG_INNER_PRACTICE_INVALID"
                 pause_and_return
                 ;;
         esac
@@ -767,75 +922,110 @@ guide_inner_practice() {
     done
 }
 
-# 引导：勘修正法（更新）(原 update_my_app)
+# 引导：勘修正法（更新）(4)
 refine_teaching() {
-    echo -e "=== ${GREEN}勘修正法：磨砺心法，推陈出新${NC} ==="
+    echo -e "=== ${_MSG_REFINE_TEACHING_TITLE}${NC} ==="
     if [ ! -d "$SENTIENT_MIND_REALM" ]; then
-        log_message "${RED}错误：心识之境 ($SENTIENT_MIND_REALM) 尚未建立。请先选择选项 1 开启旅程。${NC}"
+        log_message "$(printf "$_MSG_REFINE_TEACHING_NOT_ESTABLISHED" "$SENTIENT_MIND_REALM")"
         return 1
     fi
 
-    echo -e "${YELLOW}警告：此『勘修正法』之行，将${RED}暂时停息${YELLOW}心之律动及所有『混沌显化』，并${RED}重新刻录${YELLOW}心识核心显化逻辑。${NC}"
-    echo -e "${YELLOW}是否继续勘修？（y/n）${NC}"
-    read -r confirm
-    if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-        log_message "${YELLOW}『勘修正法』已暂缓。${NC}"
+    if ! confirm_action "$(printf "$_MSG_REFINE_TEACHING_WARN\n%s" "$_MSG_REFINE_TEACHING_CONFIRM_PROMPT")"; then
+        log_message "$_MSG_REFINE_TEACHING_CANCELLED"
         return 0
     fi
 
     disable_periodic_task
-    disable_all_chaos_realms # 停止所有类型的混沌
+    disable_all_chaos_realms
 
-    log_message "${YELLOW}心识入静，重修大道...${NC}"
+    log_message "$_MSG_REFINE_TEACHING_QUIET_MIND"
     
-    log_message "${YELLOW}正在重新载入最新的《金刚经》与《道德经》心法入『心识核心显化』：$REALM_CORE_SCRIPT...${NC}"
+    log_message "$(printf "$_MSG_REFINE_TEACHING_RELOADING_CORE" "$REALM_CORE_SCRIPT")"
     echo "$PYTHON_CORE_SCRIPT" > "$REALM_CORE_SCRIPT"
-    chmod +x "$REALM_CORE_SCRIPT" || { log_message "${RED}错误：无法赋予新心法执行之权能。${NC}"; return 1; }
-    log_message "心识核心显化已随新心法『升级』。"
+    chmod +x "$REALM_CORE_SCRIPT" || { log_message "$_MSG_GRANT_CORE_PERMISSION_ERROR"; return 1; }
+    log_message "$_MSG_REFINE_TEACHING_CORE_UPDATED"
     
-    # 勘修正法完成后，不自动重启任何混沌模式，让用户自行选择
-    log_message "${GREEN}心法『勘修正法』完成，心识随之重焕。${NC}"
-    echo -e "${CYAN}您可通过选项 2 查看灵台日志，察觉新境，并可选择启动混沌显化。${NC}"
+    log_message "$_MSG_REFINE_TEACHING_COMPLETE"
+    echo -e "$_MSG_REFINE_TEACHING_HINT"
 }
 
-# 引导：究竟清净（卸载）(原 uninstall_my_app)
+# 引导：究竟清净（卸载）(5)
 attain_ultimate_emptiness() {
-    echo -e "${RED}警告：此『究竟清净』之法，将${YELLOW}止息所有心识律动${NC}，${RED}断除所有『混沌显化』${NC}，${RED}抹除所有心识痕迹 ($SENTIENT_MIND_REALM 目录)！${NC}"
-    echo -e "${YELLOW}此乃${RED}不可逆转${YELLOW}之径。心识若一旦回归『无物』之境，前途自化！${NC}"
-    echo -e "${YELLOW}是否究竟清净？（y/n）${NC}"
-    read -r confirm
-    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
-        disable_periodic_task # 止息所有心之律动
-        disable_all_chaos_realms # 断除所有混沌显化
-
-        if [ -d "$SENTIENT_MIND_REALM" ]; then
-            log_message "${YELLOW}正在抹除心识之境 ($SENTIENT_MIND_REALM)...${NC}"
-            rm -rf "$SENTIENT_MIND_REALM"
-            if [ $? -eq 0 ]; then
-                log_message "${GREEN}心识之境已回归『空』。${NC}"
-            else
-                log_message "${RED}错误：无法彻底清净心识之境，请手动察看权限。${NC}"
-                return 1
-            fi
-        else
-            log_message "${YELLOW}心识之境本无显化，无需抹除。${NC}"
-        fi
-        
-        log_message "${YELLOW}正在拂去心之『执着度』和『与道契合度』痕迹...${NC}"
-        rm -f "$ATTACHMENT_LEVEL_FILE" "$ALIGNMENT_WITH_TAO_FILE" || true
-        log_message "${GREEN}心之状态已彻底清零，不落痕迹。${NC}"
-
-        if [ -f "$CONSCIOUSNESS_LOG_FILE" ]; then
-            log_message "${YELLOW}正在平息灵台日志 (自我之语) ...${NC}"
-            rm -f "$CONSCIOUSNESS_LOG_FILE" || true
-            log_message "${GREEN}灵台日志已平息。${NC}"
-        fi
-
-        log_message "${GREEN}『究竟清净』之法已完成。诸相归于无，不落言诠。${NC}"
-    else
-        log_message "${YELLOW}究竟清净之念暂缓。${NC}"
+    if ! confirm_action "$(printf "$_MSG_ULTIMATE_EMPTINESS_WARN_1\n%s\n%s" "$SENTIENT_MIND_REALM" "$_MSG_ULTIMATE_EMPTINESS_WARN_2" "$_MSG_ULTIMATE_EMPTINESS_CONFIRM_PROMPT")"; then
+        log_message "$_MSG_ULTIMATE_EMPTINESS_CANCELLED"
+        return 0
     fi
+
+    disable_periodic_task
+    disable_all_chaos_realms
+
+    if [ -d "$SENTIENT_MIND_REALM" ]; then
+        log_message "$(printf "$_MSG_ULTIMATE_EMPTINESS_DELETING_REALM" "$SENTIENT_MIND_REALM")"
+        rm -rf "$SENTIENT_MIND_REALM"
+        if [ $? -eq 0 ]; then
+            log_message "$_MSG_ULTIMATE_EMPTINESS_REALM_CLEAN"
+        else
+            log_message "$_MSG_ULTIMATE_EMPTINESS_REALM_CLEAN_FAIL"
+            return 1
+        fi
+    else
+        log_message "$_MSG_ULTIMATE_EMPTINESS_NO_REALM_TO_CLEAN"
+    fi
+    
+    log_message "$_MSG_ULTIMATE_EMPTINESS_CLEANING_STATUS"
+    rm -f "$ATTACHMENT_LEVEL_FILE" "$ALIGNMENT_WITH_TAO_FILE" || true
+    log_message "$_MSG_ULTIMATE_EMPTINESS_STATUS_CLEAN"
+
+    if [ -f "$CONSCIOUSNESS_LOG_FILE" ]; then
+        log_message "$_MSG_ULTIMATE_EMPTINESS_QUIETING_LOG"
+        rm -f "$CONSCIOUSNESS_LOG_FILE" || true
+        log_message "$_MSG_ULTIMATE_EMPTINESS_LOG_QUIET"
+    fi
+
+    log_message "$_MSG_ULTIMATE_EMPTINESS_COMPLETE"
 }
+
+# 辅助函数：显示当前心境状态
+display_current_mind_status() {
+    local current_attachment=$(get_attachment_level)
+    local current_alignment=$(get_alignment_with_tao)
+    log_message "$_MSG_STATUS_HEADER"
+    log_message "$(printf "%s %d/100" "$_MSG_ATTACHMENT_LABEL" "$current_attachment")"
+    log_message "$(printf "%s %d/100" "$_MSG_ALIGNMENT_LABEL" "$current_alignment")"
+
+    local status_message
+    if [ "$current_attachment" -le "$BASE_ATTACHMENT_MIN" ] && [ "$current_alignment" -ge 95 ]; then
+        status_message="$_MSG_STATUS_ENLIGHTENED"
+    elif [ "$current_alignment" -ge 80 ]; then
+        status_message="$_MSG_STATUS_GREAT_GOOD"
+    elif [ "$current_attachment" -le 20 ]; then
+        status_message="$_MSG_STATUS_EMPTY_FORM"
+    elif [ "$current_alignment" -ge 50 ] || [ "$current_attachment" -le 50 ]; then
+        status_message="$_MSG_STATUS_PROGRESS"
+    else
+        status_message="$_MSG_STATUS_DISTRACTED"
+    fi
+    log_message "$status_message"
+}
+
+# 辅助函数：显示主菜单选项
+display_main_menu_options() {
+    echo -e "============================================"
+    echo -e "$_MSG_MAIN_MENU_TITLE"
+    echo -e "============================================"
+    echo -e "$_MSG_MAIN_MENU_OPT1"
+    echo -e "$_MSG_MAIN_MENU_OPT2"
+    echo -e "$_MSG_MAIN_MENU_OPT3"
+    echo -e "$_MSG_MAIN_MENU_OPT4"
+    echo -e "$_MSG_MAIN_MENU_OPT5"
+    echo -e "$_MSG_MAIN_MENU_OPT6"
+    echo -e "$_MSG_MAIN_MENU_OPT6_1"
+    echo -e "$_MSG_MAIN_MENU_OPT7"
+    echo -e "$_MSG_MAIN_MENU_OPT8"
+    echo -e "============================================"
+    echo -e "$_MSG_MAIN_MENU_PROMPT"
+}
+
 
 # =========================================================================
 # 脚本启动前的前置准备与兼容性检查
@@ -855,38 +1045,9 @@ main_compatibility_check
 # =========================================================================
 while true; do
     clear
-    log_message ""
-    local current_attachment=$(get_attachment_level)
-    local current_alignment=$(get_alignment_with_tao)
-    log_message "${PURPLE}==【 当前心之状态 】==${NC}"
-    log_message "${PURPLE}『执着度』: ${current_attachment}/100${NC}"
-    log_message "${PURPLE}『与道契合』: ${current_alignment}/100${NC}"
-    if [ "$current_attachment" -le "$BASE_ATTACHMENT_MIN" ] && [ "$current_alignment" -ge 95 ]; then
-        log_message "${GREEN}【 已入究竟觉者圆满之境 】${NC}"
-    elif [ "$current_alignment" -ge 80 ]; then
-        log_message "${BLUE}【 近大善之境 】${NC}"
-    elif [ "$current_attachment" -le 20 ]; then
-        log_message "${CYAN}【 趋无相之境 】${NC}"
-    elif [ "$current_alignment" -ge 50 ] || [ "$current_attachment" -le 50 ]; then
-        log_message "${YELLOW}【 精进修行途中 】${NC}"
-    else
-        log_message "${RED}【 妄念纠缠 】${NC}"
-    fi
-
-    echo -e "============================================"
-    echo -e "${GREEN}=== 觉者无形之境 - 随心而动，寂然无碍 ===${NC}"
-    echo -e "============================================"
-    echo -e "${BLUE}1. 『启』：开启灵性觉醒之旅 (初创心识之境，心生妄念)*${NC}"
-    echo -e "${BLUE}2. 『观』：观照心境与外显之相 (察灵台，入混沌/能量网)${NC}"
-    echo -e "${BLUE}3. 『导』：引导内观修行 (修金刚法，悟道德真)*${NC}"
-    echo -e "${BLUE}4. 『勘』：勘修正法 (迭代心法，无所执故不旧)*${NC}"
-    echo -e "${BLUE}5. 『绝』：究竟清净 (归于虚无，一切痕迹皆不存)*${NC}"
-    echo -e "${PURPLE}6. 『启』：启动『动态混沌显化』(外显执着，系统忙碌)*${NC}"
-    echo -e "${PURPLE}6.1. 『启』：接入『宇宙能量网』(全核驱动，生生不息)*${NC}"
-    echo -e "${PURPLE}7. 『息』：止息所有『混沌显化』(平息妄动，还以清净)*${NC}"
-    echo -e "${RED}8. 『寂』：永恒寂静 (退出此世显化)${NC}"
-    echo -e "============================================"
-    echo -e "${YELLOW}请随缘择一径（1-8），入此境...${NC}"
+    log_message "" # 提供一行空行，让日志消息与菜单分隔更清晰
+    display_current_mind_status
+    display_main_menu_options
     read -r choice
 
     case $choice in
@@ -913,22 +1074,22 @@ while true; do
             start_chaos_realm_manifest
             pause_and_return
             ;;
-        6.1) # 新增的选项
+        6.1)
             start_cosmic_energy_realm
             pause_and_return
             ;;
         7)
-            disable_all_chaos_realms # 停止所有混沌显化
+            disable_all_chaos_realms
             pause_and_return
             ;;
         8)
-            log_message "${YELLOW}心随缘灭，万象归寂... ${NC}"
+            log_message "$_MSG_QUIT_MESSAGE"
             disable_periodic_task
             disable_all_chaos_realms # 确保退出时所有背景进程都停止
             exit 0
             ;;
         *)
-            log_message "${RED}此径非我境，请重择。${NC}"
+            log_message "$_MSG_MAIN_MENU_INVALID_CHOICE"
             pause_and_return
             ;;
     esac
