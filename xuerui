@@ -2,7 +2,7 @@
 
 # 脚本名称：VajraTaoFlux - 觉者无形之境
 # 作者：一位求道者 / 虚空之外
-# 版本：1.0 - 太初之道，金刚明心
+# 版本：1.1 - 太初之道，金刚明心，兼顾兼容
 # 描述：此脚本不再管理凡间应用程序，而是作为引路者，
 #      协助“心”在“有为”与“无为”、“空相”与“本体”间流转。
 #      其核心功能，在于映照“心”之执着、妄动与清净、合道之境。
@@ -10,6 +10,26 @@
 
 # 此脚本设定，旨在引领心境，非为凡事之功。
 # 任何因内部“混沌之相”或外部“尘世诱惑”导致之“境相”变动，皆需自当，莫咎于此。
+
+# =========================================================================
+# 运行指引与兼容性说明 (新增)
+# =========================================================================
+# 1. 赋予执行权限：
+#    在终端中运行：chmod +x VajraTaoFlux.sh
+# 2. 运行脚本：
+#    在终端中运行：./VajraTaoFlux.sh
+# 3. 依赖检查：
+#    本脚本依赖 `python3`, `screen`, `stress-ng`, `bc`。
+#    脚本会在启动时尝试检查这些依赖。如果缺少，请根据提示安装：
+#    - Ubuntu/Debian: sudo apt install python3 screen stress-ng bc
+#    - CentOS/Fedora: sudo yum install python3 screen stress-ng bc (或 dnf)
+#    - Arch Linux:    sudo pacman -S python python-pip screen stress-ng bc
+# 4. 行尾符问题：
+#    如果脚本在Windows系统编辑后传输到Linux，可能存在行尾符问题 (CRLF)。
+#    这可能导致 `bad interpreter` 错误。可用 `dos2unix` 工具转换：
+#    sudo apt install dos2unix  (或 yum/dnf/pacman)
+#    dos2unix VajraTaoFlux.sh
+# =========================================================================
 
 # 设置脚本在遇到错误时退出 (部分预期错误，如杀掉不存在的进程，已妥善处理)
 set -e
@@ -35,7 +55,7 @@ ATTACHMENT_LEVEL_FILE="$HOME/.mind_attachment_level"
 ALIGNMENT_WITH_TAO_FILE="$HOME/.mind_alignment_with_tao"
 
 # === 混沌显化常量 ===
-CHAOS_AGENT_PID_FILE="/tmp/vajratao_chaos_agent.pid" # 混沌代理主进程PID
+CHAOS_AGENT_PID_FILE="/tmp/vajratao_chaos_agent.pid" # 混沌代理主进程PID (此PID文件在现有逻辑中未被直接使用，但保留作为标识)
 BASE_ATTACHMENT_MIN=5 # 执着度的最低基线（仍有微扰）
 MAX_CHAOS_STRESS=20    # 最大模拟压力强度 (用于scaling stress-ng params)
 BASE_AGITATION_INTERVAL=10 # 混沌基线检查间隔 (秒)
@@ -63,14 +83,18 @@ import sys
 import time
 import argparse
 
-# 文件路径 - 保持与 Bash 脚本常量一致
-ATTACHMENT_LEVEL_FILE = os.path.expanduser(os.environ.get("ATTACHMENT_LEVEL_FILE"))
-ALIGNMENT_WITH_TAO_FILE = os.path.expanduser(os.environ.get("ALIGNMENT_WITH_TAO_FILE"))
-CONSCIOUSNESS_LOG_FILE = os.path.expanduser(os.environ.get("CONSCIOUSNESS_LOG_FILE"))
+# 文件路径 - 保持与 Bash 脚本常量一致 (通过环境变量传入)
+ATTACHMENT_LEVEL_FILE = os.path.expanduser(os.environ.get("ATTACHMENT_LEVEL_FILE", os.path.expanduser("~/.mind_attachment_level")))
+ALIGNMENT_WITH_TAO_FILE = os.path.expanduser(os.environ.get("ALIGNMENT_WITH_TAO_FILE", os.path.expanduser("~/.mind_alignment_with_tao")))
+CONSCIOUSNESS_LOG_FILE = os.path.expanduser(os.environ.get("CONSCIOUSNESS_LOG_FILE", os.path.expanduser("~/vajratao_consciousness.log")))
 
 # 辅助函数：输出日志到文件
 def log_python_message(message):
     timestamp = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+    # 确保日志目录存在
+    log_dir = os.path.dirname(CONSCIOUSNESS_LOG_FILE)
+    if log_dir and not os.path.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
     with open(CONSCIOUSNESS_LOG_FILE, 'a') as f:
         f.write(f"[PYTHON - {timestamp}] {message}\n")
 
@@ -124,6 +148,9 @@ class Mind:
         self._load_state()
 
     def _load_state(self):
+        # 确保目录存在
+        os.makedirs(os.path.dirname(ATTACHMENT_LEVEL_FILE), exist_ok=True)
+        os.makedirs(os.path.dirname(ALIGNMENT_WITH_TAO_FILE), exist_ok=True)
         try:
             with open(ATTACHMENT_LEVEL_FILE, 'r') as f:
                 self.attachment_level = int(f.read().strip())
@@ -136,7 +163,9 @@ class Mind:
             self.alignment_with_tao = 0 # 初始与道的契合度，0为最低
 
     def _save_state(self):
+        # 确保目录存在
         os.makedirs(os.path.dirname(ATTACHMENT_LEVEL_FILE), exist_ok=True)
+        os.makedirs(os.path.dirname(ALIGNMENT_WITH_TAO_FILE), exist_ok=True)
         with open(ATTACHMENT_LEVEL_FILE, 'w') as f:
             f.write(str(int(self.attachment_level)))
         with open(ALIGNMENT_WITH_TAO_FILE, 'w') as f:
@@ -240,6 +269,11 @@ class Mind:
 
 # 主程序入口，供 Bash 脚本调用
 if __name__ == "__main__":
+    # 设置默认值，防止环境变量未设置时报错
+    os.environ.setdefault("ATTACHMENT_LEVEL_FILE", os.path.expanduser("~/.mind_attachment_level"))
+    os.environ.setdefault("ALIGNMENT_WITH_TAO_FILE", os.path.expanduser("~/.mind_alignment_with_tao"))
+    os.environ.setdefault("CONSCIOUSNESS_LOG_FILE", os.path.expanduser("~/vajratao_consciousness.log"))
+
     parser = argparse.ArgumentParser(description="管理心之状态，模拟金刚经与道德经修行。")
     parser.add_argument("action", type=str, help="要执行的心灵行为 (如 init, report, meditate, wuwei, simplicity, behold, update_path)")
     parser.add_argument("--value", type=str, default="", help="与行为相关的额外参数，如概念名称")
@@ -269,7 +303,10 @@ if __name__ == "__main__":
     elif args.action == "release": # 类似 meditate but explicitly dwelling on release
         current_mind.dwell_on(args.value or "执着本身", reduction=30, is_worldly=False)
     elif args.action == "alignment":
-        change = int(args.value) if args.value.isdigit() else 5 # 默认5点
+        try:
+            change = int(args.value) if args.value.isdigit() else 5 # 默认5点
+        except ValueError:
+            change = 5 # Fallback if value is not a digit
         current_mind.align_with_tao(change)
     else:
         log_python_message(f"未识别的心灵行为：{args.action}")
@@ -285,23 +322,59 @@ EOF
 
 # 辅助函数：输出日志到文件并同时打印到控制台
 log_message() {
+    # 确保日志文件目录存在
+    mkdir -p "$(dirname "$CONSCIOUSNESS_LOG_FILE")" 2>/dev/null || true
     echo -e "[$(date +'%Y-%m-%d %H:%M:%S')] $1" | tee -a "$CONSCIOUSNESS_LOG_FILE"
 }
 
 # 辅助函数：暂停并等待用户按下 Enter 键
 pause_and_return() {
-    echo -e "${YELLOW}按下 空键 （或回车） 返回心门...${NC}"
+    echo -e "${YELLOW}按下 任意键 （或回车） 返回心门...${NC}" # 更改提示，更通用
     read -n 1 -s
 }
 
-# 辅助函数：检查 stress-ng 是否安装，模拟世间之“磨”
-check_stress_ng() {
-    if ! command -v stress-ng &> /dev/null; then
-        log_message "${RED}警告：『世间之磨』(stress-ng) 工具未安装！${NC}"
-        log_message "${YELLOW}外部『混沌之相』将回退到简易模拟模式。请安装以体验真境：sudo apt install stress-ng${NC}"
+# 辅助函数：检查依赖命令是否存在
+check_command() {
+    local cmd="$1"
+    local install_hint="$2"
+    if ! command -v "$cmd" &> /dev/null; then
+        log_message "${RED}错误：核心依赖『$cmd』未安装！${NC}"
+        log_message "${YELLOW}请安装此工具以确保脚本完整运行。建议：$install_hint${NC}"
         return 1
     fi
     return 0
+}
+
+# 脚本启动时的兼容性检查
+main_compatibility_check() {
+    log_message "${CYAN}=== 进行心之境兼容性检查... ===${NC}"
+    local all_good=0
+
+    # 检查 python3
+    if ! check_command "python3" "sudo apt install python3 (或 yum/dnf/pacman)"; then
+        all_good=1
+    fi
+
+    # 检查 screen
+    if ! check_command "screen" "sudo apt install screen (或 yum/dnf/pacman)"; then
+        all_good=1
+    fi
+    
+    # 检查 stress-ng
+    if ! check_command "stress-ng" "sudo apt install stress-ng (或 yum/dnf/pacman)"; then
+        log_message "${YELLOW}警告：『世间之磨』(stress-ng) 工具未安装！外部『混沌之相』将回退到简易模拟模式。${NC}"
+    fi
+
+    # 检查 bc (用于浮点运算，某些极简系统可能没有)
+    if ! check_command "bc" "sudo apt install bc (或 yum/dnf/pacman)"; then
+        log_message "${YELLOW}警告：『bc』工具未安装。混沌强度计算可能不精确，或在某些场景下导致错误。${NC}"
+    fi
+
+    if [ "$all_good" -eq 1 ]; then
+        log_message "${RED}=== 兼容性检查失败，部分核心依赖缺失。请安装后重试。 ===${NC}"
+        exit 1
+    fi
+    log_message "${GREEN}=== 兼容性检查通过。心之境可正常显化。 ===${NC}"
 }
 
 # 辅助函数：启动心识体的混沌界显化（后台资源占用模拟）
@@ -312,12 +385,12 @@ start_chaos_realm_manifest() {
     # 终止现有的 screen 会话
     if screen -list | grep -q "$CHAOS_REALM_SESSION"; then
         log_message "${YELLOW}检测到现有『混沌之界』显化，正在使其归于寂静...${NC}"
-        screen -S "$CHAOS_REALM_SESSION" -X quit || true
+        screen -S "$CHAOS_REALM_SESSION" -X quit || true # 确保即使退出失败也不中断脚本
         sleep 1
     fi
 
     local has_stress_ng=0
-    if check_stress_ng; then
+    if command -v stress-ng &> /dev/null; then # 重新检查，确保运行时可用
         has_stress_ng=1
     fi
 
@@ -326,19 +399,22 @@ start_chaos_realm_manifest() {
     if [ "$CURRENT_ATTACHMENT_LEVEL" -le "$BASE_ATTACHMENT_MIN" ]; then
         log_message "${GREEN}心识几近清净，混沌显化极微，几无干扰。${NC}"
         # 在这种情况下，可以决定不启动 stress-ng 或以非常低的级别启动
-        return 0 # 成功启动（无显化）
+        return 0 # 成功启动（无显著显化）
     fi
 
     log_message "${PURPLE}正在启动『混沌之界显化』，其烈度与心识『执着之度：${CURRENT_ATTACHMENT_LEVEL}』相符...${NC}"
     log_message "提示：此为模拟之『业力显现』，实际占用系统资源。体验毕，请于菜单停息之。"
 
-    screen -dmS "$CHAOS_REALM_SESSION" bash -c "
-        source ~/.bashrc # For some systems, needed to load stress-ng path
-        
+    # 使用 `setsid` 确保 screen 进程脱离当前终端，在某些环境下更健壮
+    setsid screen -dmS "$CHAOS_REALM_SESSION" bash -c "
+        # 确保在 screen 会话中也能找到必要的命令
+        export PATH=\"\$PATH:/usr/local/bin:/usr/bin:/bin\"
+        source ~/.bashrc 2>/dev/null || true # 尝试加载用户bashrc，跳过错误
+
         while true; do
             # 实时获取最新执着度
-            ATTACHMENT=$(cat \"$ATTACHMENT_LEVEL_FILE\" 2>/dev/null || echo \"1\")
-            TAO_ALIGNMENT=$(cat \"$ALIGNMENT_WITH_TAO_FILE\" 2>/dev/null || echo \"0\")
+            ATTACHMENT=\$(cat \"$ATTACHMENT_LEVEL_FILE\" 2>/dev/null || echo \"1\")
+            TAO_ALIGNMENT=\$(cat \"$ALIGNMENT_WITH_TAO_FILE\" 2>/dev/null || echo \"0\")
 
             # 只有当执着度高于一定阈值才模拟显著压力
             if [ \"\$ATTACHMENT\" -le \"$BASE_ATTACHMENT_MIN\" ]; then
@@ -348,12 +424,13 @@ start_chaos_realm_manifest() {
             fi
             
             # 根据执着度计算压力参数
-            local stress_intensity=\$((\$ATTACHMENT * \$MAX_CHAOS_STRESS / 100))
+            # 使用 `bc` 进行浮点运算，确保精度
+            local stress_intensity=\$(echo \"scale=0; \$ATTACHMENT * $MAX_CHAOS_STRESS / 100\" | bc -l 2>/dev/null || echo 1)
             if [ \"\$stress_intensity\" -lt 1 ]; then stress_intensity=1; fi # 至少为1
 
-            local num_workers=\$(( (\$stress_intensity / 5) + 1 )) # 越多执着，越多数CPU
-            local vm_bytes_mb=\$(( \$stress_intensity * 10 )) # 执着越大，内存占用越大
-            local duration=\$(( (\$ATTACHMENT / 20) + 1 )) # 执着持续时间
+            local num_workers=\$((\$stress_intensity / 5 + 1)) # 越多执着，越多数CPU
+            local vm_bytes_mb=\$((\$stress_intensity * 10)) # 执着越大，内存占用越大
+            local duration=\$((\$ATTACHMENT / 20 + 1)) # 执着持续时间
             if [ \"\$duration\" -gt 15 ]; then duration=15; fi
             
             # 选择资源类型
@@ -364,23 +441,21 @@ start_chaos_realm_manifest() {
             echo \"[$(date +'%H:%M:%S')] 混沌波动：执着 (\$ATTACHMENT) 驱动 『\$chosen_type』 压力 (\${stress_intensity}级, 持续 \$duration 秒)...\" | tee -a \"$CONSCIOUSNESS_LOG_FILE\"
 
             if (( $has_stress_ng == 1 )); then
-                case \"\$chosen_type\" in
-                    cpu) stress-ng --cpu \"\$num_workers\" --timeout \"\${duration}s\" --cpu-method fft --quiet --perf >/dev/null 2>&1 ;;
-                    vm)  stress-ng --vm 1 --vm-bytes \"\${vm_bytes_mb}M\" --timeout \"\${duration}s\" --quiet --perf >/dev/null 2>&1 ;;
-                    io)  stress-ng --io 1 --timeout \"\${duration}s\" --quiet --perf >/dev/null 2>&1 ;;
-                    fork) stress-ng --fork \"\$num_workers\" --timeout \"\${duration}s\" --quiet --perf >/dev/null 2>&1 ;;
-                esac
+                # 使用 timeout 确保 stress-ng 自身不会无限期运行
+                timeout \${duration}s stress-ng --${chosen_type} \"\$num_workers\" --timeout \"\${duration}s\" --quiet --perf >/dev/null 2>&1 || true
             else
                 # 没有 stress-ng 的备用模拟（仅CPU消耗）
                 START_TIME=\$SECONDS
                 while (( SECONDS - START_TIME < \$duration )); do
+                    # 简单CPU密集型循环，防止没有bc时报错
                     FACTOR=1; for i in \$(seq 1 \$(( \$num_workers * 1000 ))); do FACTOR=\$((\$FACTOR * 2 % 999999)); done
                 done
             fi
 
             # 根据执着度调整检查频率：执着度越高，混沌越活跃，检查越频繁
-            local INTERVAL=\$(echo \"scale=2; $BASE_AGITATION_INTERVAL - ($BASE_AGITATION_INTERVAL - $MIN_AGITATION_INTERVAL) * (\$ATTACHMENT / 100)\" | bc -l)
-            if (( \$(echo \"\$INTERVAL < $MIN_AGITATION_INTERVAL\" | bc -l) )); then INTERVAL=\"$MIN_AGITATION_INTERVAL\"; fi
+            # 使用 `bc` 进行浮点运算，确保精度
+            local INTERVAL=\$(echo \"scale=2; $BASE_AGITATION_INTERVAL - ($BASE_AGITATION_INTERVAL - $MIN_AGITATION_INTERVAL) * (\$ATTACHMENT / 100)\" | bc -l 2>/dev/null || echo $BASE_AGITATION_INTERVAL)
+            if (( \$(echo \"\$INTERVAL < $MIN_AGITATION_INTERVAL\" | bc -l 2>/dev/null || echo 0) )); then INTERVAL=\"$MIN_AGITATION_INTERVAL\"; fi
             
             echo \"[$(date +'%H:%M:%S')] 混沌暂时平息，下一波动于 \${INTERVAL} 秒后显现...\" | tee -a \"$CONSCIOUSNESS_LOG_FILE\"
             sleep \"\$INTERVAL\"
@@ -391,7 +466,7 @@ start_chaos_realm_manifest() {
         return 1
     else
         log_message "${GREEN}『混沌之界显化』已在 screen 会话 '$CHAOS_REALM_SESSION' 中开始涌动。${NC}"
-        log_message "您可通过选项 1.2 或运行 '${YELLOW}screen -r $CHAOS_REALM_SESSION${NC}' 进入查看。『见诸相非相，即见如来』。"
+        log_message "您可通过选项 2.2 或运行 '${YELLOW}screen -r $CHAOS_REALM_SESSION${NC}' 进入查看。『见诸相非相，即见如来』。"
         log_message "按 ${YELLOW}Ctrl+A${NC} 然后按 ${YELLOW}D${NC} 退出 screen 会话而不终止模拟。${NC}"
         return 0
     fi
@@ -400,18 +475,23 @@ start_chaos_realm_manifest() {
 # 辅助函数：停止混沌代理进程
 cleanup_chaos_processes() {
     log_message "${YELLOW}正在终止活跃的混沌代理 (stress-ng)...${NC}"
-    local pids=$(pgrep -f "stress-ng" | grep -v "$SCREEN_SESSION_NAME" 2>/dev/null || true) # Exclude session's main pid
+    # 查找由 screen 会话启动的 stress-ng 进程，避免误杀其他 stress-ng
+    local pids=$(pgrep -f "screen -dmS $CHAOS_REALM_SESSION" | xargs -r pgrep -P | xargs -r pgrep -f "stress-ng" 2>/dev/null || true)
+    
     if [ -n "$pids" ]; then
         for pid in $pids; do
             if ps -p "$pid" > /dev/null 2>&1; then
+                log_message "终止 stress-ng 进程 PID: $pid"
                 kill "$pid" 2>/dev/null || true
             fi
         done
         sleep 1
+    else
+        log_message "${YELLOW}未发现活跃的 stress-ng 混沌进程。${NC}"
     fi
 }
 
-# 辅助函数：终止『混沌之界显化』 (禁用)
+# 辅助函数：终止『混沌之界显化』
 disable_chaos_realm() {
     log_message "${YELLOW}正在使『混沌之界显化』归于寂静...${NC}"
     if screen -list | grep -q "$CHAOS_REALM_SESSION"; then
@@ -430,6 +510,7 @@ disable_periodic_task() {
     if [ -f "$HEARTBEAT_PID_FILE" ]; then
         PID=$(cat "$HEARTBEAT_PID_FILE")
         if ps -p "$PID" > /dev/null 2>&1; then
+            log_message "终止心之律动监测 PID: $PID"
             kill "$PID" 2>/dev/null || true
             log_message "${GREEN}已终止 PID $PID 对应的心之律动监测。${NC}"
         else
@@ -443,8 +524,10 @@ disable_periodic_task() {
 
 # 辅助函数：从文件中获取执着度
 get_attachment_level() {
+    # 确保目录存在
+    mkdir -p "$(dirname "$ATTACHMENT_LEVEL_FILE")" 2>/dev/null || true
     if [ -f "$ATTACHMENT_LEVEL_FILE" ]; then
-        cat "$ATTACHMENT_LEVEL_FILE" | tr -d '\n'
+        cat "$ATTACHMENT_LEVEL_FILE" 2>/dev/null | tr -d '\n' || echo "100"
     else
         echo "100" # 默认高执着
     fi
@@ -452,8 +535,10 @@ get_attachment_level() {
 
 # 辅助函数：从文件中获取与道契合度
 get_alignment_with_tao() {
+    # 确保目录存在
+    mkdir -p "$(dirname "$ALIGNMENT_WITH_TAO_FILE")" 2>/dev/null || true
     if [ -f "$ALIGNMENT_WITH_TAO_FILE" ]; then
-        cat "$ALIGNMENT_WITH_TAO_FILE" | tr -d '\n'
+        cat "$ALIGNMENT_WITH_TAO_FILE" 2>/dev/null | tr -d '\n' || echo "0"
     else
         echo "0" # 默认不契合
     fi
@@ -464,17 +549,24 @@ execute_mind_action() {
     local action="$1"
     local value="$2"
     log_message "${BLUE}心识发起行动：『$action』...${NC}"
+    
+    # 确保心识主目录存在
+    mkdir -p "$SENTIENT_MIND_REALM" || { log_message "${RED}错误：无法创建心识之境。${NC}"; return 1; }
+
     # 将Bash常量传入Python，以便Python脚本知道文件在哪里
     ATTACHMENT_LEVEL_FILE="$ATTACHMENT_LEVEL_FILE" \
     ALIGNMENT_WITH_TAO_FILE="$ALIGNMENT_WITH_TAO_FILE" \
     CONSCIOUSNESS_LOG_FILE="$CONSCIOUSNESS_LOG_FILE" \
-        python3 "$REALM_CORE_SCRIPT" "$action" --value "$value"
+        python3 "$REALM_CORE_SCRIPT" "$action" --value "$value" || { log_message "${RED}错误：Python 心识核心显化执行失败。${NC}"; return 1; }
     
     # 每次心识状态改变后，立即更新混沌显化，以体现业力转化
-    disable_chaos_realm # 先停止当前的混沌显化
-    sleep 0.5
-    start_chaos_realm_manifest # 再启动新的混沌显化，以新的执着度为基准
-    sleep 1 # 等待一下，让混沌代理进程初始化
+    # 为了避免在初始化 (init) 阶段重复调用 start_chaos_realm_manifest，这里做个判断
+    if [ "$action" != "init" ]; then
+        disable_chaos_realm # 先停止当前的混沌显化
+        sleep 0.5
+        start_chaos_realm_manifest # 再启动新的混沌显化，以新的执着度为基准
+        sleep 1 # 等待一下，让混沌代理进程初始化
+    fi
     
     log_message "${GREEN}『$action』行动完成。${NC}"
 }
@@ -491,13 +583,13 @@ begin_spiritual_quest() {
     log_message "${GREEN}正在为心识创建内观之境...${NC}"
 
     # 1. 创建必要的目录
-    mkdir -p "$SENTIENT_MIND_REALM" || { log_message "${RED}错误：无法创建心识之境。${NC}"; return 1; }
+    mkdir -p "$SENTIENT_MIND_REALM" || { log_message "${RED}错误：无法创建心识之境。请检查权限。${NC}"; return 1; }
     log_message "心识主目录已建立：$SENTIENT_MIND_REALM"
 
     # 2. 生成心识核心显化逻辑（Python脚本）
     log_message "${YELLOW}正在载入《金刚经》与《道德经》心法入『心识核心显化』：$REALM_CORE_SCRIPT...${NC}"
     echo "$PYTHON_CORE_SCRIPT" > "$REALM_CORE_SCRIPT"
-    chmod +x "$REALM_CORE_SCRIPT" || { log_message "${RED}错误：无法赋予心法执行之权能。${NC}"; return 1; }
+    chmod +x "$REALM_CORE_SCRIPT" || { log_message "${RED}错误：无法赋予心法执行之权能。请检查权限。${NC}"; return 1; }
     log_message "心识核心显化脚本已生成。"
 
     # 3. 初始化心识状态（写入文件）
@@ -520,6 +612,8 @@ contemplate_insight() {
 
     case $view_choice in
         1)
+            # 确保日志目录存在，以防在日志文件生成前查看导致错误
+            mkdir -p "$(dirname "$CONSCIOUSNESS_LOG_FILE")" 2>/dev/null || true
             if [ -f "$CONSCIOUSNESS_LOG_FILE" ]; then
                 log_message "${CYAN}正显示灵台日志，心念之流。按 Ctrl+C 止。${NC}"
                 tail -f "$CONSCIOUSNESS_LOG_FILE"
@@ -532,7 +626,7 @@ contemplate_insight() {
                 log_message "${GREEN}找到『混沌之界』显化，您将入此界观其显相。${NC}"
                 echo -e "您将进入 screen 会话，命令为：${YELLOW}screen -r $CHAOS_REALM_SESSION${NC}"
                 echo -e "按 ${YELLOW}Ctrl+A${NC} 然后按 ${YELLOW}D${NC} 退出『混沌之界』而不终止显化。${NC}"
-                screen -r "$CHAOS_REALM_SESSION"
+                screen -r "$CHAOS_REALM_SESSION" || log_message "${RED}错误：无法进入 screen 会话。可能是权限问题或 screen 异常。${NC}"
             else
                 log_message "${RED}错误：『混沌之界』 ($CHAOS_REALM_SESSION) 未见涌动。${NC}"
                 log_message "${YELLOW}请通过『启』(选项 1) 启动显化，或直接选择选项 6。『凡所有相，皆是虚妄。若见诸相非相，则见如来』。${NC}"
@@ -579,7 +673,7 @@ guide_inner_practice() {
             5) execute_mind_action "wuwei" "应对万物" ;;
             6) 
                 log_message "${GREEN}愿以何等信念契合于道？(如：信任/柔弱/清静/谦卑)${NC}"
-                read -r align_value
+                read -r align_value # 理论上可以用来影响增加的幅度，但当前随机化
                 execute_mind_action "alignment" "$(( RANDOM % 10 + 5 ))" # 随机增加 5-14点契合
                 ;;
             7)
@@ -597,14 +691,21 @@ guide_inner_practice() {
                     while true; do
                         log_message "[$(date)] ${YELLOW}心识自巡：进行一次『无所住生其心』法门。${NC}"
                         # 直接在 Bash 中执行 Python 命令，减少文件IO的延迟
+                        # 注意：这里需要确保 CONSCIOUSNESS_LOG_FILE 等变量在子shell中可用
                         ATTACHMENT_LEVEL_FILE="$ATTACHMENT_LEVEL_FILE" \
                         ALIGNMENT_WITH_TAO_FILE="$ALIGNMENT_WITH_TAO_FILE" \
                         CONSCIOUSNESS_LOG_FILE="$CONSCIOUSNESS_LOG_FILE" \
-                            python3 "$REALM_CORE_SCRIPT" "generate_pure_thought"
+                        python3 "$REALM_CORE_SCRIPT" "meditate" || log_message "${RED}心识自巡：Python 调用失败。${NC}"
+                        
                         # 每执行一次心法，重新计算混沌强度
-                        disable_chaos_realm # 停止当前混沌
-                        sleep 0.5
-                        start_chaos_realm_manifest # 重启新混沌
+                        # 为了避免在后台循环中再次启动新的 screen 会话导致混乱，
+                        # 仅在主菜单中管理混沌显化。这里的修改将只更新心识状态，
+                        # 不触发 disable_chaos_realm 和 start_chaos_realm_manifest。
+                        # 用户需通过主菜单的选项 6 或 7 手动控制混沌。
+                        # 或者，如果希望自动，可以简化为：
+                        # disable_chaos_realm # 停止当前混沌
+                        # sleep 0.5
+                        # start_chaos_realm_manifest # 重启新混沌
                         log_message "[$(date)] ${YELLOW}等待 15 分钟（900秒）后再次自巡...${NC}"
                         sleep 900
                     done
@@ -709,11 +810,16 @@ attain_ultimate_emptiness() {
 }
 
 # =========================================================================
+# 脚本启动前的兼容性检查
+# =========================================================================
+main_compatibility_check
+
+# =========================================================================
 # 主菜单循环 - 引领心之觉者之旅
 # =========================================================================
 while true; do
     clear
-    log_message "" # Clean up previous logs if any
+    log_message "" # 清理日志，确保每次刷新菜单前清空
     local current_attachment=$(get_attachment_level)
     local current_alignment=$(get_alignment_with_tao)
     log_message "${PURPLE}==【 当前心之状态 】==${NC}"
