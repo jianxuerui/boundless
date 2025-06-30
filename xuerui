@@ -27,10 +27,10 @@ function check_node_pm2() {
         PM2_PATH=$(npm config get prefix)/bin
         if [[ ":$PATH:" != *":$PM2_PATH:"* ]]; then
             echo "🔧 将 npm bin 路径添加到 PATH 环境变量..."
-            export PATH="$PM2_PATH:$PATH"
-            # 考虑将其永久添加到 ~/.bashrc 或 /etc/profile.d/
             echo "export PATH=\"$PM2_PATH:\$PATH\"" >> ~/.profile # 确保重启后也有效
             source ~/.profile
+            # For current session if it was root
+            export PATH="$PM2_PATH:$PATH"
         fi
         echo "✅ pm2 安装成功。"
     fi
@@ -87,13 +87,13 @@ function build_image() {
     cd "$WORKDIR"
 
     # Dockerfile
-    # 移除了 screen，nexus-network 直接运行。
     cat > Dockerfile <<EOF
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PROVER_ID_FILE=/root/.nexus/node-id
-ENV NEXUS_LOG_FILE=/root/nexus.log # 容器内部日志路径，用于 tee
+# 容器内部日志路径，用于 tee
+ENV NEXUS_LOG_FILE=/root/nexus.log 
 
 # 更新包列表并安装所需工具
 RUN apt-get update && apt-get install -y \
@@ -118,7 +118,7 @@ RUN curl -sSL https://cli.nexus.xyz/ | NONINTERACTIVE=1 sh \
 
 # Docker HEALTHCHECK 用于检查容器内服务是否运行
 # 检查 nexus-network 进程是否存在，如果不存在则容器不健康
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 CMD pgrep nexus-network >/dev/null || exit 1
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 CMD pgrep -f nexus-network >/dev/null || exit 1
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
@@ -164,7 +164,7 @@ function graceful_shutdown() {
     # 这里如果 nexus-network 是 PID 1，Docker 会直接处理它。
     # 如果您需要额外步骤（例如清理），可以添加在此处。
     # 示例: 可以简单地等待，让 Docker 自己处理 PID 1 收到 SIGTERM 后的默认行为
-    wait \$(pgrep nexus-network) 2>/dev/null || true # 等待进程结束，不报错
+    wait \$(pgrep -f nexus-network) 2>/dev/null || true # 等待进程结束，不报错
     echo "✅ nexus-network 进程已退出。"
     exit 0
 }
@@ -219,10 +219,12 @@ function run_container() {
         echo "⚠️ 检测到日志路径 $log_file 为目录，正在删除并重新创建文件..."
         rm -rf "$log_file" || { echo "🔴 错误：无法删除目录 $log_file。"; exit 1; }
     fi
+    # 重新检查日志文件是否为常规文件或已创建
     if [ ! -f "$log_file" ]; then
         touch "$log_file" || { echo "🔴 错误：无法创建日志文件 $log_file。"; exit 1; }
         chmod 644 "$log_file" || { echo "🔴 错误：无法设置日志文件权限 $log_file。"; exit 1; }
     fi
+
 
     echo "🚀 启动容器 $container_name ..."
     # 将宿主机日志文件挂载到容器内部的 /root/nexus.log，与 entrypoint.sh 保持一致
@@ -308,6 +310,8 @@ function list_nodes() {
             else
                 limit_mem="${inspect_mem_limit_bytes}B"
             fi
+        else
+             limit_mem="不限"
         fi
 
         # 仅当容器状态为 'Up' (运行中) 时，才尝试获取实时 CPU 和内存使用率
@@ -341,7 +345,7 @@ function list_nodes() {
     echo "提示："
     echo "- CPU: 显示容器CPU使用百分比 (仅对运行中容器)"
     echo "- 内存使用: 显示容器当前使用的内存 (仅对运行中容器)"
-    echo "- 内存限制: 显示容器创建时设置的内存限制 (即使容器已停止)"
+    echo "- 内存限制: 显示容器创建时设置的内存限制 (即使容器已停止, \"不限\" 表示未设置限制)"
     echo "- 状态: 显示容器的运行状态 (Up/Exited)"
     echo "- 启动时间: 显示容器的创建时间"
     read -rp "按任意键返回菜单"
@@ -460,7 +464,7 @@ function select_node_to_view() {
         return
     fi
 
-    if [ "$choice" -ge 1 ] && [ "$choice" -le ${#all_nodes[@]} ]; then
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#all_nodes[@]} ]; then
         local selected_node=${all_nodes[$((choice-1))]}
         view_node_logs "$selected_node"
     else
@@ -507,7 +511,7 @@ function uninstall_all_nodes() {
 function setup_default_auto_cleanup() {
     local days=7 # 默认保留7天的日志
     
-    read -rp "请输入日志保留天数（默认 ${days} 天）: " user_days
+    read -rp "请输入日志保留天数（默认 ${days} 天，输入 0 不保留）：" user_days
     if [[ -n "$user_days" && "$user_days" =~ ^[0-9]+$ && "$user_days" -ge 0 ]]; then
         days="$user_days"
     elif [[ -n "$user_days" ]]; then
@@ -596,19 +600,19 @@ function batch_rotate_nodes() {
     done
 
     local default_nodes_per_round=$(( (${#node_ids[@]} < 5) ? ${#node_ids[@]} : 5 )) # 默认每轮启动最多5个，如果总数小于5，则启动总数
-    read -rp "请输入每批次要同时运行的节点数量（默认：${default_nodes_per_round}）: " nodes_per_round
-    if [ -z "$nodes_per_round" ]; then
+    read -rp "请输入每批次要同时运行的节点数量（默认：${default_nodes_per_round}）: " nodes_per_round_input
+    if [ -z "$nodes_per_round_input" ]; then
+        nodes_per_round="$default_nodes_per_round"
+    elif [[ "$nodes_per_round_input" =~ ^[0-9]+$ ]] && [ "$nodes_per_round_input" -ge 1 ]; then
+        nodes_per_round="$nodes_per_round_input"
+    else
+        echo "🔴 无效的节点数量，请输入正整数，将使用默认值。"
         nodes_per_round="$default_nodes_per_round"
     fi
 
     # 验证输入
-    if ! [[ "$nodes_per_round" =~ ^[0-9]+$ ]] || [ "$nodes_per_round" -lt 1 ]; then
-        echo "🔴 无效的节点数量，请输入正整数。"
-        read -rp "按任意键返回菜单"
-        return
-    fi
     if [ "$nodes_per_round" -gt ${#node_ids[@]} ]; then
-        echo "⚠️ 警告：设定的每批次启动数量 ($nodes_per_round) 超过了总节点数 (${#node_ids[@]})。将按总节点数处理，所有节点将同时运行。"
+        echo "⚠️ 警告：设定的每批次启动数量 ($nodes_per_round) 超过了总节点数 (${#node_ids[@]})。所有节点将同时运行。"
         nodes_per_round=${#node_ids[@]}
     fi
 
@@ -686,17 +690,19 @@ if [ -d "$node_log_file" ]; then
     echo "⚠️ 日志路径 $node_log_file 是目录，尝试删除并重新创建。"
     rm -rf "$node_log_file" || echo "🔴 错误：无法删除目录 $node_log_file。"
 fi
+# 重新检查日志文件是否为常规文件或已创建
 if [ ! -f "$node_log_file" ]; then
     touch "$node_log_file" || echo "🔴 错误：无法创建日志文件 $node_log_file。"
     chmod 644 "$node_log_file" || echo "🔴 错误：无法设置日志文件权限 $node_log_file。"
 fi
 
 # 如果容器已存在，停止并删除，以便重新创建新的（包含资源限制或更新）
-docker ps -a --format '{{.Names}}' | grep -qw "$container_name" && {
+# 使用 filter 更精确匹配，确保是 exact name 而不是 prefix match
+if docker ps -a --format '{{.Names}}' | grep -Eq "^${container_name}$"; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')]   🔍 发现旧容器 ${container_name}，停止并删除..."
     docker stop -t 30 "${container_name}" >/dev/null 2>&1 || true
     docker rm -f "${container_name}" >/dev/null 2>&1 || true
-}
+fi
 
 # 启动带有资源限制的新容器
 docker run -d --name "${container_name}" \
@@ -723,8 +729,9 @@ ROTATION_INTERVAL_SECONDS=$rotation_interval_seconds # 轮换周期
 
 # 所有参与轮换的节点ID列表，用于确保每次只激活当前组的节点
 # 使用 readarray 确保 ALL_NODE_IDS 是一个实际的 bash 数组
-# 注意这里通过 bash -c 将数组元素以换行符分隔传递给 readarray
-readarray -t ALL_NODE_IDS <<<"\$(echo -e "$(printf "%s\\n" "${node_ids[@]}")")"
+# 通过 heredoc 和 printf 构建，避免任何 IFS 问题
+readarray -t ALL_NODE_IDS <<<"$(printf "%s\\n" "${node_ids[@]}")"
+
 BASE_CONTAINER_NAME="$BASE_CONTAINER_NAME"
 SCRIPT_DIR="$script_dir"
 NODES_PER_ROUND=$nodes_per_round
@@ -736,6 +743,7 @@ function stop_inactive_groups() {
 
     # 获取所有 BASE_CONTAINER_NAME- 前缀的容器（不论状态）
     local all_known_containers_raw=\$(docker ps -a --filter "name=\${BASE_CONTAINER_NAME}-" --format '{{.Names}}' 2>/dev/null)
+    # readarray 用于将多行字符串转换为数组，确保每个容器名作为一个元素
     readarray -t ALL_KNOWN_CONTAINERS_ARRAY <<< "\$all_known_containers_raw"
 
     for container_name in "\${ALL_KNOWN_CONTAINERS_ARRAY[@]}"; do
@@ -764,13 +772,13 @@ function stop_inactive_groups() {
                         docker stop -t 10 "\$target_container_id" >/dev/null 2>&1 || true
                         docker rm -f "\$target_container_id" >/dev/null 2>&1 || true
                     else
-                        echo "[$(date '+%Y-%m-%d %H:%M:%S')]   - 节点 \${container_name} 已停止，无需操作。(组: \$node_group_num, 状态: \$status)"
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')]   - 节点 \${container_name} 已停止且已退出，无需操作。(组: \$node_group_num, 状态: \$status)"
                     fi
                 fi
             fi
         else
             # 处理命名匹配但不在白名单内的容器，可能是旧的或手动创建的，不建议删除
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')]   - 发现非当前批次管理或不匹配列表的容器: \$container_name (不执行停止操作)"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')]   - 发现非轮换批次管理的容器: \$container_name (不执行停止操作)"
         fi
     done
 }
