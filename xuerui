@@ -23,6 +23,15 @@ function check_node_pm2() {
     if ! command -v pm2 >/dev/null 2>&1; then
         echo "✅ pm2 未安装，正在安装..."
         npm install -g pm2 || { echo "🔴 错误：pm2 安装失败。"; exit 1; }
+        # 配置 npm prefix，确保 pm2 可执行文件在 PATH 中
+        PM2_PATH=$(npm config get prefix)/bin
+        if [[ ":$PATH:" != *":$PM2_PATH:"* ]]; then
+            echo "🔧 将 npm bin 路径添加到 PATH 环境变量..."
+            export PATH="$PM2_PATH:$PATH"
+            # 考虑将其永久添加到 ~/.bashrc 或 /etc/profile.d/
+            echo "export PATH=\"$PM2_PATH:\$PATH\"" >> ~/.profile # 确保重启后也有效
+            source ~/.profile
+        fi
         echo "✅ pm2 安装成功。"
     fi
 }
@@ -33,13 +42,24 @@ function check_docker() {
     if ! command -v docker >/dev/null 2>&1; then
         echo "✅ Docker 未安装，正在安装..."
         apt update || { echo "🔴 错误：apt update 失败。"; exit 1; }
-        apt install -y apt-transport-https ca-certificates curl software-properties-common -y || { echo "🔴 错误：Docker 依赖安装失败。"; exit 1; }
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg || { echo "🔴 错误：Docker GPG 密钥下载失败。"; exit 1; }
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null || { echo "🔴 错误：Docker APT 源添加失败。"; exit 1; }
+        # 修正 gpg 命令以适配更新的 apt
+        apt install -y ca-certificates curl gnupg lsb-release || { echo "🔴 错误：Docker 依赖安装失败。"; exit 1; }
+        mkdir -m 0755 -p /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg || { echo "🔴 错误：Docker GPG 密钥下载失败。"; exit 1; }
+        echo \
+            "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+            $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null || { echo "🔴 错误：Docker APT 源添加失败。"; exit 1; }
         apt update || { echo "🔴 错误：apt update 失败。"; exit 1; }
-        apt install -y docker-ce docker-ce-cli containerd.io -y || { echo "🔴 错误：Docker CE 安装失败。"; exit 1; }
+        apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y || { echo "🔴 错误：Docker CE 安装失败。"; exit 1; }
         systemctl enable docker || { echo "🔴 错误：启用 Docker 失败。"; exit 1; }
         systemctl start docker || { echo "🔴 错误：启动 Docker 失败。"; exit 1; }
+        # 增加当前用户到 docker 组，避免每次都用 sudo
+        if ! getent group docker | grep -q "\b$(whoami)\b"; then
+            echo "🔧 将当前用户添加到 docker 用户组..."
+            usermod -aG docker "$(whoami)" || { echo "⚠️ 无法将用户添加到 docker 组。可能需要重新登录或使用 sudo。"; }
+            echo "✅ 用户已添加到 docker 组。请退出当前 SSH 会话并重新登录以使更改生效。"
+            sleep 3 # 等待用户阅读消息
+        fi
         echo "✅ Docker 安装并启动成功。"
     fi
 }
@@ -48,11 +68,12 @@ function check_docker() {
 function setup_pm2_startup() {
     echo "✅ 设置 PM2 启动脚本以确保服务持久化..."
     if command -v pm2 >/dev/null 2>&1; then
+        # 尝试使用 systemd，如果失败则回退到其他类型
         pm2 startup systemd || pm2 startup || echo "⚠️ PM2 startup 命令可能失败，请手动设置：pm2 startup"
         pm2 save || echo "⚠️ PM2 save 命令失败，请手动执行：pm2 save"
         echo "✅ PM2 服务持久化设置完成。"
     else
-        echo "🔴 错误：pm2 未安装，无法设置服务持久化。"
+        echo "🔴 错误：pm2 未安装，无法设置服务持久化。请尝试执行选项6先进行安装。"
     fi
 }
 
@@ -60,43 +81,52 @@ function setup_pm2_startup() {
 function build_image() {
     echo "⚙️ 正在构建 Docker 镜像: $IMAGE_NAME ..."
     WORKDIR=$(mktemp -d)
-    # Ensure to change back and cleanup even on script exit
-    trap "cd - >/dev/null 2>&1; rm -rf \"$WORKDIR\"" EXIT 
+    # 确保在脚本退出时清理临时目录
+    trap "cd - >/dev/null 2>&1; rm -rf \"$WORKDIR\"" EXIT HUP INT TERM
 
     cd "$WORKDIR"
 
     # Dockerfile
+    # 移除了 screen，nexus-network 直接运行。
     cat > Dockerfile <<EOF
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PROVER_ID_FILE=/root/.nexus/node-id
+ENV NEXUS_LOG_FILE=/root/nexus.log # 容器内部日志路径，用于 tee
 
 # 更新包列表并安装所需工具
 RUN apt-get update && apt-get install -y \
     curl \
-    screen \
     bash \
     procps \
+    locales \
+    gawk \
     && rm -rf /var/lib/apt/lists/*
+
+# 设置 locales 以避免某些命令出现警告
+RUN locale-gen en_US.UTF-8
+ENV LANG en_US.UTF-8
+ENV LANGUAGE en_US:en
+ENV LC_ALL en_US.UTF-8
 
 # 自动下载安装最新版 nexus-network
 # 使用 NONINTERACTIVE=1 避免交互式安装
 RUN curl -sSL https://cli.nexus.xyz/ | NONINTERACTIVE=1 sh \
-    && ln -sf /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network
-
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+    && ln -sf /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network \
+    && rm -rf ~/.npm ~/.config
 
 # Docker HEALTHCHECK 用于检查容器内服务是否运行
 # 检查 nexus-network 进程是否存在，如果不存在则容器不健康
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 CMD pgrep nexus-network >/dev/null || exit 1
 
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 ENTRYPOINT ["/entrypoint.sh"]
 EOF
 
-    # entrypoint.sh
-    # 强化 entrypoint.sh，处理优雅退出，并确保后台进程
+    # entrypoint.sh (已修复，更健壮且符合Docker最佳实践)
     cat > entrypoint.sh <<EOF
 #!/bin/bash
 set -e
@@ -104,8 +134,8 @@ set -e
 PROVER_ID_FILE="/root/.nexus/node-id"
 NEXUS_LOG_FILE="/root/nexus.log" # 容器内部日志路径，与宿主机挂载点一致
 
-# 清理可能的旧 screen 会话，避免干扰
-screen -S nexus -X quit >/dev/null 2>&1 || true
+# 确保日志目录存在 (对于 Dockerfile COPY 后可能不完全适用，但仍是好习惯)
+mkdir -p "\$(dirname "\$NEXUS_LOG_FILE")" || true
 
 # 检查 NODE_ID 环境变量
 if [ -z "\$NODE_ID" ]; then
@@ -119,54 +149,43 @@ echo "✅ 正在使用 node-id: \$NODE_ID"
 
 # 检查 nexus-network 命令是否可用
 if ! command -v nexus-network >/dev/null 2>&1; then
-    echo "错误：nexus-network 未安装或不可用"
+    echo "错误：nexus-network 未安装或不可用。请检查 Dockerfile。"
     exit 1
 fi
 
 # 使用 trap 捕获 SIGTERM (Docker stop 信号) 以实现优雅关闭
+# 由于 nexus-network 现在是主要进程，Docker 的 SIGTERM 会直接发送给它
+# 如果 nexus-network 自身不支持 SIGTERM 优雅关闭，则需要在它停止前发送特殊信号或进行特定操作
+# 对于通常的进程，系统会自动处理 SIGTERM。这里可以移除具体的 graceful_shutdown 函数
+# 如果 nexus-network 需要特别的处理，需要查看其文档
 function graceful_shutdown() {
-    echo "🛑 收到停止信号 (SIGTERM)，尝试优雅关闭 nexus-network..."
-    # 给 screen 会话中的进程发送 Ctrl+C 信号
-    screen -S nexus -X stuff \$'\\x03' || true
-    sleep 5 # 留出时间让进程响应关闭
-
-    # 如果进程仍在运行，则强制终止 screen 会话
-    if pgrep nexus-network >/dev/null 2>&1; then
-        echo "⚠️ nexus-network 进程未在指定时间内响应，强制关闭 screen 会话。"
-        screen -S nexus -X quit >/dev/null 2>&1 || true
-    else
-        echo "✅ nexus-network 进程已正常关闭。"
-    fi
+    echo "🛑 收到停止信号 (SIGTERM)。尝试等待 nexus-network 优雅退出..."
+    # 可以发送 SIGINT (Ctrl+C) 或 SIGTERM 给 PID 1 进程
+    # 这里如果 nexus-network 是 PID 1，Docker 会直接处理它。
+    # 如果您需要额外步骤（例如清理），可以添加在此处。
+    # 示例: 可以简单地等待，让 Docker 自己处理 PID 1 收到 SIGTERM 后的默认行为
+    wait \$(pgrep nexus-network) 2>/dev/null || true # 等待进程结束，不报错
+    echo "✅ nexus-network 进程已退出。"
     exit 0
 }
 
-trap graceful_shutdown SIGTERM
+# Trap SIGTERM 仅作为后备，Docker 会直接发送 SIGTERM 到 exec 启动的进程
+# 这在 exec 后就没有太多作用了，因为 trap 是针对当前 shell 的。
+# 通常，让容器的 PID 1 进程直接接收 Docker 的信号即可。
+# 如果 nexus-network 优雅关闭不工作，可能是它自身不处理信号。
+# 更好的做法是确保 nexus-network 能够处理 TERM 信号。
+# 这里将 trap 设置为 exec *之前*，这样它会处理退出，
+# 但是 exec 后，这个 trap 仅存在于替换的进程中。
+trap 'graceful_shutdown' SIGTERM
 
 echo "🚀 启动 nexus-network 节点..."
-# 在后台启动一个 screen 会话，并在其中运行 nexus-network，将其标准输出和标准错误重定向到 NEXUS_LOG_FILE。
-# exec 的作用是替换当前shell进程，使得nexus-network成为screen会话中的主进程，
-# 即使脚本其余部分执行完毕，screen会话也会持续。
-# Docker 容器的入口点 (ENTRYPOINT) 需要保持一个前台进程，所以我们将最终 `tail -F` 到日志文件。
-screen -dmS nexus bash -c "exec nexus-network start --node-id \$NODE_ID &>> \$NEXUS_LOG_FILE"
-
-# 给 nexus-network 一点时间启动
-sleep 3
-
-# 检查 screen 会话是否成功启动
-if screen -list | grep -q "nexus"; then
-    echo "✅ 节点已在后台启动 (screen会话)。"
-    echo "💡 日志文件：\$NEXUS_LOG_FILE"
-    echo "💡 可以使用 'docker logs <CONTAINER_NAME>' 或 'tail -F \$NEXUS_LOG_FILE' 查看日志"
-else
-    echo "🔴 节点启动失败，请检查日志或 entrypoint.sh。"
-    cat "\$NEXUS_LOG_FILE" # 输出启动失败时的日志，便于调试
-    exit 1
-fi
-
-# 保持容器活跃，并确保所有日志（包括screen进程的）都被正确捕获
-# tail -F 可以跟踪日志文件的轮换 (re-create/rename)
-# 这一行是 ENTRYPOINT 的关键，它使容器保持“运行中”状态，并将所有日志通过 Docker logs 传递。
-exec tail -F \$NEXUS_LOG_FILE
+# 将 nexus-network 的标准输出和标准错误重定向到 NEXUS_LOG_FILE，
+# 同时通过 tee 命令将它们也发送到容器的标准输出（PID 1 的输出），
+# 这样 Docker logs 命令可以实时显示日志。
+# 如果 nexus-network 进程退出，由于 exec 命令，整个容器也会退出，
+# 这才是 Docker 容器应该有的行为。
+# tee -a 表示追加到日志文件，如果文件不存在则创建。
+exec nexus-network start --node-id "\$NODE_ID" 2>&1 | tee -a "\$NEXUS_LOG_FILE"
 EOF
 
     docker build -t "$IMAGE_NAME" . || { echo "🔴 错误：Docker 镜像构建失败。"; exit 1; }
@@ -182,7 +201,7 @@ function run_container() {
     local memory_limit=$2 # 例如: 2g
     local cpu_limit=$3    # 例如: 0.5 或 1.0
     local container_name="${BASE_CONTAINER_NAME}-${node_id}"
-    local log_file="${LOG_DIR}/nexus-${node_id}.log"
+    local log_file="${LOG_DIR}/nexus-${node_id}.log" # 宿主机上的日志文件路径
 
     echo "⚙️ 准备启动容器 $container_name (内存: ${memory_limit}, CPU: ${cpu_limit})..."
 
@@ -192,8 +211,8 @@ function run_container() {
         docker rm -f "$container_name" >/dev/null 2>&1 || echo "⚠️ 无法删除旧容器 $container_name，可能已经停止或不存在。"
     fi
 
-    # 确保日志目录存在
-    mkdir -p "$LOG_DIR"
+    # 确保宿主机日志目录存在
+    mkdir -p "$LOG_DIR" || { echo "🔴 错误：无法创建日志目录 $LOG_DIR。"; exit 1; }
     
     # 确保宿主机日志文件存在并有写权限，且不是一个目录
     if [ -d "$log_file" ]; then
@@ -206,6 +225,7 @@ function run_container() {
     fi
 
     echo "🚀 启动容器 $container_name ..."
+    # 将宿主机日志文件挂载到容器内部的 /root/nexus.log，与 entrypoint.sh 保持一致
     docker run -d --name "$container_name" \
         --restart unless-stopped \
         --memory "${memory_limit}" \
@@ -214,6 +234,7 @@ function run_container() {
         -e NODE_ID="$node_id" \
         "$IMAGE_NAME" || { echo "🔴 错误：容器 $container_name 启动失败。"; exit 1; }
     echo "✅ 容器 $container_name 已成功启动！"
+    echo "💡 可以使用 'docker logs -f $container_name' 查看实时日志。"
 }
 
 # 停止并卸载容器和镜像、删除日志
@@ -525,7 +546,8 @@ EOF
     pm2 delete nexus-cleanup 2>/dev/null || true
     
     # 使用 pm2 启动定时清理任务
-    pm2 start "$cleanup_script_path" --name "nexus-cleanup" --no-autorestart --cron-restart "0 0 * * *" # 每天0点执行
+    # 使用 -- start -- 的语法确保在执行脚本前停止旧进程
+    pm2 start --name "nexus-cleanup" --no-autorestart --cron-restart "0 0 * * *" "$cleanup_script_path"
     pm2 save
     
     echo "✅ 自动日志清理任务已成功设置！将每天清理超过 $days 天的日志。"
@@ -701,9 +723,11 @@ ROTATION_INTERVAL_SECONDS=$rotation_interval_seconds # 轮换周期
 
 # 所有参与轮换的节点ID列表，用于确保每次只激活当前组的节点
 # 使用 readarray 确保 ALL_NODE_IDS 是一个实际的 bash 数组
-readarray -t ALL_NODE_IDS <<<"\$(echo -e "${node_ids[@]// /\\n}")"
+# 注意这里通过 bash -c 将数组元素以换行符分隔传递给 readarray
+readarray -t ALL_NODE_IDS <<<"\$(echo -e "$(printf "%s\\n" "${node_ids[@]}")")"
 BASE_CONTAINER_NAME="$BASE_CONTAINER_NAME"
 SCRIPT_DIR="$script_dir"
+NODES_PER_ROUND=$nodes_per_round
 
 # 在每次轮换开始前，停止并清理所有非当前组的节点
 function stop_inactive_groups() {
@@ -727,17 +751,21 @@ function stop_inactive_groups() {
         done
 
         if [ "\$node_index" -ne -1 ]; then # 确保这个node_id确实在我们管理的列表里
-            local node_group_num=\$(( (node_index / $nodes_per_round) + 1 )) # 计算当前节点所属组 (1-indexed)
+            local node_group_num=\$(( (node_index / \$NODES_PER_ROUND) + 1 )) # 计算当前节点所属组 (1-indexed)
 
             if [ "\$node_group_num" -ne "\$active_group_num" ]; then
                 # 如果容器存在且状态不是Exited (已停止), 停止并删除
-                local status=\$(docker inspect -f '{{.State.Status}}' "\$container_name" 2>/dev/null || echo "N/A")
-                if [ "\$status" != "exited" ]; then
-                    echo "[$(date '+%Y-%m-%d %H:%M:%S')]   - 停止/删除旧组的节点: \${container_name} (组: \$node_group_num, 状态: \$status)"
-                    docker stop -t 10 "\$container_name" >/dev/null 2>&1 || true
-                    docker rm -f "\$container_name" >/dev/null 2>&1 || true
-                else
-                    echo "[$(date '+%Y-%m-%d %H:%M:%S')]   - 节点 \${container_name} 已停止，无需操作。(组: \$node_group_num, 状态: \$status)"
+                # 获取容器ID以便更精确操作
+                local target_container_id=\$(docker ps -a -q -f "name=\$container_name" 2>/dev/null)
+                if [ -n "\$target_container_id" ]; then
+                    local status=\$(docker inspect -f '{{.State.Status}}' "\$target_container_id" 2>/dev/null || echo "N/A")
+                    if [ "\$status" != "exited" ]; then
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')]   - 停止/删除旧组的节点: \${container_name} (组: \$node_group_num, 状态: \$status)"
+                        docker stop -t 10 "\$target_container_id" >/dev/null 2>&1 || true
+                        docker rm -f "\$target_container_id" >/dev/null 2>&1 || true
+                    else
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')]   - 节点 \${container_name} 已停止，无需操作。(组: \$node_group_num, 状态: \$status)"
+                    fi
                 fi
             fi
         else
@@ -770,7 +798,7 @@ EOF
 
     # 使用 pm2 启动轮换脚本
     echo "🚀 使用 PM2 启动节点轮换调度程序..."
-    pm2 start "$rotate_scheduler_path" --name "nexus-rotate"
+    pm2 start --name "nexus-rotate" "$rotate_scheduler_path"
     pm2 save
 
     echo "✅ 节点轮换调度程序已启动！"
