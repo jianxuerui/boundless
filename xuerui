@@ -60,7 +60,9 @@ function setup_pm2_startup() {
 function build_image() {
     echo "⚙️ 正在构建 Docker 镜像: $IMAGE_NAME ..."
     WORKDIR=$(mktemp -d)
-    trap "rm -rf \"$WORKDIR\"; cd -" EXIT # 确保退出时清理临时目录
+    # Ensure to change back and cleanup even on script exit
+    trap "cd - >/dev/null 2>&1; rm -rf \"$WORKDIR\"" EXIT 
+
     cd "$WORKDIR"
 
     # Dockerfile
@@ -167,11 +169,10 @@ fi
 exec tail -F \$NEXUS_LOG_FILE
 EOF
 
-    docker build -t "$IMAGE_NAME" . || { echo "🔴 错误：Docker 镜像构建失败。"; cd -; rm -rf "$WORKDIR"; exit 1; }
+    docker build -t "$IMAGE_NAME" . || { echo "🔴 错误：Docker 镜像构建失败。"; exit 1; }
     echo "✅ Docker 镜像构建完成: $IMAGE_NAME"
 
-    cd - >/dev/null # 返回到脚本执行前的目录
-    rm -rf "$WORKDIR" # 清理临时目录
+    # The trap will handle cleaning up workdir and cd back to previous directory
 }
 
 # 启动容器（挂载宿主机日志文件，并添加资源限制）
@@ -239,76 +240,95 @@ function uninstall_node() {
     echo "✅ 节点 $node_id 已卸载完成。"
 }
 
-# 显示所有运行中的节点
+# 修复后的显示所有运行中的节点
 function list_nodes() {
     echo "📜 当前节点状态："
     echo "------------------------------------------------------------------------------------------------------------------------"
     printf "%-4s %-20s %-12s %-15s %-15s %-15s %-20s\n" "序号" "节点ID" "CPU" "内存使用" "内存限制" "状态" "启动时间"
     echo "------------------------------------------------------------------------------------------------------------------------"
     
-    local all_nodes=($(get_all_nodes))
-    if [ ${#all_nodes[@]} -eq 0 ]; then
+    # 统一获取所有符合命名规则的容器ID、名称、状态、创建时间
+    local all_container_data=$(docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format '{{.ID}}|{{.Names}}|{{.Status}}|{{.CreatedAt}}' 2>/dev/null)
+
+    if [ -z "$all_container_data" ]; then
         echo "                      没有发现任何 Nexus 节点容器。                  "
         echo "------------------------------------------------------------------------------------------------------------------------"
-    else
-        for i in "${!all_nodes[@]}"; do
-            local node_id=${all_nodes[$i]}
-            local container_name="${BASE_CONTAINER_NAME}-${node_id}"
-            local container_id=$(docker ps -a --filter "name=$container_name" --format "{{.ID}}" 2>/dev/null)
-            
-            if [ -n "$container_id" ]; then
-                local container_info=$(docker stats --no-stream --format "{{.CPUPerc}},{{.MemUsage}},{{.MemPerc}},{{.Status}},{{.CreatedAt}}" "$container_id" 2>/dev+null)
-                
-                if [ -n "$container_info" ]; then
-                    IFS=',' read -r cpu_usage mem_usage mem_perc status created_time <<< "$container_info"
-                    
-                    local current_mem=$(echo "$mem_usage" | cut -d'/' -f1 | xargs) # 获取当前内存使用
-                    local limit_mem=$(echo "$mem_usage" | cut -d'/' -f2 | xargs)   # 获取内存限制
-
-                    printf "%-4d %-20s %-12s %-15s %-15s %-15s %-20s\n" \
-                        $((i+1)) \
-                        "$node_id" \
-                        "$cpu_usage" \
-                        "$current_mem" \
-                        "${limit_mem:-N/A}" \
-                        "$(echo "$status" | cut -d' ' -f1)" \
-                        "$(date -d "$created_time" +'%Y-%m-%d %H:%M:%S')" # 格式化时间
-                else
-                    # Docker stats command might fail for stopped containers or if docker daemon is busy
-                    local status=$(docker inspect -f '{{.State.Status}}' "$container_id" 2>/dev/null || echo "N/A")
-                    local created_time=$(docker inspect -f '{{.Created}}' "$container_id" 2>/dev/null || echo "N/A")
-                    printf "%-4d %-20s %-12s %-15s %-15s %-15s %-20s\n" \
-                        $((i+1)) \
-                        "$node_id" \
-                        "N/A" \
-                        "N/A" \
-                        "N/A" \
-                        "$(echo "$status" | cut -d' ' -f1)" \
-                        "$(date -d "$created_time" +'%Y-%m-%d %H:%M:%S')"
-                fi
-            else
-                echo "ℹ️ 容器 $container_name 不存在，可能是异常状态。"
-            fi
-        done
+        read -rp "按任意键返回菜单"
+        return
     fi
+
+    local count=0
+    # 使用 Here String 解析多行数据
+    while IFS= read -r line; do
+        local container_id=$(echo "$line" | cut -d'|' -f1)
+        local container_name=$(echo "$line" | cut -d'|' -f2)
+        local status=$(echo "$line" | cut -d'|' -f3)
+        local created_time_raw=$(echo "$line" | cut -d'|' -f4)
+
+        # 提取 node_id
+        local node_id=$(echo "$container_name" | sed "s/^${BASE_CONTAINER_NAME}-//")
+
+        local cpu_usage="N/A"
+        local current_mem="N/A"
+        local limit_mem="N/A"
+
+        # 首先尝试获取容器的内存限制，即使是停止的容器也可以获取
+        local inspect_mem_limit_bytes=$(docker inspect -f '{{.HostConfig.Memory}}' "$container_id" 2>/dev/null)
+        if [ -n "$inspect_mem_limit_bytes" ] && [ "$inspect_mem_limit_bytes" -gt 0 ]; then
+            # 转换为可读性更好的内存单位
+            if (( inspect_mem_limit_bytes >= 1099511627776 )); then # TB
+                limit_mem=$(awk "BEGIN {printf \"%.1fT\", $inspect_mem_limit_bytes/1099511627776}")
+            elif (( inspect_mem_limit_bytes >= 1073741824 )); then # GB
+                limit_mem=$(awk "BEGIN {printf \"%.1fG\", $inspect_mem_limit_bytes/1073741824}")
+            elif (( inspect_mem_limit_bytes >= 1048576 )); then # MB
+                limit_mem=$(awk "BEGIN {printf \"%.1fM\", $inspect_mem_limit_bytes/1048576}")
+            elif (( inspect_mem_limit_bytes >= 1024 )); then # KB
+                limit_mem=$(awk "BEGIN {printf \"%.1fK\", $inspect_mem_limit_bytes/1024}")
+            else
+                limit_mem="${inspect_mem_limit_bytes}B"
+            fi
+        fi
+
+        # 仅当容器状态为 'Up' (运行中) 时，才尝试获取实时 CPU 和内存使用率
+        if [[ "$status" == Up* ]]; then
+            # 注意: docker stats 在 --no-stream 模式下可以立即返回当前快照
+            # 正确重定向错误输出到 /dev/null
+            local container_stats=$(docker stats --no-stream --format "{{.CPUPerc}}|{{.MemUsage}}" "$container_id" 2>/dev/null)
+            
+            if [ -n "$container_stats" ]; then
+                cpu_usage=$(echo "$container_stats" | cut -d'|' -f1)
+                # MemUsage 格式是 "current_usage / limit_usage"，这里只需要 current_usage
+                current_mem=$(echo "$container_stats" | cut -d'|' -f2 | cut -d'/' -f1 | xargs)
+            fi
+        fi
+
+        # 格式化创建时间
+        local formatted_created_time=$(date -d "$created_time_raw" +'%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "N/A")
+
+        count=$((count+1))
+        printf "%-4d %-20s %-12s %-15s %-15s %-15s %-20s\n" \
+            "$count" \
+            "$node_id" \
+            "$cpu_usage" \
+            "$current_mem" \
+            "${limit_mem}" \
+            "$(echo "$status" | cut -d' ' -f1)" \
+            "$formatted_created_time"
+    done <<< "$all_container_data"
+
     echo "------------------------------------------------------------------------------------------------------------------------"
     echo "提示："
-    echo "- CPU: 显示容器CPU使用百分比"
-    echo "- 内存使用: 显示容器当前使用的内存"
-    echo "- 内存限制: 显示容器内存使用限制 (如果您设置了)"
+    echo "- CPU: 显示容器CPU使用百分比 (仅对运行中容器)"
+    echo "- 内存使用: 显示容器当前使用的内存 (仅对运行中容器)"
+    echo "- 内存限制: 显示容器创建时设置的内存限制 (即使容器已停止)"
     echo "- 状态: 显示容器的运行状态 (Up/Exited)"
     echo "- 启动时间: 显示容器的创建时间"
     read -rp "按任意键返回菜单"
 }
 
-# 获取所有运行中的节点ID
-function get_running_nodes() {
-    docker ps --filter "name=${BASE_CONTAINER_NAME}" --filter "status=running" --format "{{.Names}}" | sed "s/${BASE_CONTAINER_NAME}-//"
-}
-
 # 获取所有节点ID（包括已停止的）
 function get_all_nodes() {
-    docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}" | sed "s/${BASE_CONTAINER_NAME}-//"
+    docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/${BASE_CONTAINER_NAME}-//"
 }
 
 # 查看节点日志
@@ -333,104 +353,6 @@ function view_node_logs() {
         docker logs -f "$container_name" 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | sed 's/\x1b\[?25[hl]//g'
     else
         docker logs -f "$container_name"
-    fi
-}
-
-# 批量启动多个节点 (单次启动，非轮换，现在不推荐使用此方法，轮换更稳定)
-function batch_start_nodes() {
-    echo "警告：此功能会尝试同时启动所有指定的节点，可能导致资源瞬间压力过大。建议使用 '批量节点轮换启动' (选项1)。"
-    read -rp "您确定要继续吗？(y/N): " confirm_simple_batch
-    if [[ ! "$confirm_simple_batch" =~ ^[Yy]$ ]]; then
-        echo "❌ 操作已取消。"
-        read -rp "按任意键继续"
-        return
-    fi
-
-    echo "请手动输入要启动的 node-id，每行一个，输入空行后按 Ctrl+D 结束输入："
-    
-    local node_ids=()
-    while IFS= read -r line; do
-        if [ -n "$line" ]; then
-            node_ids+=("$line")
-        fi
-    done
-
-    if [ ${#node_ids[@]} -eq 0 ]; then
-        echo "⚠️ 未输入任何 node-id，返回主菜单。"
-        read -rp "按任意键继续"
-        return
-    fi
-
-    # 获取内存和CPU限制
-    local mem_per_node=""
-    while true; do
-        read -rp "请输入每个节点容器允许的最大内存 (例如: 2g, 4g, 支持m/g后缀): " mem_per_node
-        if [[ "$mem_per_node" =~ ^[0-9]+[mgMG]$ ]]; then
-            break
-        else
-            echo "🔴 无效的内存格式。请输入例如 '2g' 或 '512m'。"
-        fi
-    done
-
-    local cpu_per_node=""
-    while true; do
-        read -rp "请输入每个节点容器允许的最大CPU核心数 (例如: 0.5, 1, 2): " cpu_per_node
-        if [[ "$cpu_per_node" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(echo "$cpu_per_node > 0" | bc -l) )); then
-            break
-        else
-            echo "🔴 无效的CPU格式。请输入大于0的数字，例如 '0.5' 或 '1'。"
-        fi
-    done
-
-    echo "⚙️ 开始构建镜像..."
-    build_image
-
-    echo "🚀 开始批量启动节点..."
-    for node_id in "${node_ids[@]}"; do
-        echo "➡️ 正在启动节点 $node_id ..."
-        run_container "$node_id" "$mem_per_node" "$cpu_per_node"
-        sleep 5  # 添加短暂延迟，避免同时启动太多容器导致资源瞬时紧张
-    done
-
-    echo "✅ 所有指定节点启动完成！"
-    read -rp "按任意键返回菜单"
-}
-
-# 选择要查看的节点
-function select_node_to_view() {
-    local all_nodes=($(get_all_nodes))
-    
-    if [ ${#all_nodes[@]} -eq 0 ]; then
-        echo "⚠️ 当前没有 Nexus 节点容器。"
-        read -rp "按任意键返回菜单"
-        return
-    fi
-
-    echo "请选择要查看日志的节点："
-    echo "0. 返回主菜单"
-    for i in "${!all_nodes[@]}"; do
-        local node_id=${all_nodes[$i]}
-        local container_name="${BASE_CONTAINER_NAME}-${node_id}"
-        local status=$(docker ps -a --filter "name=$container_name" --format "{{.Status}}" 2>/dev/null)
-        if [[ $status == Up* ]]; then
-            echo "$((i+1)). 节点 $node_id [运行中]"
-        else
-            echo "$((i+1)). 节点 $node_id [已停止]"
-        fi
-    done
-
-    read -rp "请输入选项(0-${#all_nodes[@]}): " choice
-
-    if [ "$choice" = "0" ]; then
-        return
-    fi
-
-    if [ "$choice" -ge 1 ] && [ "$choice" -le ${#all_nodes[@]} ]; then
-        local selected_node=${all_nodes[$((choice-1))]}
-        view_node_logs "$selected_node"
-    else
-        echo "🔴 无效的选项。"
-        read -rp "按任意键继续"
     fi
 }
 
@@ -488,6 +410,45 @@ function batch_uninstall_nodes() {
     read -rp "按任意键返回菜单"
 }
 
+# 选择要查看的节点
+function select_node_to_view() {
+    local all_nodes=($(get_all_nodes))
+    
+    if [ ${#all_nodes[@]} -eq 0 ]; then
+        echo "⚠️ 当前没有 Nexus 节点容器。"
+        read -rp "按任意键返回菜单"
+        return
+    fi
+
+    echo "请选择要查看日志的节点："
+    echo "0. 返回主菜单"
+    for i in "${!all_nodes[@]}"; do
+        local node_id=${all_nodes[$i]}
+        local container_name="${BASE_CONTAINER_NAME}-${node_id}"
+        local status=$(docker ps -a --filter "name=$container_name" --format "{{.Status}}" 2>/dev/null)
+        if [[ $status == Up* ]]; then
+            echo "$((i+1)). 节点 $node_id [运行中]"
+        else
+            echo "$((i+1)). 节点 $node_id [已停止]"
+        fi
+    done
+
+    read -rp "请输入选项(0-${#all_nodes[@]}): " choice
+
+    if [ "$choice" = "0" ]; then
+        return
+    fi
+
+    if [ "$choice" -ge 1 ] && [ "$choice" -le ${#all_nodes[@]} ]; then
+        local selected_node=${all_nodes[$((choice-1))]}
+        view_node_logs "$selected_node"
+    else
+        echo "🔴 无效的选项。"
+        read -rp "按任意键继续"
+    fi
+}
+
+
 # 删除全部节点
 function uninstall_all_nodes() {
     local all_nodes=($(get_all_nodes))
@@ -528,7 +489,7 @@ function setup_default_auto_cleanup() {
     read -rp "请输入日志保留天数（默认 ${days} 天）: " user_days
     if [[ -n "$user_days" && "$user_days" =~ ^[0-9]+$ && "$user_days" -ge 0 ]]; then
         days="$user_days"
-    elif [[ -n "$user_days" && ( "$user_days" =~ ^[+-]?$ ) ]]; then # Catch single + or -
+    elif [[ -n "$user_days" ]]; then
         echo "⚠️ 无效输入，使用默认 $days 天。"
     fi
 
@@ -739,7 +700,8 @@ CURRENT_GROUP=0 # 从第0组开始，加1后是1-indexed
 ROTATION_INTERVAL_SECONDS=$rotation_interval_seconds # 轮换周期
 
 # 所有参与轮换的节点ID列表，用于确保每次只激活当前组的节点
-ALL_NODE_IDS="${node_ids[*]}"
+# 使用 readarray 确保 ALL_NODE_IDS 是一个实际的 bash 数组
+readarray -t ALL_NODE_IDS <<<"\$(echo -e "${node_ids[@]// /\\n}")"
 BASE_CONTAINER_NAME="$BASE_CONTAINER_NAME"
 SCRIPT_DIR="$script_dir"
 
@@ -748,33 +710,39 @@ function stop_inactive_groups() {
     local active_group_num=\$1
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🧹 清理非当前组节点..."
 
-    for node_id in \$ALL_NODE_IDS; do
-        local container_name="${BASE_CONTAINER_NAME}-\${node_id}"
+    # 获取所有 BASE_CONTAINER_NAME- 前缀的容器（不论状态）
+    local all_known_containers_raw=\$(docker ps -a --filter "name=\${BASE_CONTAINER_NAME}-" --format '{{.Names}}' 2>/dev/null)
+    readarray -t ALL_KNOWN_CONTAINERS_ARRAY <<< "\$all_known_containers_raw"
+
+    for container_name in "\${ALL_KNOWN_CONTAINERS_ARRAY[@]}"; do
+        local current_node_id="\$(echo "\$container_name" | sed "s/^\\${BASE_CONTAINER_NAME}-//")"
+        
+        # 查找 current_node_id 在 ALL_NODE_IDS 数组中的索引
         local node_index=-1
-        # 查找 node_id 在 ALL_NODE_IDS 数组中的索引
-        local idx=0
-        for n_id in \$ALL_NODE_IDS; do
-            if [ "\$n_id" == "\$node_id" ]; then
+        for idx in "\${!ALL_NODE_IDS[@]}"; do
+            if [ "\${ALL_NODE_IDS[\$idx]}" == "\$current_node_id" ]; then
                 node_index=\$idx
                 break
             fi
-            idx=\$((idx + 1))
         done
 
-        local node_group_num=\$(( (node_index / $nodes_per_round) + 1 )) # 计算当前节点所属组 (1-indexed)
+        if [ "\$node_index" -ne -1 ]; then # 确保这个node_id确实在我们管理的列表里
+            local node_group_num=\$(( (node_index / $nodes_per_round) + 1 )) # 计算当前节点所属组 (1-indexed)
 
-        if [ "\$node_group_num" -ne "\$active_group_num" ]; then
-            # 如果容器存在且状态不是Exited (已停止), 停止并删除
-            if docker ps -a --format '{{.Names}}' | grep -qw "\$container_name"; then
+            if [ "\$node_group_num" -ne "\$active_group_num" ]; then
+                # 如果容器存在且状态不是Exited (已停止), 停止并删除
                 local status=\$(docker inspect -f '{{.State.Status}}' "\$container_name" 2>/dev/null || echo "N/A")
                 if [ "\$status" != "exited" ]; then
-                    echo "[$(date '+%Y-%m-%d %H:%M:%S')]   - 停止/删除旧组的节点: \${container_name} (组: \$node_group_num)"
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')]   - 停止/删除旧组的节点: \${container_name} (组: \$node_group_num, 状态: \$status)"
                     docker stop -t 10 "\$container_name" >/dev/null 2>&1 || true
                     docker rm -f "\$container_name" >/dev/null 2>&1 || true
                 else
-                    echo "[$(date '+%Y-%m-%d %H:%H:%S')]   - 节点 \${container_name} 已停止，无需操作。"
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')]   - 节点 \${container_name} 已停止，无需操作。(组: \$node_group_num, 状态: \$status)"
                 fi
             fi
+        else
+            # 处理命名匹配但不在白名单内的容器，可能是旧的或手动创建的，不建议删除
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')]   - 发现非当前批次管理或不匹配列表的容器: \$container_name (不执行停止操作)"
         fi
     done
 }
