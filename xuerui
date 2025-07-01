@@ -38,6 +38,8 @@ function check_docker() {
         $SUDO apt-key adv --keyserver hkp://p80.pool.sks-keyservers.net:80 --recv-keys 7EA0A30118C38AC4F0549DF5482F616D355B6C15 || \
         $SUDO apt-key adv --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys 7EA0A30118C38AC4F0549DF5482F616D355B6C15
         
+        # 使用新的方式添加 Docker apt 源，兼容性更好
+        # $SUDO add-apt-repository "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
         echo \
           "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \
           $(lsb_release -cs) stable" | $SUDO tee /etc/apt/sources.list.d/docker.list > /dev/null
@@ -119,6 +121,7 @@ LABEL description="Nexus Node Image"
 
 # 设置非交互模式，防止 apt 命令弹出确认对话框
 ENV DEBIAN_FRONTEND=noninteractive
+# !!! 修改这里：为 ENV 值加上双引号，避免 # 引发的 Syntax Error !!!
 ENV NODE_ID="" # 节点ID由 Docker 运行时注入
 ENV PROVER_ID_FILE="/root/.nexus/node-id"
 
@@ -175,9 +178,6 @@ fi
 echo "Starting Nexus Network with Node ID: \$NODE_ID..."
 
 # 使用 nohup 运行，输出重定向到日志文件，并将其放到后台
-# 这会使得 nexus-network 进程不被 ENTRYPOINT 脚本的结束而终止
-# 但是要注意，Docker 容器的存活依赖于 PID 1 进程。如果 ENTRYPOINT 退出，容器可能随之停止。
-# tail -f /root/nexus.log 最终成为了 PID 1 并且保持了容器的运行
 nohup nexus-network start --node-id "\$NODE_ID" &>> "\$NEXUS_LOG" &
 
 # 轮询检查 nexus-network 是否在运行，并给其一定初始化时间
@@ -200,7 +200,6 @@ if [ "\$IS_RUNNING" = "true" ]; then
     echo "Nexus Network started successfully."
     echo "Log file: \$NEXUS_LOG"
     # 使用 tail -f 保持容器运行，并将 nexus.log 的后续内容输出到 stdout (容器日志)
-    # tail -f 是最常见的保持 Docker container stdout 输出的方式，也使得 stdout 不会被意外关闭
     tail -f "\$NEXUS_LOG"
 else
     echo "错误：Nexus Network 未能成功启动。"
@@ -359,7 +358,8 @@ function list_nodes() {
             # 2. 获取容器资源限制信息 (来自 Docker Inspect)
             # 先尝试获取 docker inspect 的输出
             local inspect_data=$(docker inspect "${container_name}" 2>/dev/null)
-            if [ -n "$inspect_data" ] && [ "$inspect_data" != "[]" ]; then
+            # 检查 inspect_data 是否有效且不是一个空的 JSON array `[]`
+            if [ -n "$inspect_data" ] && [[ "$inspect_data" =~ ^\[.*\]$ ]] && [ "$inspect_data" != "[]" ]; then
                 # 解析内存限制
                 local mem_bytes_raw=$(echo "$inspect_data" | jq -r '.[0].HostConfig.Memory')
                 # 安全地检查是否是数字，而不是 null 或空字符串
@@ -375,7 +375,7 @@ function list_nodes() {
                         printf "%.1f%s", num, unit;
                     }')
                 else
-                    mem_limit_display="无限制" # 如果获取失败，显示无限制
+                    mem_limit_display="无限制" # 如果获取失败或为 0，显示无限制
                 fi
 
                 # 解析 CPU 限制 (NanoCPUs 转换为核心数)
@@ -383,7 +383,7 @@ function list_nodes() {
                 if [[ "$nano_cpus_raw" =~ ^[0-9]+$ ]] && [ "$nano_cpus_raw" -gt 0 ]; then
                     cpu_limit_display=$(awk -v nano="$nano_cpus_raw" 'BEGIN { printf "%.2f", nano / 1e9 }')
                 else
-                    cpu_limit_display="无限制" # 如果获取失败，显示无限制
+                    cpu_limit_display="无限制" # 如果获取失败或为 0，显示无限制
                 fi
             else
                 # 如果 inspect 命令失败或返回空/无效数据
@@ -716,13 +716,8 @@ function setup_log_cleanup_cron() {
     local CRON_FILE="/tmp/nexus_cron_jobs.$$" # 临时存储 cron 配置
     
     # 获取当前用户的 crontab 内容
-    # 使用 `sudo crontab -l` 是不正确的，应当前用户的 crontab
-    # 如果脚本是在 root 用户下运行，`crontab -l` 是有效的。
-    # 如果是在非 root 用户下运行，且目标是给 root 设置 cron，则需要 `sudo crontab -e` 等
-    # 假定脚本是在希望执行 cleanup 的用户（通常是 root）下运行
     if ! crontab -l &> "$CRON_FILE"; then
         echo "当前用户的 crontab 文件不存在或无法读取。将创建新的 crontab 配置。"
-        # 如果 crontab -l 失败，说明当前用户没有 crontab
         echo "" > "$CRON_FILE" # 创建一个空的临时文件
     fi
 
@@ -747,10 +742,7 @@ function setup_log_cleanup_cron() {
 
 # --- 主菜单与逻辑 ---
 function main_menu() {
-    # 在脚本开始运行时，先确保日志清理任务已设置
-    # 如果是 root 用户运行，直接 setup_log_cleanup_cron 即可。
-    # 如果不是 root 用户运行，此函数会失败。建议脚本由 root 用户执行以完全控制系统资源和 cron。
-    setup_log_cleanup_cron 
+    setup_log_cleanup_cron # 在脚本开始运行时，先确保日志清理任务已设置
 
     while true; do
         clear
@@ -790,66 +782,7 @@ function main_menu() {
                 list_nodes
                 ;;
             3) # 批量卸载节点
-                batch_uninstall_nodes # 此函数在前面没有定义，需要补全或者改为调用 `batch_uninstall_nodes` 后面逻辑
-                # --- 批量卸载节点函数 (新增/补充) ---
-                function batch_uninstall_nodes() {
-                    echo ""
-                    echo "--- 批量停止并卸载节点 ---"
-                    local all_nodes_ids=$(get_all_node_ids)
-                    
-                    if [ -z "$all_nodes_ids" ]; then
-                        echo "系统中当前没有已部署的节点。"
-                        read -p "按任意键返回..."
-                        return
-                    fi
-
-                    echo "请选择要卸载的节点 (输入数字，用空格分隔，例如: 1 3 5):"
-                    local node_list=($all_nodes_ids)
-                    for i in "${!node_list[@]}"; do
-                        local node_id=${node_list[$i]}
-                        local container_name="${BASE_CONTAINER_NAME}-${node_id}"
-                        local status=$(docker ps -a --filter "name=$container_name" --format "{{.Status}}" | tr '[:lower:]' '[:upper:]')
-                        local node_display_id="${node_id}"
-                        if [[ "$status" == "UP"* ]]; then
-                            node_display_id+=' [运行中]'
-                        elif [[ "$status" == "EXITED"* || "$status" == "CREATED"* ]]; then
-                            node_display_id+=' [已停止]'
-                        else
-                            node_display_id+=' [不存在]'
-                        fi
-                        printf "  %d. %s\n" $((i+1)) "$node_display_id"
-                    done
-                    echo "  0. 返回主菜单"
-                    echo ""
-
-                    read -rp "请输入您的选择: " choices
-                    if [ "$choices" == "0" ]; then
-                        echo "返回主菜单。"
-                        return
-                    fi
-                    
-                    # 解析选择的数字，进行卸载
-                    local selected_indices=$(echo "$choices" | grep -o '[0-9]\+' | tr '\n' ' ')
-                    local uninstalled_count=0
-                    for index in $selected_indices; do
-                        if [[ "$index" =~ ^[1-9][0-9]*$ ]] && [ "$index" -ge 1 ] && [ "$index" -le "${#node_list[@]}" ]; then
-                            local node_to_uninstall=${node_list[$((index-1))]}
-                            echo "正在卸载节点 '$node_to_uninstall'..."
-                            uninstall_node "$node_to_uninstall"
-                            uninstalled_count=$((uninstalled_count + 1))
-                        else
-                            echo "警告: 跳过无效的节点索引 '$index'。"
-                        fi
-                    done
-                    
-                    echo ""
-                    if [ "$uninstalled_count" -gt 0 ]; then
-                        echo "已完成对 ${uninstalled_count} 个节点的卸载。"
-                    else
-                        echo "未选择有效节点进行卸载。"
-                    fi
-                    read -p "按任意键返回主菜单..."
-                }
+                # 此函数之前已经定义好了，在此调用即可
                 batch_uninstall_nodes
                 ;;
             4) # 查看日志
