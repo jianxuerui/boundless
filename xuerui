@@ -139,12 +139,10 @@ if ! command -v nexus-network >/dev/null 2>&1; then
 fi
 
 # 停止名为 'nexus' 的 screen 会话（如果它在运行）
-# >/dev/null 2>&1 || true 确保了即使 quit 命令失败也不会中断脚本执行
 screen -S nexus -X quit >/dev/null 2>&1 || true
 
 echo "启动 nexus-network 节点..."
 # 使用 screen 在后台运行 nexus-network，并将输出重定向到 /root/nexus.log
-# 这样可以在容器运行的主进程退出后，nexus-network 服务仍可继续运行
 screen -dmS nexus bash -c "nexus-network start --node-id \$NODE_ID &>> /root/nexus.log"
 
 sleep 3 # 等待节点启动
@@ -155,15 +153,10 @@ if screen -list | grep -q "nexus"; then
     echo "日志文件位于容器内的 /root/nexus.log。可通过 'docker logs <container_name>' 查看实时日志。"
 else
     echo "Nexus 节点启动失败！检查容器内 /root/nexus.log 文件中的详细错误："
-    # 注意: 这里 cat 是为了调试，正常情况下 Docker entrypoint 返回前打印日志已足够
     cat /root/nexus.log
     exit 1
 fi
 
-# Entrypoint 在执行完任务后应退出，否则容器将持续运行 (除非是设计成长期服务的，但这不符合典型的 docker run exit 行为)
-# 对于这里，我们模拟启动一个服务然后让 Docker 以为进程已经完成了工作，并期望日志被 Docker 的日志驱动捕获。
-# 为了防止容器立即退出，我们也可以在这里设置一个简单的 tail 命令，但这不建议，因为 docker logs 会处理。
-# 直接退出，等待 Docker log driver 接管日志的实时流。
 exit 0
 EOF
 
@@ -182,16 +175,13 @@ EOF
 
 # 获取宿主机总内存和可用内存 (单位 MB)
 function get_host_memory() {
-    # 使用 MemTotal 和 MemAvailable 从 /proc/meminfo 获取信息
     local total_mem_kb=$(grep MemTotal /proc/meminfo | awk '{print $2}')
     local available_mem_kb=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
 
-    # 如果 MemAvailable 不存在 (老内核可能没有), 使用 MemFree 作为备选
     if [ -z "$available_mem_kb" ]; then
         available_mem_kb=$(grep MemFree /proc/meminfo | awk '{print $2}')
     fi
 
-    # 将 KB 转换为 MB
     local total_mem_mb=$((total_mem_kb / 1024))
     local available_mem_mb=$((available_mem_kb / 1024))
 
@@ -210,7 +200,6 @@ function run_container() {
         echo "检测到旧容器 '$container_name'，正在停止并删除..."
         if ! docker rm -f "$container_name"; then
             echo "警告: 删除旧容器 '$container_name' 失败，请手动检查。"
-            # 不中断，尝试创建新容器，但可能有问题
         else
             echo "旧容器 '$container_name' 已移除。"
         fi
@@ -230,7 +219,6 @@ function run_container() {
     local host_available_mem_mb
     read host_total_mem_mb host_available_mem_mb <<< $(get_host_memory)
 
-    # 确保获取到内存信息
     if [ -z "$host_total_mem_mb" ] || [ -z "$host_available_mem_mb" ]; then
         echo "错误: 无法获取宿主机内存信息，无法计算内存分配。"
         return 1
@@ -238,7 +226,6 @@ function run_container() {
 
     echo "宿主机信息: 总内存=${host_total_mem_mb} MB, 可用内存=${host_available_mem_mb} MB"
 
-    # 确保 bc 已安装用于浮点数计算
     if ! install_utility_if_not_exists "bc"; then
         echo "错误: 'bc' 工具未安装，无法计算内存。请安装 'bc' 并重试。"
         return 1
@@ -263,12 +250,10 @@ function run_container() {
         local available_adjusted_float=$(echo "$host_available_mem_mb * 0.9" | bc)
         allocated_mem_mb=$(printf "%.0f" "$available_adjusted_float")
 
-        # 调整后仍然要确保不小于最小限制
         if [ "$allocated_mem_mb" -lt "$CONTAINER_MEM_MIN_MB" ]; then
             allocated_mem_mb="$CONTAINER_MEM_MIN_MB"
         fi
 
-        # 最终检查：如果连最小内存都无法满足宿主机的可用内存，则报错退出
         if [ "$allocated_mem_mb" -gt "$host_available_mem_mb" ]; then
             echo "错误: 宿主机可用内存 (${host_available_mem_mb}MB) 不足以满足节点 '$node_id' 的最小内存要求 (${allocated_mem_mb}MB)。"
             return 1
@@ -278,20 +263,17 @@ function run_container() {
     echo "为节点 '$node_id' 分配内存: ${allocated_mem_mb}MB"
 
     # 执行 Docker run 命令，包含内存限制和日志挂载
-    # 注意: Docker 的 -m 参数后面必须带单位，如 'm' (MB), 'g' (GB)
     if ! docker run -d --name "$container_name" -m "${allocated_mem_mb}m" -v "$log_file":/root/nexus.log -e NODE_ID="$node_id" "$IMAGE_NAME"; then
         echo "错误: 启动容器 '$container_name' 失败。"
-        return 1 # 返回失败状态
+        return 1
     fi
 
     echo "容器 '$container_name' (Node ID: $node_id) 已成功启动！"
-    return 0 # 返回成功状态
+    return 0
 }
 
 # 显示所有节点ID（无论运行与否）
 function get_all_nodes() {
-    # 使用 docker ps -a 列出所有容器 (包括已停止的)，过滤名字，然后只输出名字列。
-    # 最后使用 sed 去除容器名前缀 "${BASE_CONTAINER_NAME}-" 以得到纯节点ID。
     docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}" | sed "s/${BASE_CONTAINER_NAME}-//"
 }
 
@@ -341,23 +323,19 @@ function list_and_select_operation() {
     echo "序号  节点ID                状态"
     echo "----------------------------------------"
     
-    # 获取所有节点的ID
-    local all_nodes=($(get_all_nodes)) # 这个函数定义应该在这个位置
+    local all_nodes=($(get_all_nodes))
     
-    # 检查是否有节点存在
     if [ ${#all_nodes[@]} -eq 0 ]; then
         echo "未发现任何 Nexus 节点。"
         echo "----------------------------------------"
         return 0 # 表示没有节点需要选择
     fi
 
-    # 遍历所有节点，显示其状态
     for i in "${!all_nodes[@]}"; do
         local node_id=${all_nodes[$i]}
         local container_name="${BASE_CONTAINER_NAME}-${node_id}"
-        local status="不存在" # 默认状态
+        local status="不存在"
 
-        # 检查容器是否存在
         if docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
             status=$(docker ps -a --filter "name=$container_name" --format "{{.Status}}" 2>/dev/null)
         fi
@@ -369,10 +347,7 @@ function list_and_select_operation() {
 
 # 批量停止并卸载指定节点
 function batch_uninstall_nodes() {
-    # 显示节点列表并获取节点总数
     local num_all_nodes=$(list_and_select_operation)
-    
-    # 如果没有节点，则退出
     if [ "$num_all_nodes" -eq 0 ]; then
         read -p "按任意键返回菜单"
         return
@@ -384,20 +359,18 @@ function batch_uninstall_nodes() {
     
     read -rp "请输入选项: " choices
 
-    # 处理返回主菜单
     if [ "$choices" == "0" ]; then
         echo "已取消操作，返回主菜单。"
         read -p "按任意键继续"
         return
     fi
 
-    # 处理卸载所有节点
     if [ "$choices" == "all" ]; then
         echo "您选择了卸载所有节点！"
-        read -rp "确定要卸载所有节点吗? (y/N): " confirm_all
-        if [[ "$confirm_all" =~ ^[Yy]$ ]]; then
+        read -rp "确定要卸载所有节点吗? (请输入 'yes' 以确认): " confirm_all
+        if [ "$confirm_all" == "yes" ]; then
             echo "开始卸载所有节点..."
-            local all_nodes_for_uninstall=($(get_all_nodes)) # 重新获取节点列表
+            local all_nodes_for_uninstall=($(get_all_nodes))
             for node_id in "${all_nodes_for_uninstall[@]}"; do
                 uninstall_node "$node_id"
             done
@@ -409,27 +382,23 @@ function batch_uninstall_nodes() {
         return
     fi
 
-    # 处理选定部分节点的卸载
-    read -ra selected_choices <<< "$choices" # 将输入的序号列表分割成数组
-    local processed_nodes=() # 用于记录已处理过的节点ID，避免重复卸载
+    read -ra selected_choices <<< "$choices"
+    local processed_nodes=()
     
     for choice_str in "${selected_choices[@]}"; do
-        choice_str=$(echo "$choice_str" | xargs) # 清理空格
-        
-        if [[ "$choice_str" =~ ^[0-9]+$ ]]; then # 检查是否为数字序号
+        choice_str=$(echo "$choice_str" | xargs)
+        if [[ "$choice_str" =~ ^[0-9]+$ ]]; then
             local choice_num=$((choice_str))
-            local all_nodes=($(get_all_nodes)) # 重新获取节点列表以防万一
+            local all_nodes=($(get_all_nodes))
             
             if [ "$choice_num" -ge 1 ] && [ "$choice_num" -le ${#all_nodes[@]} ]; then
-                local selected_node=${all_nodes[$((choice_num-1))]} # 根据序号获取节点ID
-                
-                # 检查是否已处理过此节点ID
+                local selected_node=${all_nodes[$((choice_num-1))]}
                 if [[ " ${processed_nodes[@]} " =~ " ${selected_node} " ]]; then
                     echo "节点 '$selected_node' (序号 $choice_num) 已重复选择，已忽略。"
                 else
                     echo "正在为节点 '$selected_node' (序号 $choice_num) 执行卸载操作..."
                     uninstall_node "$selected_node"
-                    processed_nodes+=("$selected_node") # 添加到已处理列表
+                    processed_nodes+=("$selected_node")
                 fi
             else
                 echo "警告: 无效的序号 '$choice_str'。请确保输入 1 到 ${#all_nodes[@]} 之间的数字。"
@@ -481,7 +450,6 @@ function select_node_to_view() {
         return
     fi
 
-    # 验证用户输入
     if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#all_nodes[@]} ]; then
         local selected_node=${all_nodes[$((choice-1))]}
         view_node_logs "$selected_node"
@@ -496,7 +464,6 @@ function view_node_logs() {
     local node_id=$1
     local container_name="${BASE_CONTAINER_NAME}-${node_id}"
     
-    # 检查容器是否存在
     if ! docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
         echo "错误: 容器 '$container_name' 不存在或已从 Docker 中移除。"
         read -p "按任意键返回菜单"
@@ -507,17 +474,14 @@ function view_node_logs() {
     echo "按 Ctrl+C 退出日志查看。"
     echo "--------------------------------------------------------------------------"
     
-    # 提供日志模式选择
     echo "请选择日志查看模式:"
     echo "1. 原始日志 (包含颜色代码)"
     echo "2. 清理后的日志 (移除 ANSI 颜色代码)"
     read -rp "请选择 (1-2): " log_mode
 
     if [ "$log_mode" = "2" ]; then
-        # 使用 sed 清理 ANSI 转义序列 (颜色代码)
         docker logs -f "$container_name" | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/\x1b\[?25h//g' -e 's/\x1b\[?25l//g'
     else
-        # 原始日志流
         docker logs -f "$container_name"
     fi
 }
@@ -531,9 +495,9 @@ function batch_start_nodes() {
     
     local node_ids=()
     while IFS= read -r line; do
-        local trimmed_line=$(echo "$line" | xargs) # 清理输入行的首尾空格
+        local trimmed_line=$(echo "$line" | xargs)
         if [ -n "$trimmed_line" ]; then
-            node_ids+=("$trimmed_line") # 将非空行添加到数组
+            node_ids+=("$trimmed_line")
         fi
     done
 
@@ -544,10 +508,10 @@ function batch_start_nodes() {
     fi
 
     echo "将要启动 ${#node_ids[@]} 个新节点..."
-    echo "正在构建 Nexus Docker 镜像（如果尚未构建或已过时）。.."
-    build_image # 先确保镜像可用
+    echo "正在构建 Nexus Docker 镜像..."
+    build_image
     if [ $? -ne 0 ]; then
-        echo "错误: 镜像构建失败。请检查错误信息并重试。"
+        echo "镜像构建失败，请检查上述错误信息。"
         read -p "按任意键返回菜单"
         return
     fi
@@ -562,7 +526,7 @@ function batch_start_nodes() {
         else
             echo "警告: 节点 '$node_id' 的启动过程遇到问题。"
         fi
-        sleep 3 # 稍微延迟以避免瞬间创建过多 Docker 实例
+        sleep 3 # 稍微延迟
     done
 
     echo "批量启动流程完成。共尝试启动 ${#node_ids[@]} 个节点，成功发送启动请求的有 $success_count 个。"
@@ -571,7 +535,7 @@ function batch_start_nodes() {
 
 # 批量节点轮换启动脚本
 function batch_rotate_nodes() {
-    check_pm2 # 确保 pm2 和 Node.js 可用
+    check_pm2
     
     echo "请输入进行轮换启动的节点 ID，每行一个。输入空行并按回车后，按 Ctrl+D 结束输入："
     echo "节点 ID 会用于创建容器名称，确保它们是唯一的。"
@@ -593,42 +557,35 @@ function batch_rotate_nodes() {
     local total_nodes=${#node_ids[@]}
     echo "您总共输入了 $total_nodes 个节点 ID。"
 
-    # 配置每轮启动的节点数量
     local nodes_per_round=$(( (total_nodes + 1) / 2 )) # 默认一半向上取整
     read -rp "请输入每轮要启动的节点数量 (默认: $nodes_per_round): " input_nodes_per_round
     
-    # 验证用户输入的数量
     if [[ "$input_nodes_per_round" =~ ^[0-9]+$ ]] && [ "$input_nodes_per_round" -ge 1 ] && [ "$input_nodes_per_round" -le "$total_nodes" ]; then
         nodes_per_round=$input_nodes_per_round
     elif [ -n "$input_nodes_per_round" ]; then
         echo "无效的节点数量输入 '$input_nodes_per_round'。将使用默认值 $nodes_per_round。"
     fi
     
-    local num_groups=$(( (total_nodes + nodes_per_round - 1) / nodes_per_round )) # 计算总共需要多少批次（组）
+    local num_groups=$(( (total_nodes + nodes_per_round - 1) / nodes_per_round ))
     echo "总共将节点分为 $num_groups 组进行轮换，每组约 $nodes_per_round 个节点。"
 
-    # 获取宿主机内存信息用于计算分配量
     local host_total_mem_mb_rotate
     local host_available_mem_mb_rotate
     read host_total_mem_mb_rotate host_available_mem_mb_rotate <<< $(get_host_memory)
     
     if [ -z "$host_total_mem_mb_rotate" ] || [ -z "$host_available_mem_mb_rotate" ]; then
         echo "警告: 无法获取宿主机内存信息，轮换节点的内存分配将采用默认设置或可能出错。"
-        # 此处可以考虑是否需要中断，但这里允许脚本继续运行
     fi
 
-    # 清理旧的轮换脚本和相关的临时文件
-    echo "正在清理旧的轮换启动脚本目录（如果存在）..."
+    echo "正在清理旧的轮换启动脚本目录..."
     local script_dir="/root/nexus_scripts"
     if [ -d "$script_dir" ]; then
         rm -rf "$script_dir"
     fi
     mkdir -p "$script_dir"
 
-    # 确保日志目录存在
     mkdir -p "$LOG_DIR"
 
-    # 停止任何正在运行的 pm2 nexus-rotate 任务
     echo "停止任何可能存在的旧的 'nexus-rotate' pm2 任务..."
     pm2 delete nexus-rotate 2>/dev/null || echo "未找到名为 'nexus-rotate' 的 pm2 任务，继续执行。"
 
@@ -648,15 +605,12 @@ EOF
         local container_name="${BASE_CONTAINER_NAME}-${node_id}"
         local log_file="${LOG_DIR}/nexus-${node_id}.log"
         
-        # 计算节点属于哪个组
         local group_num=$(( i / nodes_per_round + 1 ))
-        # 确保 group_num 不会超出总组数 (当最后一组节点少于 nodes_per_round 时)
         if [ $group_num -gt $num_groups ]; then group_num=$num_groups; fi 
 
-        # --- 计算节点的内存分配 ---
+        # 计算节点的内存分配
         local allocated_mem_mb_for_script=0
         if [ -n "$host_total_mem_mb_rotate" ] && [ -n "$host_available_mem_mb_rotate" ]; then
-            # 应用与 run_container 中相同的内存计算逻辑
             local allocated_mem_float=$(echo "$host_total_mem_mb_rotate * $CONTAINER_MEM_RATIO" | bc)
             allocated_mem_mb_for_script=$(printf "%.0f" "$allocated_mem_float")
 
@@ -665,26 +619,23 @@ EOF
             
             if [ "$allocated_mem_mb_for_script" -gt "$host_available_mem_mb_rotate" ]; then
                 echo "警告: 为节点 '$node_id' (第${group_num}组) 计算的内存分配 (${allocated_mem_mb_for_script}MB) 可能大于宿主机当前可用内存 (${host_available_mem_mb_rotate}MB)。"
-                echo "将尝试分配可用内存的 90%."
+                echo "将尝试分配可用内存的 90%。"
                 local available_adjusted_float=$(echo "$host_available_mem_mb_rotate * 0.9" | bc)
                 allocated_mem_mb_for_script=$(printf "%.0f" "$available_adjusted_float")
                 if [ "$allocated_mem_mb_for_script" -lt "$CONTAINER_MEM_MIN_MB" ]; then allocated_mem_mb_for_script="$CONTAINER_MEM_MIN_MB"; fi
-                if [ "$allocated_mem_mb_for_script" -gt "$host_available_mem_mb_rotate" ]; then allocated_mem_mb_for_script="$host_available_mem_mb_rotate"; fi
+                if [ "$allocated_mem_mb_for_script" -gt "$host_available_mem_mb_rotate" ]; then allocated_mem_mb_for_script="$host_available_mem_mb_rotate"; fi # final safety net
             fi
         fi
-        # 如果内存计算出现问题 (allocated_mem_mb_for_script <= 0)，则跳过内存限制
         local mem_param=""
         if [ "$allocated_mem_mb_for_script" -gt 0 ]; then
             mem_param="-m ${allocated_mem_mb_for_script}m"
         fi
         
         # 构建 docker run 命令并追加到对应的组脚本
-        # 注意使用 printf "%q" 进行字符串引用，以正确处理特殊字符
         local quoted_container_name=$(printf "%q" "$container_name")
         local quoted_log_file=$(printf "%q" "$log_file")
         local quoted_node_id=$(printf "%q" "$node_id")
         
-        # 生成 Docker 启动命令字符串
         local docker_run_cmd="echo \"[\`date '+%Y-%m-%d %H:%M:%S'\`] 启动节点 '$node_id' ${mem_param:+(内存: ${allocated_mem_mb_for_script}MB)}...\" && $docker run -d --name $quoted_container_name $mem_param -v $quoted_log_file:/root/nexus.log -e NODE_ID=$quoted_node_id $IMAGE_NAME"
         
         echo "$docker_run_cmd" >> "$script_dir/start_group${group}.sh"
@@ -698,8 +649,7 @@ EOF
 set -e
 echo "[\`date '+%Y-%m-%d %H:%M:%S'\`] Nexus 节点轮换脚本启动..."
 
-# 计算当前轮换间隔 (脚本内部逻辑，等待 2 小时)
-WAIT_INTERVAL_SECONDS=7200 
+WAIT_INTERVAL_SECONDS=7200 # 2 hours in seconds
 
 while true; do
     echo ""
@@ -713,7 +663,7 @@ while true; do
 
     # 执行所有分组的启动脚本
 EOF
-    # 追加每个分组的启动命令
+    # 追加各组的启动逻辑到主 rotate.sh 脚本
     for ((group=1; group<=num_groups; group++)); do
         echo "echo \"[\`date '+%Y-%m-%d %H:%M:%S'\`] === 开始执行第 ${group}/${num_groups} 组节点启动脚本 === \"" >> "$script_dir/rotate.sh"
         cat "$script_dir/start_group${group}.sh" >> "$script_dir/rotate.sh" # 追加组脚本内容
@@ -728,16 +678,17 @@ EOF
         fi
     done
     
-    # 循环结束的最后一次等待
+    # 最后一轮等待 和 循环结束逻辑
     echo "echo \"[\`date '+%Y-%m-%d %H:%M:%S'\`] === 本轮所有节点启动批次执行完毕。 === \"" >> "$script_dir/rotate.sh"
     echo "echo \"[\`date '+%Y-%m-%d %H:%M:%S'\`] 等待 ${WAIT_INTERVAL_SECONDS} 秒 (${WAIT_INTERVAL_SECONDS}s) 开始下一轮清理和启动周期...\"" >> "$script_dir/rotate.sh"
     echo "sleep \$WAIT_INTERVAL_SECONDS" >> "$script_dir/rotate.sh"
     echo "" >> "$script_dir/rotate.sh"
     
-    # 结束 while true 循环
-    echo "done" >> "$script_dir/rotate.sh" # 在此之前已经有一个 exit 0 类似的操作了
-    echo "echo \"[\`date '+%Y-%m-%d %H:%M:%S'\`] Nexus 节点轮换脚本完成一次完整周期执行.\"" >> "$script_dir/rotate.sh" # 这个打印实际上不会在死循环里出现
+done # This marks the end of the 'while true' loop definition WITHIN the generated script.
+     # The script generation itself MUST end cleanly with the 'EOF' on its OWN line.
 
+# The EOF below properly terminates the HERE document for creating rotate.sh.
+# No stray commands or prints should follow it directly if it's intended as the absolute end of the cat > command's input.
 EOF
 
     # 为所有生成的脚本赋予执行权限
@@ -757,29 +708,55 @@ EOF
     pm2 save # 保存 pm2 的进程列表，使其能在系统重启后自动恢复
 
     echo "节点轮换启动已配置并启动！"
-    echo "你可以使用 'pm2 status' 来查看 'nexus-rotate' 的状态。"
+    echo "您可以使用 'pm2 status' 来查看 'nexus-rotate' 的状态。"
     echo "使用 'pm2 logs nexus-rotate' 查看其详细日志。"
     echo "使用 'pm2 stop nexus-rotate', 'pm2 restart nexus-rotate', 或 'pm2 delete nexus-rotate' 来管理它。"
     read -p "按任意键返回菜单"
 }
 
-# 设置定时清理日志的任务
-function setup_log_cleanup_cron() {
-    # crontab 条目格式: 分 时 天 月 周 命令
-    # "0 3 */2 * *" 表示: 在每月的第3天凌晨3点，如果日期是奇数则执行（即每两天执行一次）
-    # find "$LOG_DIR" -type f -name 'nexus-*.log' -mtime +2 -delete: 查找指定目录下所有 nexus-*.log 文件，删除创建或修改时间在2天之前的
-    local cron_job="0 3 */2 * * find $LOG_DIR -type f -name 'nexus-*.log' -mtime +2 -delete"
+# 显示所有节点（带状态），供用户选择查看日志
+function select_node_to_view() {
+    local all_nodes=($(get_all_nodes))
     
-    # 检查 crontab 是否包含此任务
-    if crontab -l 2>/dev/null | grep -qF "$cron_job"; then
-        echo "日志清理的定时任务已存在。"
+    if [ ${#all_nodes[@]} -eq 0 ]; then
+        echo "当前没有已创建的 Nexus 节点。"
+        read -p "按任意键返回菜单"
+        return
+    fi
+
+    echo "请选择要查看日志的节点："
+    echo "0. 返回主菜单"
+    for i in "${!all_nodes[@]}"; do
+        local node_id=${all_nodes[$i]}
+        local container_name="${BASE_CONTAINER_NAME}-${node_id}"
+        local status="不存在"
+        
+        if docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
+             status=$(docker ps -a --filter "name=$container_name" --format "{{.Status}}")
+        fi
+        
+        if [[ "$status" == Up* ]]; then
+            echo "$((i+1)). 节点 '$node_id' [运行中]"
+        else
+            echo "$((i+1)). 节点 '$node_id' [已停止:$status]"
+        fi
+    done
+
+    read -rp "请输入选项(0-${#all_nodes[@]}): " choice
+
+    if [ "$choice" = "0" ]; then
+        return
+    fi
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#all_nodes[@]} ]; then
+        local selected_node=${all_nodes[$((choice-1))]}
+        view_node_logs "$selected_node"
     else
-        # 添加任务，并进行去重和排序（以确保正确性）
-        (crontab -l 2>/dev/null; echo "$cron_job") | sort -u | crontab -
-        echo "已设置日志清理定时任务: 每两天凌晨3点删除超过2天的 nexus 日志文件。"
-        echo "您可以使用 'crontab -e' 命令来编辑所有 cron 任务。"
+        echo "无效的选项 '$choice'。"
+        read -p "按任意键继续"
     fi
 }
+
 
 # 主菜单函数
 function display_menu() {
@@ -788,7 +765,7 @@ function display_menu() {
     echo "**            Nexus 多节点管理脚本            **"
     echo "**************************************************"
     echo "作者: 哈哈哈哈 (Github/Twitter: @ferdie_jhovie)"
-    echo "版本: 1.3.0 (集成内存自动分配，优化脚本逻辑)"
+    echo "版本: 1.3.1 (修复了rotate.sh生成错误)"
     echo "**************************************************"
     echo "1. [单节点] 安装并启动一个新节点"
     echo "2. [管理] 显示所有节点的当前状态和详情"
@@ -801,10 +778,8 @@ function display_menu() {
 }
 
 # ---- 主程序逻辑 ----
-# 脚本启动时设置日志清理任务
 setup_log_cleanup_cron
 
-# 进入主菜单循环
 while true; do
     display_menu
     read -rp "请选择操作 (1-7): " choice
@@ -812,26 +787,26 @@ while true; do
     case $choice in
         1) # 单节点安装和启动
             check_docker
-            if ! install_utility_if_not_exists "bc"; then # 检查并提示安装bc
+            if ! install_utility_if_not_exists "bc"; then
                 echo "您需要安装 'bc' 工具来计算内存分配。"
                 read -p "按任意键尝试继续 (若失败请手动安装后重试) "
             fi
             
             read -rp "请输入一个唯一的节点 ID (例如: my-nexus-node-01): " NODE_ID
-            NODE_ID=$(echo "$NODE_ID" | xargs) # 清理输入首尾空格
+            NODE_ID=$(echo "$NODE_ID" | xargs)
             
             if [ -z "$NODE_ID" ]; then
                 echo "错误: Node ID 不能为空！"
             else
                 echo "准备为节点 '$NODE_ID' 安装并启动..."
-                build_image # 先确保镜像可用
+                build_image
                 if [ $? -ne 0 ]; then
                     echo "镜像构建失败，请检查上述错误信息。"
                 else
-                    if ! run_container "$NODE_ID"; then # 尝试启动容器并检查结果
+                    if ! run_container "$NODE_ID"; then
                         echo "节点 '$NODE_ID' 启动失败。"
                     else
-                        echo "节点 '$NODE_ID' 已启动。"
+                        echo "节点 '$node_id' 已启动。" # 修正一下打印变量名
                     fi
                 fi
             fi
@@ -852,7 +827,7 @@ while true; do
             
         5) # 批量节点轮换启动
             check_docker
-            if ! install_utility_if_not_exists "bc"; then # 再次检查bc
+            if ! install_utility_if_not_exists "bc"; then
                 echo "您需要安装 'bc' 工具来计算内存分配。"
                 read -p "按任意键尝试继续 (若失败请手动安装后重试) "
             fi
@@ -861,7 +836,7 @@ while true; do
             
         6) # 删除所有节点
             echo "此操作将永久删除所有已创建的 Nexus 节点容器以及它们的日志文件！"
-            local all_nodes_before_delete=($(get_all_nodes)) # 获取节点列表用于显示
+            local all_nodes_before_delete=($(get_all_nodes))
             if [ ${#all_nodes_before_delete[@]} -eq 0 ]; then
                 echo "当前没有已存在的 Nexus 节点。"
             else
@@ -874,7 +849,7 @@ while true; do
             read -rp "确定要删除所有节点吗？(请输入 'yes' 以确认): " confirm_all_delete
             if [ "$confirm_all_delete" == "yes" ]; then
                 echo "正在删除所有节点..."
-                local nodes_to_delete=($(get_all_nodes)) # 重新获取节点列表以防操作过程变化
+                local nodes_to_delete=($(get_all_nodes))
                 if [ ${#nodes_to_delete[@]} -eq 0 ]; then
                     echo "在删除操作过程中，没有发现任何 Nexus 节点。"
                 else
