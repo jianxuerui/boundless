@@ -63,7 +63,7 @@ function calculate_per_node_memory_mb() {
     if [ "$num_nodes_to_allocate" -eq 0 ]; then
         echo 0 # 没有节点，不分配内存
         return
-    fi
+    }
 
     # 计算 Nexus 节点总共可使用的内存量
     local allocatable_ram_mb=$(( (total_ram_mb * percentage) / 100 ))
@@ -95,22 +95,18 @@ function build_image() {
     fi
     cd "$WORKDIR"
 
+    # Dockerfile 内容：将 RUN 命令尽可能写为单行以避免 heredoc 中的转义问题
     cat > Dockerfile <<EOF
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PROVER_ID_FILE=/root/.nexus/node-id
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    bash \
-    # screen can be useful for debugging if needed, but not for final setup.
-    # screen is removed from Dockerfile to keep image slim, as it is no longer part of entrypoint logic
-    && rm -rf /var/lib/apt/lists/*
+# 优化后的 apt-get 命令，所有操作都在一行，避免多行续行符问题
+RUN apt-get update && apt-get install -y --no-install-recommends curl bash && rm -rf /var/lib/apt/lists/*
 
-# 自动下载安装最新版 nexus-network
-RUN curl -sSL https://cli.nexus.xyz/ | NONINTERACTIVE=1 sh \
-    && ln -sf /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network
+# 自动下载安装最新版 nexus-network，也放在一行
+RUN curl -sSL https://cli.nexus.xyz/ | NONINTERACTIVE=1 sh && ln -sf /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
@@ -118,6 +114,7 @@ RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 EOF
 
+    # entrypoint.sh 内容
     cat > entrypoint.sh <<EOF
 #!/bin/bash
 set -e
@@ -125,7 +122,7 @@ set -e
 PROVER_ID_FILE="/root/.nexus/node-id"
 NEXUS_LOG_FILE="/root/nexus.log" # 容器内部的日志文件路径
 
-# Ensure the log directory exists within the container (even if bind mounted, it's good practice)
+# 确保容器内的日志目录存在（即使宿主机的目录是挂载的，也建议这样）
 mkdir -p "\$(dirname "\$NEXUS_LOG_FILE")"
 
 if [ -z "\$NODE_ID" ]; then
@@ -438,7 +435,7 @@ function batch_start_nodes() {
         echo "未输入任何 node-id，返回主菜单"
         read -p "按任意键继续"
         return
-    fi
+    }
 
     local total_system_ram_mb=$(get_total_system_ram_mb)
     echo "系统总内存：${total_system_ram_mb}MB"
@@ -620,7 +617,7 @@ function batch_rotate_nodes() {
         echo "未输入任何 node-id，返回主菜单"
         read -p "按任意键继续"
         return
-    fi
+    }
 
     local total_system_ram_mb=$(get_total_system_ram_mb)
     echo "系统总内存：${total_system_ram_mb}MB"
@@ -768,7 +765,7 @@ EOF
             local log_file_host="${LOG_DIR}/nexus-${node_id}.log" # 这是指宿主机上的路径
 
             # 确保宿主机上的日志文件已准备好用于卷挂载
-            # 优先检查是否存在目录冲突，确保文件可创建
+            # 优先检查是否存在目录冲突
             echo "
 if [ -d \"$log_file_host\" ]; then
     echo \"[$(date '+%Y-%m-%d %H:%M:%S')] \$0 警告: 日志文件路径 '$log_file_host' 冲突，是一个目录。将尝试删除以便创建文件。\" >&2
@@ -831,7 +828,7 @@ EOF
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 检查本轮次节点启动状态..."
         for ((c=1; c<=max_checks; c++)); do
             launched_nodes_count=0
-            for i_check in \$(seq $start_idx $((end_idx-1))); do
+            for i_check in \$(seq \$start_idx \$((end_idx-1))); do
                 local node_id_check="\${ALL_NODE_IDS[\$i_check]}"
                 local container_name_check="\${BASE_CONTAINER_NAME}-\${node_id_check}"
                 if docker ps --filter "name=\${container_name_check}" --filter "status=running" --format "{{.Names}}" | grep -qw "\${container_name_check}"; then
@@ -842,7 +839,7 @@ EOF
                         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 节点 \${node_id_check} (容器 \${container_name_check}) 尚未运行，请检查日志... (检查 \$c/\$max_checks)" >&2
                         docker logs "\${container_name_check}" 2>&1 | tail -n 10 >&2 # 显示最后10行日志
                     else # 容器甚至没有创建成功
-                         echo "[$(date '+%Y-%m-%d %H:%M:%M')] 节点 \${node_id_check} (容器 \${container_name_check}) 未能创建或已消失，请检查日志... (检查 \$c/\$max_checks)" >&2
+                         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 节点 \${node_id_check} (容器 \${container_name_check}) 未能创建或已消失，请检查日志... (检查 \$c/\$max_checks)" >&2
                     fi
                 fi
             done
