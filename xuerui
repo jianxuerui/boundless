@@ -10,7 +10,7 @@ set -e # 脚本遇到非零退出码时立即退出
 
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:latest"
-LOG_DIR="/root/nexus_logs" # 宿主机上的 Nexus 日志存储目录
+LOG_DIR="/root/nexus_logs"     # 宿主机上的 Nexus 日志存储目录
 SCRIPT_DIR="/root/nexus_scripts" # 存放轮换脚本的目录
 
 # !!! 定义默认的节点资源限制 !!!
@@ -22,7 +22,8 @@ DEFAULT_CPUS_LIMIT="2"    # 每个节点最多使用 2 个 CPU 核心 (例如 2.
 # --- 辅助函数 ---
 
 # 检查是否是 root 用户或拥有 sudo 权限
-function is_root_or_sudo() {
+# 返回 0 表示是 root 或有 sudo 权限，返回 1 表示都不是
+function is_root_or_sudo_available() {
     if [[ "$EUID" -ne 0 ]]; then
         # 尝试使用 sudo -v 来检测是否有 sudo 权限 (不需要密码)
         if command -v sudo &> /dev/null && sudo -v &> /dev/null; then
@@ -34,20 +35,20 @@ function is_root_or_sudo() {
     return 0 # 本身就是 root
 }
 
-# 获取 sudo 前缀，如果当前用户不是 root 且有 sudo 权限
+# 获取 sudo 命令前缀，如果当前用户不是 root 且有 sudo 权限，则返回 "sudo"
+# 否则返回空字符串
 function get_sudo_prefix() {
     if [[ "$EUID" -ne 0 ]]; then
-        if is_root_or_sudo; then
+        if is_root_or_sudo_available; then
             echo "sudo"
         else
-            # 如果不是 root 且没有 sudo 权限，则返回空，后续命令可能会失败
             echo ""
         fi
     else
-        # 如果是 root，也不需要 sudo
         echo ""
     fi
 }
+# 全局设置 SUDO 变量，确保所有需要权限的命令都带上正确的 SUDO 前缀
 SUDO=$(get_sudo_prefix)
 
 # 检测当前系统的包管理器
@@ -67,25 +68,30 @@ function get_package_manager() {
 
 # 尝试安装包的通用函数
 function install_package() {
-    local pkg_name="$1"
+    local pkgs="$@" # 支持同时安装多个包，例如 "nodejs npm"
     local pm=$(get_package_manager)
 
-    echo "正在尝试安装 '$pkg_name'..."
+    echo "正在尝试安装 '$pkgs'..."
+    if ! is_root_or_sudo_available; then
+        echo "错误: 安装 '$pkgs' 需要 root 权限或 sudo。请以 root 用户或使用 sudo 执行此命令。"
+        return 1
+    fi
+
     case "$pm" in
         apt)
-            $SUDO apt update && $SUDO apt install -y "$pkg_name"
+            $SUDO apt update && $SUDO apt install -y "$pkgs"
             ;;
         yum)
-            $SUDO yum install -y "$pkg_name"
+            $SUDO yum install -y "$pkgs"
             ;;
         dnf)
-            $SUDO dnf install -y "$pkg_name"
+            $SUDO dnf install -y "$pkgs"
             ;;
         apk)
-            $SUDO apk add "$pkg_name"
+            $SUDO apk add "$pkgs"
             ;;
         *)
-            echo "错误: 未知或不支持的包管理器 '$pm'。请手动安装 '$pkg_name'。"
+            echo "错误: 未知或不支持的包管理器 '$pm'。请手动安装 '$pkgs'。"
             return 1
             ;;
     esac
@@ -94,15 +100,17 @@ function install_package() {
 
 # 确保必要的系统工具已安装
 function ensure_package_installed() {
-    local pkg_name="$1"
+    local pkg_name="$1" # 包的名称
     local command_to_check="${2:-$pkg_name}" # 默认为 pkg_name，可选指定检查的命令名
 
     if ! command -v "$command_to_check" &> /dev/null; then
         echo "必需的命令 '$command_to_check' 未找到。尝试安装 '$pkg_name'..."
         if ! install_package "$pkg_name"; then
-            echo "错误：无法安装 '$pkg_name'。请手动安装 '$pkg_name' 后重试。"
-            exit 1
+            echo "错误：无法自动安装 '$pkg_name'。请手动安装 '$pkg_name' 后重试。"
+            echo "您可以使用 '$SUDO apt install $pkg_name' (Debian/Ubuntu), '$SUDO yum install $pkg_name' (CentOS/RHEL), 或 '$SUDO dnf install $pkg_name' (Fedora) 等。"
+            exit 1 # 硬停止，因为是关键依赖
         fi
+        echo "'$command_to_check' 已成功安装。"
     fi
 }
 
@@ -113,31 +121,31 @@ function check_docker() {
     if ! command -v docker &> /dev/null; then
         echo "错误：未检测到 Docker 命令。请先安装 Docker。"
         echo "您可以尝试运行以下官方脚本来安装 Docker (适用于大多数 Linux 发行版):"
-        echo "  $SUDO curl -fsSL https://get.docker.com -o get-docker.sh"
-        echo "  $SUDO sh get-docker.sh --dry-run # 建议先 dry-run 检查"
-        echo "  $SUDO sh get-docker.sh"
-        echo "安装后，请确保将当前用户添加到 docker 组，并重新登录： $SUDO usermod -aG docker \$USER"
+        echo "  ${SUDO} curl -fsSL https://get.docker.com -o get-docker.sh"
+        echo "  ${SUDO} sh get-docker.sh --dry-run # 建议先 dry-run 检查兼容性"
+        echo "  ${SUDO} sh get-docker.sh"
+        echo "安装完成后，请确保将当前用户添加到 docker 组，并重新登录： ${SUDO} usermod -aG docker \$USER"
         echo "然后确保 Docker 服务已启用并正在运行："
-        echo "  $SUDO systemctl enable docker"
-        echo "  $SUDO systemctl start docker"
+        echo "  ${SUDO} systemctl enable docker"
+        echo "  ${SUDO} systemctl start docker"
         return 1 # 返回错误码，表示 Docker 未就绪
     fi
     
     # Docker 命令存在，现在检查服务是否运行
-    if ! $SUDO systemctl is-active --quiet docker; then
+    if ! ${SUDO} systemctl is-active --quiet docker; then
         echo "错误：Docker 服务未运行。正在尝试启动..."
-        if $SUDO systemctl start docker; then
+        if ${SUDO} systemctl start docker; then
             echo "Docker 服务已尝试启动。等待 5 秒..."
             sleep 5 
-            if ! $SUDO systemctl is-active --quiet docker; then
-                echo "错误：未能成功启动 Docker 服务。请手动检查 '$SUDO systemctl status docker'。"
+            if ! ${SUDO} systemctl is-active --quiet docker; then
+                echo "错误：未能成功启动 Docker 服务。请手动检查 '${SUDO} systemctl status docker'。"
                 return 1 # 失败
             else
                 echo "Docker 服务已成功启动。"
                 return 0 # 成功
             fi
         else
-            echo "错误：Docker 服务的启动命令执行失败。请手动检查 '$SUDO systemctl status docker'。"
+            echo "错误：Docker 服务的启动命令执行失败。请手动检查 '${SUDO} systemctl status docker'。"
             return 1
         fi
     fi
@@ -164,8 +172,8 @@ function check_pm2() {
             apt)
                 echo "您的系统使用 apt，尝试自动安装 Node.js 18..."
                 # NodeSource 脚本用于添加最新 Node.js 源
-                if ! $SUDO curl -fsSL https://deb.nodesource.com/setup_18.x | $SUDO bash - ; then
-                     echo "错误: 尝试下载并执行 NodeSource 设置脚本失败。可能是 curl 或 bash 环境问题。"
+                if ! ${SUDO} curl -fsSL https://deb.nodesource.com/setup_18.x | ${SUDO} bash - ; then
+                     echo "错误: 尝试下载并执行 NodeSource 设置脚本失败。可能是 curl 或 bash 环境问题，或网络问题。"
                      return 1
                 fi
                 if ! install_package nodejs; then
@@ -176,12 +184,12 @@ function check_pm2() {
             yum|dnf)
                 echo "您的系统使用 $pm，尝试安装 Node.js..."
                 # 尝试安装 EPEL (Extra Packages for Enterprise Linux)
-                if ! $SUDO rpm -q epel-release &> /dev/null; then
+                if ! ${SUDO} rpm -q epel-release &> /dev/null; then
                     echo "尝试安装 EPEL 仓库..."
                     if [[ "$pm" == "yum" ]]; then
-                        $SUDO yum install -y epel-release
+                        ${SUDO} yum install -y epel-release
                     elif [[ "$pm" == "dnf" ]]; then
-                        $SUDO dnf install -y epel-release
+                        ${SUDO} dnf install -y epel-release
                     fi
                 fi
                 if ! install_package nodejs; then # 通常 yum/dnf 的 nodejs 包会包含 npm
@@ -215,8 +223,8 @@ function check_pm2() {
     if ! command -v pm2 &> /dev/null; then
         echo "错误：未检测到 pm2。正在安装..."
         # pm2 是通过 npm 安装的
-        if ! $SUDO npm install -g pm2; then # 使用 sudo 安装全局包
-            echo "错误：使用 npm 安装 pm2 失败。请确保 npm 有足够的权限，或者尝试手动运行 '$SUDO npm install -g pm2'。"
+        if ! ${SUDO} npm install -g pm2; then # 使用 sudo 安装全局包
+            echo "错误：使用 npm 安装 pm2 失败。请确保 npm 有足够的权限，或者尝试手动运行 '${SUDO} npm install -g pm2'。"
             return 1 # 表示安装失败
         fi
         echo "pm2 安装完成。"
@@ -235,6 +243,7 @@ function build_image() {
         echo "Docker 环境未就绪，无法构建镜像。"
         return 1
     fi
+    ensure_package_installed "jq" # Ensure jq for the Dockerfile base
 
     # 创建一个临时目录用于构建
     WORKDIR=$(mktemp -d)
@@ -243,8 +252,8 @@ function build_image() {
         return 1
     fi
     # 确保临时目录可写
-    chmod 755 "$WORKDIR"
-    
+    ${SUDO} chmod 755 "$WORKDIR" # Ensure sudo user can write
+
     cd "$WORKDIR"
 
     # 创建 Dockerfile
@@ -256,7 +265,6 @@ LABEL description="Nexus Node Image"
 
 # 设置非交互模式，防止 apt 命令弹出确认对话框
 ENV DEBIAN_FRONTEND=noninteractive
-# !!! 确保 ENV 值都加上双引号，以防 shell 解释或 # 注释的混淆 !!!
 # 节点ID由 Docker 运行时注入
 ENV NODE_ID="" 
 ENV PROVER_ID_FILE="/root/.nexus/node-id"
@@ -271,9 +279,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo "Base image updated and essentials installed."
 
 # 自动下载并安装最新版 nexus-network
+# 使用 NONINTERACTIVE=1 sh 来确保安装过程是非交互式的
 RUN echo "Downloading and installing the latest nexus-network..." && \
     curl -sSL https://cli.nexus.xyz/ | NONINTERACTIVE=1 sh && \
     echo "nexus-network installation complete." && \
+    # 创建软链接到常用PATH中，方便容器内直接调用
     ln -sf /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network
 
 # 复制启动脚本到容器内
@@ -347,16 +357,16 @@ EOF
 
     echo "正在执行 Docker 镜像构建，这可能需要一些时间..."
     # 执行 Docker 构建
-    if ! $SUDO docker build -t "$IMAGE_NAME" . --progress=plain; then # --progress=plain 使得构建过程日志更详细
+    if ! ${SUDO} docker build -t "$IMAGE_NAME" . --progress=plain; then # --progress=plain 使得构建过程日志更详细
         echo "错误：Docker 镜像构建失败。请检查 Dockerfile 和构建输出。"
         cd - > /dev/null # 返回之前目录
-        rm -rf "$WORKDIR"
+        ${SUDO} rm -rf "$WORKDIR"
         return 1
     fi
     
     # 返回上一级目录并清理临时文件
     cd - > /dev/null
-    $SUDO rm -rf "$WORKDIR"
+    ${SUDO} rm -rf "$WORKDIR"
     echo "======================================"
     echo " Docker 镜像 '$IMAGE_NAME' 构建完成。"
     echo "======================================"
@@ -383,37 +393,37 @@ function run_container() {
     fi
 
     # 检查是否已存在同名容器，如果有，先删除
-    if $SUDO docker ps -a --format '{{.Names}}' | grep -q "^${container_name}$"; then
+    if ${SUDO} docker ps -a --format '{{.Names}}' | grep -q "^${container_name}$"; then
         echo "发现同名容器 '$container_name'。正在尝试删除旧容器..."
-        $SUDO docker rm -f "${container_name}" > /dev/null 2>&1 || echo "警告: 删除旧容器 '$container_name' 失败。"
+        ${SUDO} docker rm -f "${container_name}" > /dev/null 2>&1 || echo "警告: 删除旧容器 '$container_name' 失败，可能需要手动介入。"
     fi
 
-    # 确保日志目录存在
-    $SUDO mkdir -p "$LOG_DIR"
+    # 确保日志目录存在并可写
+    ${SUDO} mkdir -p "$LOG_DIR"
     if [ ! -d "$LOG_DIR" ]; then
         echo "错误：无法创建宿主机上的日志目录 '$LOG_DIR'。"
         return 1
     fi
     
-    # 确保宿主机日志文件存在且可写
+    # 确保宿主机日志文件存在且可写，并设置正确的权限
     if [ ! -f "$log_file" ]; then
-        $SUDO touch "$log_file"
-        # 设置日志文件的读写权限，并确保所有者是当前用户（如果脚本不是root运行）
-        $SUDO chmod 644 "$log_file"
+        ${SUDO} touch "$log_file"
+        ${SUDO} chmod 644 "$log_file" # 设置日志文件的读写权限
         if [ "$EUID" -ne 0 ]; then
-          $SUDO chown $(whoami):$(whoami) "$log_file"
+          ${SUDO} chown $(whoami):$(whoami) "$log_file" # 确保所有者是当前用户
         fi
         echo "已创建日志文件: $log_file"
     fi
-    # 确保日志文件所有者是你（如果你不是root执行脚本的话，这可能很重要）
+    # 再次确保权限和所有者，以防万一
+    ${SUDO} chmod 644 "$log_file"
     if [ "$EUID" -ne 0 ]; then
-      $SUDO chown $(whoami):$(whoami) "$log_file" # 明确指定用户和组
+      ${SUDO} chown $(whoami):$(whoami) "$log_file" # 明确指定用户和组
     fi
 
     echo "正在使用镜像 '$IMAGE_NAME' 启动新容器 '$container_name'..."
     
     # 启动容器，设置名称、内存限制、CPU限制、挂载日志文件、传递 NODE_ID
-    if ! $SUDO docker run -d \
+    if ! ${SUDO} docker run -d \
             --name "${container_name}" \
             --memory "${DEFAULT_MEMORY_LIMIT}" \
             --cpus "${DEFAULT_CPUS_LIMIT}" \
@@ -422,15 +432,15 @@ function run_container() {
             "${IMAGE_NAME}" > /dev/null; then
         echo "错误：启动容器 '$container_name' 失败！"
         echo "请检查以下信息:"
-        echo "  - Docker 日志: '$SUDO docker logs $container_name'"
-        echo "  - Nexus 节点日志: '$log_file'"
-        echo "  - Docker 服务状态: '$SUDO systemctl status docker'"
+        echo "  - Docker 容器日志: '${SUDO} docker logs $container_name'"
+        echo "  - Nexus 节点日志文件 (宿主机): '$log_file'"
+        echo "  - Docker 服务状态: '${SUDO} systemctl status docker'"
         return 1
     fi
     
     echo "容器 '$container_name' 已成功启动。"
     # 通过 docker inspect 获取启动后的 PID (如果有)
-    local container_pid=$($SUDO docker inspect -f '{{.State.Pid}}' "$container_name" 2>/dev/null || echo "N/A")
+    local container_pid=$(${SUDO} docker inspect -f '{{.State.Pid}}' "$container_name" 2>/dev/null || echo "N/A")
     echo "    容器 PID: $container_pid"
     return 0
 }
@@ -444,25 +454,25 @@ function uninstall_node() {
     echo ""
     echo "--- 卸载节点: $node_id ---"
     
-    if ! check_docker; then
-        echo "Docker 环境未就绪，无法卸载节点。"
+    if ! check_docker &> /dev/null; then # 静默检查 Docker，如果失败则输出信息并返回
+        echo "Docker 命令不可用，无法卸载节点。"
         return 1
     fi
     
     # 停止并删除容器
     echo "    正在停止并删除容器 '$container_name'..."
-    if $SUDO docker ps -q -f name=${container_name} &> /dev/null; then
+    if ${SUDO} docker ps -q -f name=${container_name} &> /dev/null; then
         # 如果容器正在运行，则先停止
-        $SUDO docker stop "${container_name}" > /dev/null 2>&1 || echo "    警告: 尝试停止容器 '$container_name' 但可能已停止或执行命令失败。"
+        ${SUDO} docker stop "${container_name}" > /dev/null 2>&1 || echo "    警告: 尝试停止容器 '$container_name' 但可能已停止或执行命令失败。"
     fi
     
     # 删除容器，即使不存在或已停止，执行命令也能安全处理
-    $SUDO docker rm "${container_name}" > /dev/null 2>&1 || echo "    警告: 尝试删除容器 '$container_name' 但可能不存在或已删除。"
+    ${SUDO} docker rm "${container_name}" > /dev/null 2>&1 || echo "    警告: 尝试删除容器 '$container_name' 但可能不存在或已删除。"
 
     # 删除对应的日志文件
     if [ -f "$log_file" ]; then
         echo "    正在删除日志文件 '$log_file'..."
-        $SUDO rm -f "$log_file"
+        ${SUDO} rm -f "$log_file"
     else
         echo "    日志文件 '$log_file' 不存在，跳过删除。"
     fi
@@ -480,13 +490,12 @@ function list_nodes() {
     
     if ! check_docker; then
         echo "Docker 环境未就绪，无法显示节点状态。"
-        read -p "按任意键返回主菜单..."
         return 1
     fi
     ensure_package_installed "jq" # 确保宿主机安装了 jq
 
     # 获取所有匹配 BASE_CONTAINER_NAME 的容器ID，无论其状态如何
-    local container_names=($($SUDO docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}"))
+    local container_names=($(${SUDO} docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}"))
     
     if [ ${#container_names[@]} -eq 0 ]; then
         echo "当前系统中没有部署 Nexus 节点。"
@@ -505,16 +514,14 @@ function list_nodes() {
             local container_created_time="N/A"
 
             # 1. 获取容器基本信息: 状态, 创建时间
-            local status_and_time=$($SUDO docker ps -a --filter "name=${container_name}" --format "{{.Status}}|{{.CreatedAt}}" 2>/dev/null)
+            local status_and_time=$(${SUDO} docker ps -a --filter "name=${container_name}" --format "{{.Status}}|{{.CreatedAt}}" 2>/dev/null)
             if [ -n "$status_and_time" ]; then
                 container_status=$(echo "$status_and_time" | cut -d'|' -f1 | awk '{print $1}') # 只取状态的首个单词
                 container_created_time=$(echo "$status_and_time" | cut -d'|' -f2)
-            else
-                container_status="不存在" # 理论上不会走到这里，因为是遍历 ps -a 的结果
             fi
 
             # 2. 获取容器资源限制信息 (来自 Docker Inspect)
-            local inspect_data=$($SUDO docker inspect "${container_name}" 2>/dev/null)
+            local inspect_data=$(${SUDO} docker inspect "${container_name}" 2>/dev/null)
             if [ -n "$inspect_data" ] && [[ "$inspect_data" =~ ^\[.*\]$ ]] && [ "$inspect_data" != "[]" ]; then
                 local mem_bytes_raw=$(echo "$inspect_data" | jq -r '.[0].HostConfig.Memory')
                 if [[ "$mem_bytes_raw" =~ ^[0-9]+$ ]] && [ "$mem_bytes_raw" -gt 0 ]; then
@@ -545,7 +552,7 @@ function list_nodes() {
 
             # 3. 如果容器正在运行，则获取实时统计数据
             if [[ "$container_status" == "Up" ]]; then
-                local stats_output=$($SUDO docker stats --no-stream --format "{{.CPUPerc}}|{{.MemUsage}}" "${container_name}" 2>/dev/null)
+                local stats_output=$(${SUDO} docker stats --no-stream --format "{{.CPUPerc}}|{{.MemUsage}}" "${container_name}" 2>/dev/null)
                 if [ -n "$stats_output" ]; then
                     cpu_usage_display=$(echo "$stats_output" | cut -d'|' -f1 | sed 's/\%//g') # 移除 '%'
                     mem_usage_display=$(echo "$stats_output" | cut -d'|' -f2 | awk '{print $1}') # 取如 "1.5G/4.0G" 中的 "1.5G"
@@ -580,7 +587,7 @@ function get_all_node_ids() {
     if ! check_docker &> /dev/null; then # 静默检查 Docker
         return 1 # 命令不存在或服务未运行
     fi
-    $SUDO docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}" | sed "s/${BASE_CONTAINER_NAME}-//"
+    ${SUDO} docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}" | sed "s/${BASE_CONTAINER_NAME}-//"
 }
 
 # 查看指定节点的日志
@@ -594,7 +601,7 @@ function view_node_logs() {
     fi
     
     # 检查容器是否存在
-    if ! $SUDO docker ps -a --filter "name=${container_name}" --format "{{.Names}}" &> /dev/null; then
+    if ! ${SUDO} docker ps -a --filter "name=${container_name}" --format "{{.Names}}" &> /dev/null; then
         echo ""
         echo "错误：节点 '$node_id' (容器 '$container_name') 在系统中未找到。"
         read -p "按任意键返回菜单..."
@@ -613,15 +620,15 @@ function view_node_logs() {
     
     case "$log_mode" in
         1)
-            $SUDO docker logs -f "$container_name"
+            ${SUDO} docker logs -f "$container_name"
             ;;
         2)
             # 使用 sed 移除 ANSI 转义序列，使其更易读
-            $SUDO docker logs -f "$container_name" | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/\x1b\[?25l//g' -e 's/\x1b\[?25h//g'
+            ${SUDO} docker logs -f "$container_name" | sed -e 's/\x1b\[[0-9;]*m//g' -e 's/\x1b\[?25l//g' -e 's/\x1b\[?25h//g'
             ;;
         *)
             echo "无效选项。将使用原始日志模式。"
-            $SUDO docker logs -f "$container_name"
+            ${SUDO} docker logs -f "$container_name"
             ;;
     esac
     echo ""
@@ -632,12 +639,11 @@ function view_node_logs() {
 function batch_start_nodes() {
     echo ""
     echo "--- 批量启动 Nexus 节点 ---"
-    echo "请输入您要启动的节点 IDs，每行一个，输入空行并按回车键结束输入："
+    echo "请输入您要启动的节点 IDs，每行一个，输入空行并按 Ctrl+D 结束输入："
     echo "例如:"
     echo "    node-001"
     echo "    node-002"
     echo "    ..."
-    echo "输入完成后，按 Ctrl+D 结束输入。"
     
     local node_ids=()
     while IFS= read -r line; do
@@ -662,6 +668,11 @@ function batch_start_nodes() {
         fi
     else
         echo "跳过镜像构建，将使用现有镜像（如果镜像不存在，启动将会失败）。"
+        if ! ${SUDO} docker images -q "$IMAGE_NAME" &> /dev/null; then
+            echo "警告: Docker 镜像 '$IMAGE_NAME' 不存在。您可能需要选择重新构建镜像，否则节点启动会失败。"
+            read -p "按任意键继续..."
+            return
+        fi
     fi
 
     echo ""
@@ -706,12 +717,11 @@ function batch_rotate_nodes() {
         return
     fi
 
-    echo "请输入您希望参与轮换的节点 IDs，每行一个，输入空行并按回车键结束输入："
+    echo "请输入您希望参与轮换的节点 IDs，每行一个，输入空行并按 Ctrl+D 结束输入："
     echo "示例:"
     echo "    rot-node-a"
     echo "    rot-node-b"
     echo "    ..."
-    echo "输入完成后，按 Ctrl+D 结束输入。"
     
     local node_ids=()
     while IFS= read -r line; do
@@ -741,7 +751,7 @@ function batch_rotate_nodes() {
 
     # 输入验证
     if ! [[ "$nodes_per_round" =~ ^[1-9][0-9]*$ ]] || [ "$nodes_per_round" -gt "$total_nodes" ]; then
-        echo "输入无效。请确保每批启动的节点数量是大于等于 1 的整数，并且不超过总节点数 (${total_nodes})"。"
+        echo "输入无效。请确保每批启动的节点数量是大于等于 1 的整数，并且不超过总节点数 (${total_nodes})。"
         read -p "按任意键返回..."
         return
     fi
@@ -753,7 +763,7 @@ function batch_rotate_nodes() {
     
     # 停止并删除之前可能存在的 'nexus-rotate' PM2 进程
     echo "停止并移除可能存在的旧的 'nexus-rotate' PM2 进程..."
-    $SUDO pm2 delete nexus-rotate --silent || true # --silent 忽略错误，例如进程不存在
+    ${SUDO} pm2 delete nexus-rotate --silent || true # --silent 忽略错误，例如进程不存在
 
     # 构建最新镜像，轮换启动前务必保证镜像是最新的
     if ! build_image; then
@@ -763,8 +773,8 @@ function batch_rotate_nodes() {
     fi
     
     # --- 创建用于轮换启动的脚本 ---
-    $SUDO mkdir -p "$SCRIPT_DIR"
-    $SUDO rm -f "${SCRIPT_DIR}"/*.sh # 清理旧的轮换脚本，以防重复创建导致混乱
+    ${SUDO} mkdir -p "$SCRIPT_DIR"
+    ${SUDO} rm -f "${SCRIPT_DIR}"/*.sh # 清理旧的轮换脚本，以防重复创建导致混乱
 
     echo "正在为节点轮换创建启动脚本..."
 
@@ -779,11 +789,11 @@ function batch_rotate_nodes() {
 #!/bin/bash
 set -e
 
-# 设置 sudo 前缀，因为这个脚本将由 pm2 独立执行
-SUDO=""
+# 在子脚本中再次获取 SUDO 变量，以确保权限正确传递
+SUB_SUDO=""
 if [[ "\$EUID" -ne 0 ]]; then
     if command -v sudo &> /dev/null && sudo -v &> /dev/null; then
-        SUDO="sudo"
+        SUB_SUDO="sudo"
     fi
 fi
 
@@ -795,7 +805,10 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===========================================
 # !!! 重要步骤：在启动新一批节点前，先停止并删除所有现有的 nexus-node 容器。
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] 正在停止并删除所有 Nexus Node 容器..."
 if command -v docker &> /dev/null; then
-    \$SUDO docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}" | xargs -r \$SUDO docker rm -f > /dev/null 2>&1
+    # -r 表示只有当 xargs 接收到输入时才执行 docker rm
+    # -f 强制删除，包括正在运行的容器
+    # 2>&1 将 stderr 也重定向到 /dev/null，避免输出“未找到容器”等信息
+    \$SUB_SUDO docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}" | xargs -r \$SUB_SUDO docker rm -f > /dev/null 2>&1
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] 已清理完所有 Nexus Node 容器。"
 else
     echo "警告: Docker 命令不可用，无法清理 Nexus Node 容器。请检查 Docker 是否正确安装并运行。"
@@ -811,12 +824,12 @@ EOF
             local container_name="${BASE_CONTAINER_NAME}-${node_id}"
             local log_file="${LOG_DIR}/nexus-${node_id}.log"
             
-            # 确保日志目录和文件存在且可写
-            $SUDO mkdir -p "$LOG_DIR"
-            $SUDO touch "$log_file"
-            $SUDO chmod 644 "$log_file"
-            if [ "$EUID" -ne 0 ]; then
-                $SUDO chown $(whoami):$(whoami) "$log_file"
+            # 确保日志目录和文件存在且可写，并设置正确的所有者
+            ${SUDO} mkdir -p "$LOG_DIR"
+            ${SUDO} touch "$log_file"
+            ${SUDO} chmod 644 "$log_file"
+            if [ "$EUID" -ne 0 ]; then # 如果主脚本不是root运行，则确保日志文件的用户所有权正确
+                ${SUDO} chown $(whoami):$(whoami) "$log_file"
             fi
 
             echo "echo \"[$(date '+%Y-%m-%d %H:%M:%S')]  ->  尝试启动节点 '$node_id' (容器: '$container_name')\"" >> "$group_script"
@@ -824,8 +837,8 @@ EOF
             echo "local CPUS_LIMIT=\"${DEFAULT_CPUS_LIMIT}\"" >> "$group_script"
             echo "local NODE_IMAGE_NAME=\"${IMAGE_NAME}\"" >> "$group_script"
             
-            # 使用docker run 命令，保持和run_container相同的逻辑
-            echo "\$SUDO docker run -d \\" >> "$group_script"
+            # 使用docker run 命令，保持和run_container相同的逻辑，使用 SUB_SUDO
+            echo "\$SUB_SUDO docker run -d \\" >> "$group_script"
             echo "        --name \"${container_name}\" \\" >> "$group_script"
             echo "        --memory \"\${MEM_LIMIT}\" \\" >> "$group_script"
             echo "        --cpus \"\${CPUS_LIMIT}\" \\" >> "$group_script"
@@ -833,15 +846,15 @@ EOF
             echo "        -e NODE_ID=\"${node_id}\" \\" >> "$group_script"
             echo "        \"\${NODE_IMAGE_NAME}\" > /dev/null" >> "$group_script"
             echo "if [ \$? -eq 0 ]; then" >> "$group_script"
-            echo "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')]      ->  节点 '$node_id' 启动命令已发送（请通过 list_nodes 或 docker logs 确认实际状态）\"" >> "$group_script"
+            echo "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')]      ->  节点 '$node_id' 启动命令已发送（请通过列表或日志确认实际状态）\"" >> "$group_script"
             echo "else" >> "$group_script"
-            echo "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')]      ->  !! 节点 '$node_id' 启动命令执行失败！\"" >> "$group_script"
+            echo "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')]      ->  !! 节点 '$node_id' 启动命令执行失败！请检查系统资源和Docker日志。\"" >> "$group_script"
             echo "fi" >> "$group_script"
             echo "sleep 10 # 每个节点启动间的小延迟" >> "$group_script"
         done
         
         echo "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] 第 ${group} 批节点启动指令集生成完毕。\"" >> "$group_script"
-        $SUDO chmod +x "$group_script" # 脚本必须有执行权限
+        ${SUDO} chmod +x "$group_script" # 脚本必须有执行权限
     done
 
     # --- 创建主管理脚本，用于按批次轮换启动 ---
@@ -850,16 +863,16 @@ EOF
 #!/bin/bash
 set -e
 
-# 设置 sudo 前缀，因为这个脚本将由 pm2 独立执行
-SUDO=""
+# 在子脚本中再次获取 SUDO 变量
+SUB_SUDO=""
 if [[ "\$EUID" -ne 0 ]]; then
     if command -v sudo &> /dev/null && sudo -v &> /dev/null; then
-        SUDO="sudo"
+        SUB_SUDO="sudo"
     fi
 fi
 
-echo "Nexus 节点轮换管理脚本启动..."
-echo "总节点数: ${total_nodes}, 每批启动数: ${nodes_per_round}, 共 ${num_groups} 批。"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Nexus 节点轮换管理脚本启动..."
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] 总节点数: ${total_nodes}, 每批启动数: ${nodes_per_round}, 共 ${num_groups} 批。"
 
 INTERVAL_HOURS=2
 SLEEP_SECONDS=\$((INTERVAL_HOURS * 60 * 60)) # 2小时转换为秒
@@ -871,12 +884,12 @@ for ((group=1; group<=${num_groups}; group++)); do
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
     
     # 执行当前批次的启动脚本
-    # 注意：这里需要确保执行权限
-    if [ -x "/root/nexus_scripts/start_group\${group}.sh" ]; then
-        /root/nexus_scripts/start_group\${group}.sh
+    local current_group_script="/root/nexus_scripts/start_group\${group}.sh"
+    if [ -x "\$current_group_script" ]; then
+        "\$current_group_script"
     else
-        echo "错误: 启动脚本 /root/nexus_scripts/start_group\${group}.sh 不可执行。请检查文件权限。"
-        exit 1
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 错误: 启动脚本 \$current_group_script 不可执行。请检查文件权限，可能需要执行: '\$SUB_SUDO chmod +x \$current_group_script'。"
+        exit 1 # 硬停止，因为无法执行子脚本
     fi
     
     # 如果不是最后一批，则等待指定间隔
@@ -894,28 +907,27 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] 如需再次轮换，请重新启动本 PM2
 
 exit 0
 EOF
-    $SUDO chmod +x "$manager_script"
+    ${SUDO} chmod +x "$manager_script"
 
     # 使用 PM2 启动管理脚本
     echo "使用 PM2 启动轮换管理进程..."
-    # --output /dev/null --error /dev/null 是为了不让 PM2 管理日志文件本身（轮换脚本自己有输出）
-    # 但是，如果PM2进程本身出现问题，就看不到PM2自己的错误日志了，通常建议指向一个文件，例如 $SCRIPT_DIR/pm2-rotate.log
-    $SUDO pm2 start "${manager_script}" --name "nexus-rotate" --interpreter bash \
+    # 为PM2进程指定输出和错误日志，方便调试
+    ${SUDO} pm2 start "${manager_script}" --name "nexus-rotate" --interpreter bash \
         --output "${SCRIPT_DIR}/pm2-rotate-out.log" --error "${SCRIPT_DIR}/pm2-rotate-err.log"
     
-    $SUDO pm2 save # 保存 PM2 配置，这样 PM2 服务启动时会加载这个进程
-    $SUDO pm2 list # 显示 PM2 管理的进程列表
+    ${SUDO} pm2 save # 保存 PM2 配置，这样 PM2 服务启动时会加载这个进程
+    ${SUDO} pm2 list # 显示 PM2 管理的进程列表
 
     echo "-------------------------------------------------------------"
     echo "Nexus 节点轮换启动配置完成！"
     echo "轮换流程已通过 PM2 启动。请使用以下命令进行监控和管理:"
-    echo "  $SUDO pm2 list              # 查看 PM2 管理的进程状态"
-    echo "  $SUDO pm2 logs nexus-rotate # 查看轮换管理脚本的聚合日志"
-    echo "  $SUDO tail -f ${SCRIPT_DIR}/pm2-rotate-out.log # 查看轮换管理脚本的stdout日志"
-    echo "  $SUDO tail -f ${SCRIPT_DIR}/pm2-rotate-err.log # 查看轮换管理脚本的stderr日志"
-    echo "  $SUDO pm2 stop nexus-rotate # 停止轮换进程"
-    echo "  $SUDO pm2 restart nexus-rotate # 重启轮换进程"
-    echo "  $SUDO pm2 delete nexus-rotate # 删除轮换进程配置"
+    echo "  ${SUDO} pm2 list                  # 查看 PM2 管理的进程状态"
+    echo "  ${SUDO} pm2 logs nexus-rotate     # 查看轮换管理脚本的聚合日志"
+    echo "  ${SUDO} tail -f ${SCRIPT_DIR}/pm2-rotate-out.log # 查看轮换管理脚本的stdout日志"
+    echo "  ${SUDO} tail -f ${SCRIPT_DIR}/pm2-rotate-err.log # 查看轮换管理脚本的stderr日志"
+    echo "  ${SUDO} pm2 stop nexus-rotate     # 停止轮换进程"
+    echo "  ${SUDO} pm2 restart nexus-rotate  # 重启轮换进程"
+    echo "  ${SUDO} pm2 delete nexus-rotate   # 删除轮换进程配置"
     echo "-------------------------------------------------------------"
     read -p "按任意键返回主菜单..."
 }
@@ -923,12 +935,17 @@ EOF
 # 设置定时任务以自动清理过期的 Nexus 日志文件
 function setup_log_cleanup_cron() {
     echo "--- 配置日志清理定时任务 ---"
+    if ! is_root_or_sudo_available; then
+        echo "警告: 无法设置定时清理任务。请以 root 身份或具备 sudo 权限的用户执行此操作。"
+        return 1
+    fi
+
     # 每天凌晨 3 点执行一次清理任务，删除超过 2 天未修改的日志文件
     local cron_job="0 3 * * * find $LOG_DIR -type f -name 'nexus-*.log' -mtime +2 -delete"
     local CRON_FILE="/tmp/nexus_cron_jobs.$$" # 临时存储 cron 配置，确保可写
 
     # 尝试获取当前用户的 crontab 内容
-    if ! $SUDO crontab -l &> "$CRON_FILE"; then
+    if ! ${SUDO} crontab -l &> "$CRON_FILE"; then
         echo "当前用户的 crontab 文件不存在或无法读取。将创建新的 crontab 配置。"
         echo "" > "$CRON_FILE" # 创建一个空的临时文件
     fi
@@ -940,12 +957,12 @@ function setup_log_cleanup_cron() {
         # 添加新任务到临时文件
         echo "$cron_job" >> "$CRON_FILE"
         # 将临时文件内容导入 crontab
-        if $SUDO crontab "$CRON_FILE"; then
+        if ${SUDO} crontab "$CRON_FILE"; then
             echo "成功添加定时日志清理任务。"
             echo "任务内容: \"$cron_job\""
             echo "（任务将在每天凌晨 3 点执行，清理 $LOG_DIR 中超过 2 天未修改的日志）"
         else
-            echo "警告: 添加定时日志清理任务失败。请手动检查您的 crontab 配置 ('$SUDO crontab -e')。"
+            echo "警告: 添加定时日志清理任务失败。请手动检查您的 crontab 配置 ('${SUDO} crontab -e')。"
         fi
     fi
     
@@ -978,7 +995,7 @@ function batch_uninstall_nodes() {
         local node_id=${node_list[$i]}
         local container_name="${BASE_CONTAINER_NAME}-${node_id}"
         # 获取容器状态
-        local status=$($SUDO docker ps -a --filter "name=$container_name" --format "{{.Status}}" 2>/dev/null | tr '[:lower:]' '[:upper:]')
+        local status=$(${SUDO} docker ps -a --filter "name=$container_name" --format "{{.Status}}" 2>/dev/null | tr '[:lower:]' '[:upper:]')
         local node_display_id="${node_id}"
         if [[ "$status" == "UP"* ]]; then
             node_display_id+=' [运行中]'
@@ -1039,8 +1056,10 @@ function batch_uninstall_nodes() {
 # --- 主菜单与逻辑 ---
 function main_menu() {
     # 脚本启动时，先确保基本的系统工具和日志清理任务已设置
-    ensure_package_installed "jq"
-    ensure_package_installed "curl"
+    ensure_package_installed "jq" # 用于docker inspect解析
+    ensure_package_installed "curl" # 用于下载docker/node安装脚本
+
+    # 尝试配置日志清理定时任务
     setup_log_cleanup_cron
 
     while true; do
@@ -1059,6 +1078,9 @@ function main_menu() {
         echo " 7. 退出脚本"
         echo "=========================================================================="
         echo "当前节点资源限制设置: 内存=${DEFAULT_MEMORY_LIMIT}, CPU=${DEFAULT_CPUS_LIMIT}"
+        if [ "$EUID" -ne 0 ] && ! is_root_or_sudo_available; then
+            echo "⚠️  警告: 当前用户无 root 权限或 sudo 权限，部分功能可能受限！"
+        fi
         echo ""
         read -rp "请选择您要执行的操作 (1-7): " choice
 
@@ -1073,13 +1095,15 @@ function main_menu() {
                     echo "Node ID 不能为空。请重新选择操作。"
                 else
                     # 首次部署前，检查镜像是否存在，不存在则构建
-                    if ! $SUDO docker images -q "$IMAGE_NAME" &> /dev/null; then
-                        echo "Nexus Docker 镜像未找到，将为您构建..."
+                    if ! ${SUDO} docker images -q "$IMAGE_NAME" &> /dev/null; then
+                        echo "Nexus Docker 镜像 '$IMAGE_NAME' 未找到，将为您构建..."
                         if ! build_image; then
-                            echo "错误: Docker 镜像构建失败，无法部署节点。"
+                            echo "错误: Docker 镜像构建失败，无法部署节点。请检查上述错误。"
                             read -p "按任意键返回主菜单..."
                             continue
                         fi
+                    else
+                        echo "Nexus Docker 镜像 '$IMAGE_NAME' 已存在，跳过构建。"
                     fi
                     run_container "$NODE_ID"
                 fi
@@ -1092,24 +1116,25 @@ function main_menu() {
                 batch_uninstall_nodes
                 ;;
             4) # 查看日志
-                local all_node_ids=$(get_all_node_ids)
-                if [ -z "$all_node_ids" ]; then
+                local all_node_ids_temp=$(get_all_node_ids)
+                if [ -z "$all_node_ids_temp" ]; then
                     echo "系统中尚无已部署的节点。无法查看日志。"
                 else
                     echo ""
                     echo "可用的节点列表用于选择日志查看:"
-                    local node_list=($all_node_ids)
+                    local node_list=($all_node_ids_temp)
                     local node_index=1
                     for id in "${!node_list[@]}"; do
-                        local node_id=${node_list[$id]}
-                        printf "  %d. %s\n" $((node_index)) "$node_id"
+                        local node_id_disp=${node_list[$id]}
+                        printf "  %d. %s\n" $((node_index)) "$node_id_disp"
                         node_index=$((node_index + 1))
                     done
                     echo ""
                     read -rp "请输入要查看日志的节点的 Node ID: " node_to_view_id
                     if [ -z "$node_to_view_id" ]; then
                         echo "Node ID 为空，取消操作。"
-                    elif echo "${node_list[*]}" | grep -qw "$node_to_view_id"; then
+                    # 使用一个更可靠的方法来检查输入ID是否存在于列表中
+                    elif [[ " ${node_list[*]} " =~ " ${node_to_view_id} " ]]; then
                         view_node_logs "$node_to_view_id"
                     else
                         echo "未找到您输入的 Node ID: '$node_to_view_id'。请检查输入是否正确，或选择 '2' 查看节点列表确认。"
@@ -1127,17 +1152,17 @@ function main_menu() {
                 echo "请务必确认您已备份所有重要信息。"
                 
                 if ! check_docker; then
-                    echo "Docker 环境未就绪，无法删除节点。"
+                    echo "Docker 环境未就绪，无法执行此操作。"
                     read -p "按任意键返回主菜单..."
                     continue
                 fi
                 
-                local existing_nodes_count=$($SUDO docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}" | wc -l)
+                local existing_nodes_count=$(${SUDO} docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}" | wc -l)
                 if [ "$existing_nodes_count" -eq 0 ]; then
                     echo "系统中没有找到 Nexus 节点需要删除。"
                 else
                     echo "系统检测到 ${existing_nodes_count} 个 Nexus 节点。"
-                    read -rp "您确定要删除所有节点吗？(输入 'yes' 确认): " confirm_delete_all
+                    read -rp "您确定要删除所有 Nexus 节点及相关数据吗？(输入 'yes' 确认): " confirm_delete_all
                     if [[ "$confirm_delete_all" == "yes" ]]; then
                         echo "开始删除所有 Nexus 节点..."
                         local all_nodes=($(get_all_node_ids))
@@ -1154,16 +1179,19 @@ function main_menu() {
                 # 清理 PM2 进程及相关脚本
                 if command -v pm2 &> /dev/null; then
                     echo "正在清理 PM2 轮换管理进程和脚本..."
-                    $SUDO pm2 delete nexus-rotate --silent || true
-                    $SUDO pm2 save # 保存更改
+                    ${SUDO} pm2 delete nexus-rotate --silent || true
+                    ${SUDO} pm2 save # 保存更改
+                    echo "PM2 进程已清理。"
                 fi
                 if [ -d "$SCRIPT_DIR" ]; then
                     echo "正在删除轮换脚本目录 '$SCRIPT_DIR'..."
-                    $SUDO rm -rf "$SCRIPT_DIR"
+                    ${SUDO} rm -rf "$SCRIPT_DIR"
+                    echo "脚本目录已删除。"
                 fi
                 if [ -d "$LOG_DIR" ]; then
-                    echo "正在删除日志目录 '$LOG_DIR'..."
-                    $SUDO rm -rf "$LOG_DIR"
+                    echo "正在删除节点日志目录 '$LOG_DIR'..."
+                    ${SUDO} rm -rf "$LOG_DIR"
+                    echo "节点日志目录已删除。"
                 fi
                 echo "所有相关资源清理完成。"
                 read -p "按任意键返回主菜单..."
