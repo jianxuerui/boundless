@@ -8,8 +8,8 @@
 #                   增强了系统兼容性与用户体验。
 #
 #       AUTHOR: 哈哈哈哈 (Github/Twitter: @ferdie_jhovie)
-#       VERSION: 1.5.0 (增强兼容性，Nexus CLI v0.8.17 集成)
-#     LAST CHANGE: 2024-07-26
+#       VERSION: 1.5.1 (修复 Dockerfile RUN 中 IF 解析问题，Nexus CLI v0.8.17 集成)
+#     LAST CHANGE: 2024-07-27
 #
 #===============================================================================
 
@@ -19,8 +19,7 @@ set -e # 遇到错误时立即退出
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:v0.8.17" # 镜像名称更新以反映Nexus CLI版本
 SPECIFIC_NEXUS_CLI_VERSION="v0.8.17" # 指定Nexus CLI版本
-# 检查 release page 上其他可能的 binary 名字。amd64 通常兼容 x86_64
-# 如果有发现其他如 "linux-x86_64" 的，可以添加到列表中检查。
+# 注意：若目标系统不是 amd64, 需要替换该URL
 SPECIFIC_NEXUS_CLI_BINARY_URL="https://github.com/nexus-xyz/nexus-cli/releases/download/${SPECIFIC_NEXUS_CLI_VERSION}/nexus-network-v0.8.17-linux-amd64"
 
 LOG_DIR="/root/nexus_logs"
@@ -62,7 +61,7 @@ function install_utility_if_not_exists() {
         if [ "$(id -u)" -ne 0 ]; then
             echo "  [!] 当前用户非 root，安装命令将尝试使用 'sudo'。"
             if ! command -v sudo &>/dev/null; then
-                echo "  [!] 警告: 未检测到 'sudo' 命令。请以 root 用户身份运行此脚本，或手动安装 '$package_name'。"
+                echo "  [!] 错误: 未检测到 'sudo' 命令。请以 root 用户身份运行此脚本，或手动安装 '$package_name'。"
                 return 1
             fi
             local sudo_prefix="sudo "
@@ -109,7 +108,7 @@ function install_utility_if_not_exists() {
         return 0 # 已经存在，不认为失败
     fi
     
-    return $install_success # 返回安装是否成功的状态
+    return "$install_success" # 返回安装是否成功的状态
 }
 
 # -----------------------------------------------------------------------------
@@ -225,7 +224,10 @@ function check_nodejs_and_pm2() {
         if command -v apt-get &>/dev/null; then # Debian/Ubuntu
             local node_version_to_install="18.x"
             echo "  [*] 配置 NodeSource 以安装 Node.js ${node_version_to_install}..."
+            # 添加 node_source.list 的创建逻辑，并处理 key
             if ! install_utility_if_not_exists "curl" "curl" || \
+               ! command -v gpg &>/dev/null && install_utility_if_not_exists "gpg" "gnupg" "gpg" || \
+               ! curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg || \
                ! echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${node_version_to_install} nodistro main" | sudo tee /etc/apt/sources.list.d/nodesource.list > /dev/null || \
                ! sudo apt-get update -qq || \
                ! sudo apt-get install -y -qq nodejs; then
@@ -319,12 +321,14 @@ function build_image() {
 
     echo "[-] 开始构建 Docker 镜像 '${IMAGE_NAME}' (包含 Nexus CLI ${SPECIFIC_NEXUS_CLI_VERSION})..."
     local WORKDIR
+    # 使用 mktemp 创建一个临时目录，使用 /tmp 作为基础，更具通用性
     if ! WORKDIR=$(mktemp -d /tmp/nexus_build_XXXXXX); then echo "[!] 错误: 创建临时目录失败！"; return 1; fi
     
     echo "[*] 使用临时目录 '$WORKDIR' 进行构建。"
+    # 进入临时目录，以便构建命令在当前目录中执行
     cd "$WORKDIR" || return 1
 
-    # 创建 Dockerfile，指定使用 Ubuntu，并下载 Nexus CLI v0.8.17
+    # 创建 Dockerfile
     cat > Dockerfile <<EOF
 FROM ubuntu:24.04
 
@@ -350,10 +354,14 @@ RUN set -ex; \
     echo "[-] 正在下载 Nexus CLI ${SPECIFIC_NEXUS_CLI_VERSION} (binary: ${SPECIFIC_NEXUS_CLI_BINARY_URL})..."; \
     mkdir -p /root/.nexus/bin; \
     cd /root/.nexus/bin; \
-    curl -L "${SPECIFIC_NEXUS_CLI_BINARY_URL}" -o nexus-network; \
+    # 使用 curl 下载，并增加对下载失败的检查
+    if ! curl -L "${SPECIFIC_NEXUS_CLI_BINARY_URL}" -o nexus-network; then \
+        echo "[!] Nexus CLI 下载失败，请检查 URL 或网络连接。"; \
+        exit 1; \
+    fi; \
     chmod +x nexus-network; \
     echo "[-] Nexus CLI ${SPECIFIC_NEXUS_CLI_VERSION} 下载并安装到 /root/.nexus/bin/nexus-network。"; \
-    # 验证安装
+    # 验证安装，使用 set -x 使验证步骤清晰
     if [ ! -f nexus-network ] || [ ! -x nexus-network ]; then \
         echo "[!] Nexus CLI 安装失败，二进制文件未找到或不可执行！"; \
         exit 1; \
@@ -374,7 +382,7 @@ RUN chmod +x /entrypoint.sh \
 ENTRYPOINT ["/entrypoint.sh"]
 EOF
 
-    # 创建 entrypoint.sh 文件 (保持与之前一致，只是安装 Nexus CLI 的方式变了)
+    # 创建 entrypoint.sh 文件
     cat > entrypoint.sh <<EOF
 #!/bin/bash
 # Nexus Node Entrypoint Script
@@ -395,6 +403,7 @@ if [ -z "\$NODE_ID" ]; then
 fi
 
 # 确保 .nexus 目录存在，并写入 node-id
+# 尽管 PROVER_ID_FILE 是一个ENV变量，我们仍然可以在容器内确保其路径存在
 mkdir -p /root/.nexus
 echo "\$NODE_ID" > "\$PROVER_ID_FILE"
 echo "[-] Nexus Node: 设置节点 ID 为: \$NODE_ID (存储在 \$PROVER_ID_FILE)"
@@ -428,16 +437,15 @@ tail -f /dev/null
 EOF
 
     # 执行 Docker 构建
-    # 如果你需要为非amd64架构构建镜像，需要修改 SPECIFIC_NEXUS_CLI_BINARY_URL
     if ! docker build -t "${IMAGE_NAME}" .; then
         echo "[!] 错误: Docker 镜像构建失败！"
-        cd - > /dev/null
-        rm -rf "$WORKDIR"
+        cd - > /dev/null # 返回到原来的目录
+        rm -rf "$WORKDIR" # 清理临时目录
         return 1
     fi
 
-    cd - > /dev/null
-    rm -rf "$WORKDIR"
+    cd - > /dev/null # 返回到原来的目录
+    rm -rf "$WORKDIR" # 清理临时目录
     echo "[+] Docker 镜像 '${IMAGE_NAME}' 构建成功！"
     return 0
 }
@@ -498,7 +506,7 @@ function run_container() {
         echo "[!] 错误: 无法创建日志目录 '$LOG_DIR'。"
         return 1
     fi
-    # 尝试创建并设置日志文件权限，如果失败则给出警告（容器内部也可以创建）
+    # 尝试创建并设置日志文件权限，如果失败则给出警告（容器内部仍可写入）
     touch "$log_file" && chmod 644 "$log_file" || echo "[-] 警告: 无法创建/修改宿主机日志文件 '$log_file'。容器内部仍会尝试创建。"
 
     # --- 计算容器内存限制 ---
@@ -516,9 +524,9 @@ function run_container() {
         return 1
     fi
 
-    # 计算内存分配，保留一位小数并四舍五入
+    # 计算内存分配，使用 `scale=0` 并四舍五入
     local allocated_mem_float=$(echo "$host_total_mem_mb * $CONTAINER_MEM_RATIO" | bc)
-    local allocated_mem_mb=$(printf "%.0f" "$allocated_mem_float")
+    local allocated_mem_mb=$(printf "%.0f" $(echo "scale=4; $allocated_mem_float / 1024" | bc)) # 转换成 MB，并保留几位小数以确保精度
 
     # 应用最大和最小内存限制
     if (( allocated_mem_mb > CONTAINER_MEM_MAX_MB )); then allocated_mem_mb="$CONTAINER_MEM_MAX_MB"; fi
@@ -529,11 +537,11 @@ function run_container() {
         echo "[-] 警告: 内存分配请求 (${allocated_mem_mb}MB) 已超出宿主机可用内存 (${host_available_mem_mb}MB)。尝试调整..."
         # 预留一部分内存（例如 10%），防止宿主机系统卡死
         local available_adjusted_float=$(echo "$host_available_mem_mb * 0.9" | bc)
-        allocated_mem_mb=$(printf "%.0f" "$available_adjusted_float")
+        allocated_mem_mb=$(printf "%.0f" $(echo "scale=4; $available_adjusted_float / 1024" | bc)) # 转换成 MB
         
-        # 确保调整后的内存不小于最小限制
+        # 再次确保不小于最小限制
         if (( allocated_mem_mb < CONTAINER_MEM_MIN_MB )); then allocated_mem_mb="$CONTAINER_MEM_MIN_MB"; fi
-        # 再次确保调整后的内存不超过宿主机可用内存
+        # 确保不大于宿主机实际可用内存
         if (( allocated_mem_mb > host_available_mem_mb )); then allocated_mem_mb="$host_available_mem_mb"; fi # 最后的上限保护
         
         echo "[+] 调整后分配内存: ${allocated_mem_mb}MB (宿主机可用 ${host_available_mem_mb}MB)"
@@ -915,8 +923,8 @@ function batch_rotate_nodes() {
         echo "[!] 输入无效，使用默认值 $nodes_per_round。"
     fi
     
-    # 确保节点 ID 数组被正确传递
-    local node_ids_for_script=("${node_ids_input_array[@]}") # 复制一份用于脚本
+    # 确保节点 ID 数组被正确传递给后面的脚本生成部分
+    local node_ids_for_script=("${node_ids_input_array[@]}") 
     
     echo "[-] 正在清理旧的轮换启动脚本和 PM2 配置..."
     local script_dir="/root/nexus_scripts" # 脚本存放目录
@@ -947,8 +955,7 @@ function batch_rotate_nodes() {
     
     # 生成主控制脚本
     echo "[-] 生成节点轮换管理脚本..."
-    # 将 node_ids_for_script, nodes_per_round, num_actual_groups, batch_mode 等变量嵌入到脚本中
-    # 使用 EOF 作为分隔符创建多行字符串
+    # 将主脚本中的配置变量通过 here-document 的形式嵌入到管理脚本中
     cat > "$script_dir/nexus_rotation_manager.sh" <<EOF
 #!/bin/bash
 # Nexus Node Rotation Manager Script (Managed by PM2)
@@ -958,11 +965,16 @@ echo "[\$(date '+%Y-%m-%d %H:%M:%S')] ==== Nexus 节点轮换管理脚本启动 
 
 # --- 配置参数，由主脚本传递 ---
 readonly ROTATION_WAIT_INTERVAL_SECONDS=7200 # 轮换间隔，单位秒 (例如：2小时)
-declare -a NODE_IDS=($(printf '"%s" ' "${node_ids_for_script[@]}")) # 节点 ID 列表
+declare -a NODE_IDS=($(printf '"%s" ' "${node_ids_for_script[@]}")) # 节点 ID 列表，来自主脚本
 readonly TOTAL_NODES=\${#NODE_IDS[@]}
 readonly NODES_PER_BATCH=$nodes_per_round # 每批节点数
 readonly NUM_BATCHES=$num_actual_groups      # 总批次数
 readonly BATCH_MODE="$batch_mode"            # 'rotate' 或 'single_run'
+
+# 引用主脚本中定义的常量以进行内存计算
+CONTAINER_MEM_RATIO=$CONTAINER_MEM_RATIO
+CONTAINER_MEM_MAX_MB=$CONTAINER_MEM_MAX_MB
+CONTAINER_MEM_MIN_MB=$CONTAINER_MEM_MIN_MB
 
 # --- 辅助函数 ---
 # 获取宿主机内存 (总内存或可用内存)，返回 MB
@@ -995,15 +1007,10 @@ execute_batch() {
         local allocated_mem_mb_for_script=0 # 用于传递给 docker run 的内存参数
         
         # 计算内存分配，使用主脚本中的配置
-        # 引入主脚本的全局变量作为参考
-        local CONTAINER_MEM_RATIO=$CONTAINER_MEM_RATIO
-        local CONTAINER_MEM_MAX_MB=$CONTAINER_MEM_MAX_MB
-        local CONTAINER_MEM_MIN_MB=$CONTAINER_MEM_MIN_MB
-
         if [ -n "\$host_total_mem_mb" ] && [ -n "\$host_available_mem_mb" ] && [ -n "\$(command -v bc)" ]; then
             # 计算基础内存分配
             local allocated_mem_float="(\$host_total_mem_mb * ${CONTAINER_MEM_RATIO})" # 乘以比例
-            allocated_mem_mb_for_script=\$(echo "scale=0; (\$allocated_mem_float / 1024)" | bc) # 转换为 MB 并四舍五入
+            allocated_mem_mb_for_script=\$(echo "scale=4; (\$allocated_mem_float / 1024)" | bc) # 转换为 MB 并保留小数
 
             # 应用最大和最小限制
             if (( allocated_mem_mb_for_script > ${CONTAINER_MEM_MAX_MB} )); then allocated_mem_mb_for_script=${CONTAINER_MEM_MAX_MB}; fi
@@ -1013,7 +1020,7 @@ execute_batch() {
             if (( allocated_mem_mb_for_script > host_available_mem_mb )); then
                 echo "[\$(date '+%Y-%m-%d %H:%M:%S')] 节点 \$node_id: 内存请求 (\$allocated_mem_mb_for_script MB) 已超可用内存 (\$host_available_mem_mb MB)。调整中..."
                 local available_adjusted_float="(\$host_available_mem_mb * 0.9)" # 保留10%作为预留
-                allocated_mem_mb_for_script=\$(echo "scale=0; \$available_adjusted_float / 1024" | bc) # 转换为 MB 并四舍五入
+                allocated_mem_mb_for_script=\$(echo "scale=4; \$available_adjusted_float / 1024" | bc) # 转换为 MB
                 
                 # 再次确保不小于最小限制
                 if (( allocated_mem_mb_for_script < ${CONTAINER_MEM_MIN_MB} )); then allocated_mem_mb_for_script=${CONTAINER_MEM_MIN_MB}; fi
@@ -1025,10 +1032,11 @@ execute_batch() {
             allocated_mem_mb_for_script=${CONTAINER_MEM_MIN_MB}
         fi
         
-        # 打印内存分配信息
-        if (( allocated_mem_mb_for_script > 0 )); then 
-            echo "[\$(date '+%Y-%m-%d %H:%M:%S')] 节点 \$node_id: 将分配 \${allocated_mem_mb_for_script} MB RAM。"
-            mem_param="-m \${allocated_mem_mb_for_script}m" # 格式化为 docker run 参数
+        # 打印内存分配信息 (取整)
+        local final_allocated_mb=\$(printf "%.0f" "\$allocated_mem_mb_for_script")
+        if (( final_allocated_mb > 0 )); then 
+            echo "[\$(date '+%Y-%m-%d %H:%M:%S')] 节点 \$node_id: 将分配 \${final_allocated_mb} MB RAM。"
+            mem_param="-m \${final_allocated_mb}m" # 格式化为 docker run 参数
         else
             echo "[\$(date '+%Y-%m-%d %H:%M:%S')] 节点 \$node_id: 无法确定内存分配，跳过内存限制参数。"
             mem_param=""
@@ -1155,7 +1163,7 @@ function display_menu() {
     echo "**           Nexus 多节点管理工具                    **"
     echo "********************************************************"
     echo "   作者: 哈哈哈哈 (Github/Twitter: @ferdie_jhovie)"
-    echo "   版本: 1.5.0 (Nexus CLI ${SPECIFIC_NEXUS_CLI_VERSION} 集成，增强兼容性)"
+    echo "   版本: 1.5.1 (Nexus CLI ${SPECIFIC_NEXUS_CLI_VERSION} 集成，增强兼容性，修复Dockerfile错误)"
     echo "--------------------------------------------------------"
     echo " [1] 单节点部署: 安装并启动一个新的 Nexus 节点 (使用镜像 ${IMAGE_NAME})"
     echo " [2] 节点列表: 查看所有已创建 Nexus 节点的当前状态和详情"
@@ -1202,7 +1210,7 @@ while true; do
                     if run_container "$NODE_ID"; then
                         echo "[+] 节点 '$NODE_ID' 启动请求已发送。"
                     else
-                        echo "[!] 启动节点 '$NODE_ID' 的容器失败。"
+                        echo "[!] 启动节点 '$node_id' 的容器失败。"
                     fi
                 fi
             fi
