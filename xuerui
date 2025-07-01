@@ -14,6 +14,8 @@ function check_node_pm2() {
     # 检查是否安装了 Node.js
     if ! command -v node >/dev/null 2>&1; then
         echo "✅ Node.js 未安装，正在安装..."
+        # NodeSource 脚本会自动检测操作系统和版本，并配置合适的仓库
+        # 使用 Node.js 20 是一个较新的稳定版本
         curl -fsSL https://deb.nodesource.com/setup_20.x | bash - || { echo "🔴 错误：Node.js 安装脚本失败。"; exit 1; }
         apt-get update && apt-get install -y nodejs || { echo "🔴 错误：Node.js 包安装失败。"; exit 1; }
         echo "✅ Node.js 安装成功。"
@@ -24,12 +26,18 @@ function check_node_pm2() {
         echo "✅ pm2 未安装，正在安装..."
         npm install -g pm2 || { echo "🔴 错误：pm2 安装失败。"; exit 1; }
         # 配置 npm prefix，确保 pm2 可执行文件在 PATH 中
+        # 这部分确保 PM2 的全局可执行文件在后续命令或系统启动时可被发现。
         PM2_PATH=$(npm config get prefix)/bin
         if [[ ":$PATH:" != *":$PM2_PATH:"* ]]; then
             echo "🔧 将 npm bin 路径添加到 PATH 环境变量..."
-            echo "export PATH=\"$PM2_PATH:\$PATH\"" >> ~/.profile # 确保重启后也有效
-            source ~/.profile
-            # For current session if it was root
+            # 为确保持久性，添加到 ~/.profile。对于 root 用户，通常已在 /usr/local/bin 中
+            # 避免重复添加 PATH 路径
+            if ! grep -q "export PATH=\"$PM2_PATH:\$PATH\"" ~/.profile 2>/dev/null; then
+                echo "export PATH=\"$PM2_PATH:\$PATH\"" >> ~/.profile # 确保重启后也有效
+            fi
+            source ~/.profile # 对于当前会话使其生效
+            # 如果作为 root 或非登录 shell 运行，可能 ~/.profile 不会被自动加载
+            # 为当前脚本会话显式导出 PATH。
             export PATH="$PM2_PATH:$PATH"
         fi
         echo "✅ pm2 安装成功。"
@@ -50,6 +58,7 @@ function check_docker() {
             "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
             $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null || { echo "🔴 错误：Docker APT 源添加失败。"; exit 1; }
         apt update || { echo "🔴 错误：apt update 失败。"; exit 1; }
+        # Docker 安装包名称是正确的标准包
         apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y || { echo "🔴 错误：Docker CE 安装失败。"; exit 1; }
         systemctl enable docker || { echo "🔴 错误：启用 Docker 失败。"; exit 1; }
         systemctl start docker || { echo "🔴 错误：启动 Docker 失败。"; exit 1; }
@@ -68,7 +77,7 @@ function check_docker() {
 function setup_pm2_startup() {
     echo "✅ 设置 PM2 启动脚本以确保服务持久化..."
     if command -v pm2 >/dev/null 2>&1; then
-        # 尝试使用 systemd，如果失败则回退到其他类型
+        # 尝试使用 systemd，如果失败则回退到其他类型 (现代 Ubuntu 优先 systemd)
         pm2 startup systemd || pm2 startup || echo "⚠️ PM2 startup 命令可能失败，请手动设置：pm2 startup"
         pm2 save || echo "⚠️ PM2 save 命令失败，请手动执行：pm2 save"
         echo "✅ PM2 服务持久化设置完成。"
@@ -86,7 +95,7 @@ function build_image() {
 
     cd "$WORKDIR"
 
-    # Dockerfile
+    # Dockerfile 内容
     cat > Dockerfile <<EOF
 FROM ubuntu:24.04
 
@@ -112,9 +121,10 @@ ENV LC_ALL en_US.UTF-8
 
 # 自动下载安装最新版 nexus-network
 # 使用 NONINTERACTIVE=1 避免交互式安装
+# 这个 URL (https://cli.nexus.xyz/) 总是指向最新稳定的安装脚本。
 RUN curl -sSL https://cli.nexus.xyz/ | NONINTERACTIVE=1 sh \
     && ln -sf /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network \
-    && rm -rf ~/.npm ~/.config
+    && rm -rf ~/.npm ~/.config # 清理安装过程中的临时文件，减小镜像大小
 
 # Docker HEALTHCHECK 用于检查容器内服务是否运行
 # 检查 nexus-network 进程是否存在，如果不存在则容器不健康
@@ -126,7 +136,7 @@ RUN chmod +x /entrypoint.sh
 ENTRYPOINT ["/entrypoint.sh"]
 EOF
 
-    # entrypoint.sh (已修复，更健壮且符合Docker最佳实践)
+    # entrypoint.sh (已优化，更健壮且符合Docker最佳实践)
     cat > entrypoint.sh <<EOF
 #!/bin/bash
 set -e
@@ -153,30 +163,12 @@ if ! command -v nexus-network >/dev/null 2>&1; then
     exit 1
 fi
 
-# 使用 trap 捕获 SIGTERM (Docker stop 信号) 以实现优雅关闭
-# 由于 nexus-network 现在是主要进程，Docker 的 SIGTERM 会直接发送给它
-# 如果 nexus-network 自身不支持 SIGTERM 优雅关闭，则需要在它停止前发送特殊信号或进行特定操作
-# 对于通常的进程，系统会自动处理 SIGTERM。这里可以移除具体的 graceful_shutdown 函数
-# 如果 nexus-network 需要特别的处理，需要查看其文档
-function graceful_shutdown() {
-    echo "🛑 收到停止信号 (SIGTERM)。尝试等待 nexus-network 优雅退出..."
-    # 可以发送 SIGINT (Ctrl+C) 或 SIGTERM 给 PID 1 进程
-    # 这里如果 nexus-network 是 PID 1，Docker 会直接处理它。
-    # 如果您需要额外步骤（例如清理），可以添加在此处。
-    # 示例: 可以简单地等待，让 Docker 自己处理 PID 1 收到 SIGTERM 后的默认行为
-    wait \$(pgrep -f nexus-network) 2>/dev/null || true # 等待进程结束，不报错
-    echo "✅ nexus-network 进程已退出。"
-    exit 0
-}
-
-# Trap SIGTERM 仅作为后备，Docker 会直接发送 SIGTERM 到 exec 启动的进程
-# 这在 exec 后就没有太多作用了，因为 trap 是针对当前 shell 的。
-# 通常，让容器的 PID 1 进程直接接收 Docker 的信号即可。
-# 如果 nexus-network 优雅关闭不工作，可能是它自身不处理信号。
-# 更好的做法是确保 nexus-network 能够处理 TERM 信号。
-# 这里将 trap 设置为 exec *之前*，这样它会处理退出，
-# 但是 exec 后，这个 trap 仅存在于替换的进程中。
-trap 'graceful_shutdown' SIGTERM
+# 重要：`exec` 命令会将当前 shell 进程替换为指定的程序。
+# 这意味着 `nexus-network` 将成为容器中的 PID 1 进程。
+# 任何在此脚本中 `exec` 之前设置的 `trap` 命令对于 `nexus-network` 将不会活跃。
+# Docker 会直接将信号 (例如 'docker stop' 发送的 SIGTERM) 发送给 PID 1。
+# 为了实现优雅关闭，`nexus-network` 本身必须能够处理 SIGTERM。
+# 因此，此处移除之前设置的 `trap`，以避免误导。容器的核心功能是运行一个主要进程，而 `exec` 正是为此。
 
 echo "🚀 启动 nexus-network 节点..."
 # 将 nexus-network 的标准输出和标准错误重定向到 NEXUS_LOG_FILE，
