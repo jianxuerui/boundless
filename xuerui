@@ -21,6 +21,7 @@ DEFAULT_CPUS_LIMIT="2"    # 每个节点最多使用 2 个 CPU 核心 (例如 2.
 # 检查是否是 root 用户或拥有 sudo 权限
 function is_root_or_sudo() {
     if [[ "$EUID" -ne 0 ]]; then
+        # 尝试使用 sudo 来检测是否有 sudo 权限
         if command -v sudo &> /dev/null && sudo -v &> /dev/null; then
             return 0 # 可以使用 sudo
         else
@@ -51,63 +52,37 @@ function check_docker() {
     if ! command -v docker &> /dev/null; then
         echo "错误：未检测到 Docker 命令。请先安装 Docker。"
         
-        # 尝试检测包管理器并提供安装指示
+        # 检查当前环境是否可以执行包管理命令
         local pm=$(get_package_manager)
-        local common_arch="amd64" # 默认为 amd64，如果需要 arm 等可以考虑更通用的检测方式
-        # 尝试更通用的架构检测
-        case "$(uname -m)" in
-            x86_64) common_arch="amd64" ;;
-            aarch64) common_arch="arm64" ;;
-            armv7l) common_arch="armhf" ;;
-            *) echo "警告: 未知系统架构 '$(uname -m)'，将尝试使用 amd64 进行 Docker 安装指引。" ;;
-        esac
-        
         if [[ "$pm" != "unknown" ]]; then
             echo "您的系统似乎使用 '$pm' 作为包管理器。"
-            # 根据 PM 打印安装说明
-            if [[ "$pm" == "apt" ]]; then
-                echo "请尝试手动执行以下命令安装 Docker (基于 Ubuntu/Debian 的系统):"
-                echo "  # 1. 更新包列表和安装必要依赖"
-                echo "  sudo apt update"
-                echo "  sudo apt install -y apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release"
-                echo "  # 2. 添加 Docker 的官方 GPG key"
-                echo "  sudo mkdir -p /etc/apt/keyrings"
-                echo "  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg"
-                echo "  # 3. 添加 Docker apt repository"
-                echo "  echo \"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable\" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null"
-                echo "  # 4. 重新更新包列表并安装 Docker Engine"
-                echo "  sudo apt update"
-                echo "  sudo apt install -y docker-ce docker-ce-cli containerd.io"
-            elif [[ "$pm" == "yum" ]]; then
-                echo "请尝试手动执行以下命令安装 Docker (基于 RHEL/CentOS/Fedora 系统):"
-                echo "  sudo yum install -y yum-utils"
-                echo "  sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo" # CentOS repo for Docker
-                echo "  sudo yum install -y docker-ce docker-ce-cli containerd.io"
-            elif [[ "$pm" == "dnf" ]]; then
-                echo "请尝试手动执行以下命令安装 Docker (基于 Fedora 或较新 CentOS/RHEL):"
-                echo "  sudo dnf install -y dnf-plugins-core"
-                echo "  sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo"
-                echo "  sudo dnf install -y docker-ce docker-ce-cli containerd.io"
-            elif [[ "$pm" == "apk" ]]; then
-                echo "请尝试手动执行以下命令安装 Docker (基于 Alpine Linux):"
-                echo "  sudo apk add docker docker-cli containerd.io"
-            fi
+            echo "但您的环境中可能缺少核心命令，如 'apt' 本身。"
+            echo "因此，我们无法自动为您安装 Docker。"
+            echo "请按照您的系统发行版文档手动安装 Docker Engine。"
+            echo "您可以参考以下常用系统的安装说明:"
+            
+            # 提供最常用的安装说明，但重点是让用户理解这里是安装失败原因
+            echo "  - Ubuntu/Debian 系统 (需要 'apt'): 参考 Docker 官方文档以获取最新最准确的安装步骤。"
+            echo "  - Fedora/CentOS/RHEL 系统 (需要 'dnf'/'yum'): 参考 Docker 官方文档。"
+            echo "  - Alpine Linux (需要 'apk'): 参考 Docker 官方文档。"
+            
+            echo "  例如，对于 Ubuntu 22.04 (Jammy)，可能需要类似步骤，但请务必从官方文档确认："
+            echo "    sudo apt update && sudo apt install -y docker-ce docker-ce-cli containerd.io"
             echo "---------------------------------------------------------------------------"
-            echo "Docker 安装完成后，请您需要确保 Docker 服务正在运行："
-            echo "  # 尝试启用并启动 Docker 服务 (可能需要 root 权限)"
-            echo "  sudo systemctl enable docker"
-            echo "  sudo systemctl start docker"
-            echo "Docker 安装和启动成功后，请重新运行本脚本。"
+            echo "Docker 安装完成后，请确保 Docker 服务正在运行："
+            echo "  sudo systemctl enable docker && sudo systemctl start docker"
         else
-            echo "未能识别您系统的包管理器。请访问 Docker 官方网站获取您的操作系统对应的安装指南:"
+            echo "未能识别您系统的包管理器，因此无法提供自动安装建议。"
+            echo "请访问 Docker 官方网站获取您的操作系统对应的安装指南:"
             echo "  https://docs.docker.com/engine/install/"
             echo "请在安装完成后，手动确保 Docker 服务正在运行 (例如: sudo systemctl start docker)。"
-            echo "然后请重新运行本脚本。"
         fi
-        return 1 # 指示未成功执行 (Docker 命令不存在)
+        echo "请在 Docker 安装并成功运行后，重新执行此脚本。"
+        
+        return 1 # 返回错误码，表示 Docker 未就绪
     fi
     
-    # Docker 命令存在，现在检查服务是否运行
+    # Docker 命令存在，但需要检查服务是否运行
     local SUDO=""
     if ! is_root_or_sudo; then
         # 如果不是 root, 并且需要管理服务, 需要尝试 sudo
@@ -147,7 +122,7 @@ function check_docker() {
 function check_pm2() {
     # 检查 Node.js 和 npm
     if ! command -v node &> /dev/null || ! command -v npm &> /dev/null; then
-        echo "错误：未检测到 Node.js/npm。正在安装..."
+        echo "错误：未检测到 Node.js/npm。尝试安装..."
         local pm=$(get_package_manager)
         if [[ "$pm" == "apt" ]]; then
             # 下载 NodeSource 的脚本来添加 Node.js 源
@@ -158,14 +133,13 @@ function check_pm2() {
             fi
         else
             echo "警告：Node.js/npm 未找到。由于您的系统未使用 apt 包管理器，无法自动安装 Node.js。"
-            echo "请手动安装 Node.js (例如使用 nvm 或下载二进制包)。"
-            echo "如果手动安装后仍无法找到命令，pm2 功能将不可用。"
-            # 仅作警告，不返回错误，除非后面 PM2 也失败了
+            echo "请手动安装 Node.js (例如使用 nvm 或下载二进制包)。如果手动安装后仍无法找到命令，pm2 功能将不可用。"
+            return 1 # 返回失败，因为 PM2 功能对轮换启动是必需的
         fi
         # 再次检查，确保 Node.js 和 npm 确实被安装了
         if ! command -v node &> /dev/null || ! command -v npm &> /dev/null; then
              echo "错误：Node.js/npm 安装或配置失败，pm2 功能将不可用。"
-             return 1 # 表示安装失败或跳过
+             return 1 # 表示安装失败
         fi
         echo "Node.js 和 npm 安装完成。"
     fi
@@ -189,9 +163,9 @@ function build_image() {
     echo " 开始构建 Docker 镜像 '$IMAGE_NAME'..."
     echo "======================================"
     
-    # 必须先确认 Docker 可用，否则构建镜像会失败
+    # 必须先确认 Docker 命令可用
     if ! command -v docker &> /dev/null; then
-        echo "错误：在尝试构建镜像前，Docker 命令不可用。请先正确安装 Docker。"
+        echo "错误：Docker 命令不可用。无法构建镜像。"
         return 1
     fi
 
@@ -331,6 +305,12 @@ function run_container() {
     echo "    CPU 限制: $DEFAULT_CPUS_LIMIT"
     echo "----------------------------"
 
+    # 必须先确保 Docker 命令可用
+    if ! command -v docker &> /dev/null; then
+        echo "错误：Docker 命令不可用。无法启动容器。"
+        return 1
+    fi
+
     # 检查是否已存在同名容器，如果有，先删除
     if docker ps -a --format '{{.Names}}' | grep -q "^${container_name}$"; then
         echo "发现同名容器 '$container_name'。正在尝试删除旧容器..."
@@ -392,6 +372,12 @@ function uninstall_node() {
     echo ""
     echo "--- 卸载节点: $node_id ---"
     
+    # 必须先确保 Docker 命令可用
+    if ! command -v docker &> /dev/null; then
+        echo "错误：Docker 命令不可用。无法卸载节点。"
+        return 1
+    fi
+    
     # 停止并删除容器
     echo "    正在停止并删除容器 '$container_name'..."
     if docker ps -q -f name=${container_name} &> /dev/null; then
@@ -421,6 +407,13 @@ function list_nodes() {
     printf "%-6s %-20s %-10s %-12s %-12s %-10s %-15s %-20s\n" "序号" "节点ID" "CPU%" "内存使用" "内存限制" "CPU核数" "状态" "创建时间"
     echo "--------------------------------------------------------------------------"
     
+    # 必须先确保 Docker 命令可用
+    if ! command -v docker &> /dev/null; then
+        echo "错误：Docker 命令不可用，无法显示节点状态。"
+        read -p "按任意键返回主菜单..."
+        return 1
+    fi
+
     # 获取所有匹配 BASE_CONTAINER_NAME 的容器ID，无论其状态如何
     local container_names=($(docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}"))
     
@@ -528,6 +521,12 @@ function view_node_logs() {
     local node_id=$1
     local container_name="${BASE_CONTAINER_NAME}-${node_id}"
     
+    # 必须先确保 Docker 命令可用
+    if ! command -v docker &> /dev/null; then
+        echo "错误：Docker 命令不可用，无法查看日志。"
+        return 1
+    fi
+    
     # 检查容器是否存在
     if ! docker ps -a --filter "name=${container_name}" --format "{{.Names}}" &> /dev/null; then
         echo ""
@@ -630,11 +629,17 @@ function batch_rotate_nodes() {
     echo "--- Nexus 节点轮换启动管理 ---"
     # 首先确保 Docker 可用
     if ! check_docker; then
-        echo "Docker 服务检查失败，无法进行节点轮换管理。"
+        echo "Docker 服务检查失败，无法进行节点轮换管理。" # check_docker 函数已经提供了所有信息和指引
+        read -p "按任意键继续..."
+        return # 如果 Docker 不可用，直接返回，停止当前操作
+    fi
+    # 只有当 Docker 可用时才检查 PM2
+    if ! check_pm2; then
+        echo "PM2 (用于管理轮换进程) 检查失败或安装失败，节点轮换管理将无法进行。"
+        echo "请确保您已成功安装 Node.js, npm, 并使用 npm 安装了 pm2。"
         read -p "按任意键继续..."
         return
     fi
-    check_pm2    # 确保 PM2 已安装
 
     echo "请输入您希望参与轮换的节点 IDs，每行一个，输入空行并按回车键结束输入："
     echo "示例:"
@@ -866,8 +871,8 @@ function main_menu() {
         case "$choice" in
             1) # 部署新节点
                 if ! check_docker; then # 确保 Docker 可用
-                    # check_docker 函数已在无法安装时给出提示
-                    read -p "按任意键继续..."
+                    # check_docker 会打印错误信息和安装指引
+                    read -p "按任意键返回主菜单..."
                     continue
                 fi
                 read -rp "请输入此新节点的 Node ID: " NODE_ID
@@ -911,6 +916,18 @@ function main_menu() {
                 read -p "按任意键返回主菜单..."
                 ;;
             5) # 批量轮换启动
+                # 批量轮换启动依赖 Docker 和 PM2，所以在此也需要检查 Docker 和 PM2
+                if ! check_docker; then
+                    echo "Docker 服务检查失败，无法进行节点轮换管理。"
+                    read -p "按任意键继续..."
+                    continue
+                fi
+                if ! check_pm2; then
+                    echo "PM2 (用于管理轮换进程) 检查失败或安装失败，节点轮换管理将无法进行。"
+                    echo "请确保您已成功安装 Node.js, npm, 并使用 npm 安装了 pm2。"
+                    read -p "按任意键继续..."
+                    continue
+                fi
                 batch_rotate_nodes
                 ;;
             6) # 删除所有节点
@@ -951,10 +968,75 @@ function main_menu() {
     done
 }
 
-# --- 批量卸载节点的函数定义 --- (之前已添加，确保此处有定义)
-# （在此处注释掉了，因为它已经在主函数main_menu之前被调用了。理论上应该放在main_menu之前或者放在main_menu内部调用）
-# 但考虑到此版本脚本是按照功能区域组织，在主菜单的 case 里调用它是没问题的。
-# function batch_uninstall_nodes() { ... } 
+# --- 批量卸载节点的函数定义 --- 
+function batch_uninstall_nodes() {
+    echo ""
+    echo "--- 批量停止并卸载节点 ---"
+    # 先检查 Docker 命令是否存在
+    if ! command -v docker &> /dev/null; then
+        echo "错误：Docker 命令不可用。无法卸载节点。"
+        read -p "按任意键返回主菜单..."
+        return 1
+    fi
+    
+    local all_nodes_ids=$(get_all_node_ids)
+    
+    if [ -z "$all_nodes_ids" ]; then
+        echo "系统中当前没有已部署的节点。"
+        read -p "按任意键返回..."
+        return
+    fi
+
+    echo "请选择要卸载的节点 (输入数字，用空格分隔，例如: 1 3 5):"
+    local node_list=($all_nodes_ids)
+    for i in "${!node_list[@]}"; do
+        local node_id=${node_list[$i]}
+        local container_name="${BASE_CONTAINER_NAME}-${node_id}"
+        # 获取容器状态
+        local status=$(docker ps -a --filter "name=$container_name" --format "{{.Status}}" | tr '[:lower:]' '[:upper:]')
+        local node_display_id="${node_id}"
+        if [[ "$status" == "UP"* ]]; then
+            node_display_id+=' [运行中]'
+        elif [[ "$status" == "EXITED"* || "$status" == "CREATED"* ]]; then
+            node_display_id+=' [已停止]'
+        else
+            node_display_id+=' [不存在]'
+        fi
+        printf "  %d. %s\n" $((i+1)) "$node_display_id"
+    done
+    echo "  0. 返回主菜单"
+    echo ""
+
+    read -rp "请输入您的选择: " choices
+    if [ "$choices" == "0" ]; then
+        echo "返回主菜单。"
+        return
+    fi
+    
+    # 解析选择的数字，进行卸载
+    # 使用 grep -o '[0-9]\+' 提取数字，tr '\n' ' ' 将它们放入一个空格分隔的字符串
+    local selected_indices=$(echo "$choices" | grep -o '[0-9]\+' | tr '\n' ' ')
+    local uninstalled_count=0
+    for index in $selected_indices; do
+        # 验证输入的索引是否在合法范围内
+        if [[ "$index" =~ ^[1-9][0-9]*$ ]] && [ "$index" -ge 1 ] && [ "$index" -le "${#node_list[@]}" ]; then
+            local node_to_uninstall=${node_list[$((index-1))]}
+            echo "正在卸载节点 '$node_to_uninstall'..."
+            uninstall_node "$node_to_uninstall"
+            uninstalled_count=$((uninstalled_count + 1))
+        else
+            echo "警告: 跳过无效的节点索引 '$index'。"
+        fi
+    done
+    
+    echo ""
+    if [ "$uninstalled_count" -gt 0 ]; then
+        echo "已完成对 ${uninstalled_count} 个节点的卸载。"
+    else
+        echo "未选择有效节点进行卸载。"
+    fi
+    read -p "按任意键返回主菜单..."
+}
 
 
 # --- 主脚本执行入口 ---
