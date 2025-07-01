@@ -62,6 +62,7 @@ function install_package() {
     case "$pm" in
         apt)
             echo "使用 '$SUDO apt update && $SUDO apt install -y $pkg_name' 进行安装..."
+            # 这里可以添加更多的 apt 相关的安装逻辑，但尽量保持简洁，错误会显示
             $SUDO apt update && $SUDO apt install -y "$pkg_name"
             ;;
         yum)
@@ -84,128 +85,48 @@ function install_package() {
     return $? # 返回 install_package 命令的退出状态
 }
 
-# 尝试安装 Docker 并启动服务
-function install_docker_and_start() {
-    local pm=$(get_package_manager)
-    local SUDO=""
-    if ! is_root_or_sudo; then
-        if command -v sudo &> /dev/null && sudo -v &> /dev/null; then
-            SUDO="sudo"
-        else
-            echo "错误: 安装 Docker 需要 root 权限或 sudo。您似乎既不是 root 用户，也不能使用 sudo。"
-            echo "请切换到 root 用户，或者确保 sudo 可用并已配置。"
-            return 1
-        fi
-    fi
-
-    case "$pm" in
-        apt)
-            echo "正在尝试为基于 Debian/Ubuntu 的系统安装 Docker..."
-            # 1. 更新包列表和安装必要依赖
-            echo "  1/4: Updating package list and installing dependencies..."
-            if ! $SUDO apt update || ! $SUDO apt install -y apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release; then
-                echo "错误: apt 安装依赖失败。请手动检查 apt 环境或修复权限。"
-                return 1
-            fi
-            # 2. 添加 Docker 的官方 GPG key
-            echo "  2/4: Adding Docker GPG key..."
-            if ! $SUDO mkdir -p /etc/apt/keyrings || ! curl -fsSL https://download.docker.com/linux/ubuntu/gpg | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg; then
-                echo "错误: 无法添加 Docker GPG key。请检查网络或权限。"
-                return 1
-            fi
-            # 3. 添加 Docker apt repository (假设使用 amd64 架构，并且 lsb_release 命令可用)
-            local system_arch=$(dpkg --print-architecture || echo "amd64") # 尝试获取架构，失败则默认为 amd64
-            local system_codename=$(lsb_release -cs || echo "jammy") # 尝试获取系统代号，失败则默认为 jammy
-            echo "  3/4: Adding Docker APT repository for Ubuntu ${system_codename} ($system_arch)..."
-            if ! echo "deb [arch=$system_arch signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $system_codename stable" | $SUDO tee /etc/apt/sources.list.d/docker.list > /dev/null; then
-                echo "错误: 无法添加 Docker apt repository。请检查命令输出。"
-                return 1
-            fi
-            # 4. 重新更新包列表并安装 Docker Engine
-            echo "  4/4: Updating package list again and installing Docker Engine..."
-            if ! $SUDO apt update || ! $SUDO apt install -y docker-ce docker-ce-cli containerd.io; then
-                echo "错误: 安装 Docker Engine 失败。请手动检查 apt 错误信息。"
-                return 1
-            fi
-            ;;
-        yum|dnf) # 合并 yum 和 dnf 的逻辑，尽管源文件略有不同
-            echo "正在尝试为基于 RHEL/CentOS/Fedora 的系统安装 Docker..."
-            if ! install_package "yum-utils" || ! install_package "dnf-plugins-core"; then
-                 echo "错误: 安装必要的辅助包失败。"
-                 return 1
-            fi
-            # 添加 Docker CE repository (通用做法)
-            echo "  Adding Docker CE repository..."
-            local docker_repo_url="https://download.docker.com/linux/centos/docker-ce.repo" # CentOS repo usually works for Fedora too
-            if ! curl -fsSL "$docker_repo_url" | $SUDO tee /etc/yum.repos.d/docker-ce.repo > /dev/null; then
-                echo "错误: 无法添加 Docker repository。请检查网络或 URL。"
-                return 1
-            fi
-            echo "  Repository added. Installing Docker Engine..."
-            if [[ "$pm" == "yum" ]]; then
-                if ! $SUDO yum install -y docker-ce docker-ce-cli containerd.io; then
-                    echo "错误: 使用 yum 安装 Docker Engine 失败。"
-                    return 1
-                fi
-            elif [[ "$pm" == "dnf" ]]; then
-                 if ! $SUDO dnf install -y docker-ce docker-ce-cli containerd.io; then
-                    echo "错误: 使用 dnf 安装 Docker Engine 失败。"
-                    return 1
-                fi
-            fi
-            ;;
-        apk)
-            echo "正在尝试为 Alpine Linux 安装 Docker..."
-            echo "  Installing Docker, docker-cli, and containerd.io..."
-            if ! install_package "docker docker-cli containerd.io"; then
-                echo "错误: 使用 apk 安装 Docker 失败。"
-                return 1
-            fi
-            ;;
-        *)
-            echo "错误: 未能识别您系统的包管理器。无法自动安装 Docker。"
-            echo "请访问 Docker 官方网站获取您系统对应的安装指南："
-            echo "  https://docs.docker.com/engine/install/"
-            echo "在手动安装 Docker 并启动服务后，请重新运行此脚本。"
-            return 1
-            ;;
-    esac
-
-    # 安装成功后，尝试启用并启动 Docker 服务
-    echo "Docker Engine 安装似乎已完成。现在尝试启用并启动 Docker 服务..."
-    if ! $SUDO systemctl enable docker || ! $SUDO systemctl start docker; then
-        echo "警告: 尝试启用或启动 Docker 服务失败。请手动检查 '$SUDO systemctl status docker'。"
-        # 这里不立即返回错误，因为安装可能部分成功
-    else
-        echo "Docker 服务已尝试启用并启动。"
-    fi
-
-    # 最后，检查服务是否确实在运行
-    sleep 3 # 等待片刻
-    if ! $SUDO systemctl is-active --quiet docker; then
-        echo "错误：Docker 服务未能成功运行。请手动检查 '$SUDO systemctl status docker'。"
-        return 1
-    else
-        echo "Docker 已成功安装并运行。"
-        return 0 # 表示成功
-    fi
-}
-
-# 检查 Docker 命令是否存在以及服务是否运行 (现在依赖于 install_docker_and_start 的成功)
+# 检查 Docker 命令是否存在以及服务是否运行
 function check_docker() {
     # 1. 检查 Docker 命令是否存在
     if ! command -v docker &> /dev/null; then
-        echo "错误：未检测到 Docker 命令。尝试为您自动安装 Docker..."
-        if ! install_docker_and_start; then
-            echo "Docker 安装尝试失败，或者 Docker 服务未正常启动。"
-            echo "请您手动完成 Docker 的安装和启动（参考上面给出的安装指引），然后重新运行此脚本。"
-            return 1 # 返回错误码，表示 Docker 未就绪
+        echo "错误：未检测到 Docker 命令。请先安装 Docker。"
+        
+        # 尝试检测包管理器并提供安装指示
+        local pm=$(get_package_manager)
+        if [[ "$pm" != "unknown" ]]; then
+            echo "您的系统似乎使用 '$pm' 作为包管理器。"
+            echo "但您的环境中可能缺少核心命令，如 'apt' 本身。"
+            echo "因此，我们无法自动为您安装 Docker。"
+            echo "请尝试手动执行以下命令安装 Docker（请根据您的发行版仔细选择并确认）："
+            
+            # 提供安装指令，但不直接执行
+            if [[ "$pm" == "apt" ]]; then
+                echo "  # 如果您的系统确实是 Debian/Ubuntu 系列并且支持 apt (尽管我们这里未找到):"
+                echo "  # sudo apt update && sudo apt install -y docker-ce docker-ce-cli containerd.io"
+            elif [[ "$pm" == "yum" ]]; then
+                echo "  # 如果您的系统支持 yum: sudo yum install -y docker-ce docker-ce-cli containerd.io"
+            elif [[ "$pm" == "dnf" ]]; then
+                echo "  # 如果您的系统支持 dnf: sudo dnf install -y docker-ce docker-ce-cli containerd.io"
+            elif [[ "$pm" == "apk" ]]; then
+                echo "  # 如果您的系统支持 apk: sudo apk add docker docker-cli containerd.io"
+            fi
+            echo "  # 请注意：以上命令仅为示例，具体请参考您发行版对应的 Docker 官方文档！"
+            echo "  # 并且请您手动确保 Docker 服务已启用并正在运行："
+            echo "  # sudo systemctl enable docker && sudo systemctl start docker"
+        else
+            echo "未能识别您系统的包管理器，也无法为您提供自动安装 Docker 的指引。"
+            echo "请访问 Docker 官方网站获取您系统对应的安装指南:"
+            echo "  https://docs.docker.com/engine/install/"
         fi
+        echo "请在 Docker 安装并成功运行后，重新执行此脚本。"
+        
+        return 1 # 返回错误码，表示 Docker 未就绪
     fi
     
-    # Docker 命令存在，现在检查服务是否运行 (即使自动安装了，也要检查服务状态)
+    # Docker 命令存在，现在检查服务是否运行
     local SUDO=""
     if ! is_root_or_sudo; then
+        # 如果不是 root, 并且需要管理服务, 需要尝试 sudo
         if command -v sudo &> /dev/null && sudo -v &> /dev/null; then
             SUDO="sudo"
         else
@@ -214,11 +135,13 @@ function check_docker() {
         fi
     fi
 
+    # 检查 Docker 服务是否在运行
     if ! $SUDO systemctl is-active --quiet docker; then
         echo "错误：Docker 服务未运行。正在尝试启动..."
         if $SUDO systemctl start docker; then
             echo "Docker 服务已尝试启动。"
-            sleep 3 # 等待片刻
+            # 等待片刻，让服务启动并使其状态能被 systemctl 准确读取
+            sleep 3 
             if ! $SUDO systemctl is-active --quiet docker; then
                 echo "错误：未能成功启动 Docker 服务。请手动检查 '$SUDO systemctl status docker'。"
                 return 1 # 失败
@@ -244,8 +167,11 @@ function check_pm2() {
         local pm=$(get_package_manager)
         if [[ "$pm" == "apt" ]]; then
             # 下载 NodeSource 的脚本来添加 Node.js 源
-            if ! curl -fsSL https://deb.nodesource.com/setup_18.x | bash -; then
-                 echo "错误: 尝试下载 Node.js 安装脚本失败。"
+            # curl -fsSL https://deb.nodesource.com/setup_18.x | bash - # 这句本身也依赖 curl 和 bash 的可用性，且会自动执行
+            # 这里只打印命令，让用户自己执行安装，减少不确定性
+            echo "您的系统使用 apt，尝试自动安装 Node.js 18..."
+            if ! curl -fsSL https://deb.nodesource.com/setup_18.x | bash - ; then
+                 echo "错误: 尝试下载并执行 NodeSource 设置脚本失败。"
                  return 1
             fi
             if ! install_package nodejs; then
@@ -307,7 +233,7 @@ LABEL description="Nexus Node Image"
 
 # 设置非交互模式，防止 apt 命令弹出确认对话框
 ENV DEBIAN_FRONTEND=noninteractive
-# !!! 修改这里：为 ENV 值加上双引号，避免 # 引发的 Syntax Error !!!
+# !!! 确保 ENV 值都加上双引号，以防 shell 解释或 # 注释的混淆 !!!
 ENV NODE_ID="" # 节点ID由 Docker 运行时注入
 ENV PROVER_ID_FILE="/root/.nexus/node-id"
 
@@ -754,7 +680,7 @@ function batch_rotate_nodes() {
     echo "--- Nexus 节点轮换启动管理 ---"
     # 首先确保 Docker 可用
     if ! check_docker; then
-        echo "Docker 服务检查失败，无法进行节点轮换管理。" # check_docker 函数已经提供了所有信息和指引
+        echo "Docker 服务检查失败，无法进行节点轮换管理。" # check_docker 会提供所有信息和指引
         read -p "按任意键继续..."
         return # 如果 Docker 不可用，直接返回，停止当前操作
     fi
@@ -848,7 +774,7 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] ===========================================
 
 # !!! 重要步骤：在启动新一批节点前，先停止并删除所有现有的 nexus-node 容器。
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] 正在停止并删除所有 Nexus Node 容器..."
-# 确保 docker 命令可用
+# 必须先确保 Docker 命令可用
 if command -v docker &> /dev/null; then
     docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}" | xargs -r docker rm -f > /dev/null 2>&1
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] 已清理完所有 Nexus Node 容器。"
@@ -1105,6 +1031,7 @@ function main_menu() {
 }
 
 # --- 批量卸载节点的函数定义 --- 
+# 在main_menu的case中被调用
 function batch_uninstall_nodes() {
     echo ""
     echo "--- 批量停止并卸载节点 ---"
