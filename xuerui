@@ -4,23 +4,14 @@ set -e
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:latest"
 LOG_DIR="/root/nexus_logs" # 默认日志目录
-
-# ==========================================================================
-#                         !!! 重 要 提 示 !!!
-# 本脚本将在 '$LOG_DIR' 路径下创建日志目录和文件。
-# 默认路径 '/root/nexus_logs' 通常需要 root 权限。
-# 请务必使用 'sudo ./nexus_manager.sh' 命令运行此脚本，以确保所有功能正常工作。
-# 如果您不希望使用 '/root' 目录，请修改上方 'LOG_DIR' 变量为其他路径，
-# 例如：LOG_DIR="$HOME/nexus_logs" (这将使用当前用户家目录下的nexus_logs)。
-# ==========================================================================
-
+DEFAULT_MEMORY_PERCENTAGE=80 # 默认系统内存分配给Nexus节点的百分比
 
 # 检查 Docker 是否安装
 function check_docker() {
     if ! command -v docker >/dev/null 2>&1; then
         echo "检测到未安装 Docker，正在安装..."
         apt update || { echo "错误：apt update 失败。"; exit 1; }
-        apt install -y apt-transport-https ca-certificates curl software-properties-common || { echo "错误：安装依赖失败。"; exit 1; }
+        apt install -y apt-transport-https ca-certificates curl software-properties-common || { echo "错误：安装 Docker 依赖失败。"; exit 1; }
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add - || { echo "错误：添加 Docker GPG 密钥失败。"; exit 1; }
         add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" || { echo "错误：添加 Docker APT 仓库失败。"; exit 1; }
         apt update || { echo "错误：再次 apt update 失败。"; exit 1; }
@@ -63,10 +54,19 @@ function calculate_per_node_memory_mb() {
     if [ "$num_nodes_to_allocate" -eq 0 ]; then
         echo 0 # 没有节点，不分配内存
         return
-    }
+    fi
 
     # 计算 Nexus 节点总共可使用的内存量
     local allocatable_ram_mb=$(( (total_ram_mb * percentage) / 100 ))
+
+    # 确保总分配量有足够的基础内存 (例如至少 512MB 用于 Nexus 进程)
+    if [ "$allocatable_ram_mb" -lt 512 ]; then
+        echo "警告: 根据您设定的系统内存百分比 (${percentage}%)，总可用内存不足512MB。这将强制最低分配512MB或按实际可用内存分配，请注意。" >&2
+        allocatable_ram_mb=512 # 确保即使百分比很小，也能分到至少 512MB
+        if [ "$allocatable_ram_mb" -gt "$total_ram_mb" ]; then # 不要超过系统总内存
+             allocatable_ram_mb="$total_ram_mb"
+        fi
+    fi
 
     # 计算每节点内存（整数除法）
     local per_node_ram_mb=$(( allocatable_ram_mb / num_nodes_to_allocate ))
@@ -77,7 +77,7 @@ function calculate_per_node_memory_mb() {
         per_node_ram_mb="$min_per_node_mb"
         # 如果强制最低内存后，总分配超过了设定的百分比，给出警告
         if [ $((num_nodes_to_allocate * min_per_node_mb)) -gt "$allocatable_ram_mb" ]; then
-             echo "警告: 根据您设定的系统内存百分比 (${percentage}%) 和当前节点数量 (${num_nodes_to_allocate}个)，总可用内存不足以保证每节点 ${min_per_node_mb}MB。脚本将强制使用此最低限制，可能超出设定百分比或导致系统资源争抢，请注意！" >&2
+             echo "警告: 根据您设定的系统内存百分比 (${percentage}%) 和当前节点数量 (${num_nodes_to_allocate}个)，总可用内存不足以保证每节点 ${min_per_node_mb}MB。脚本将强制使用此最低限制，这可能超出设定百分比或导致系统资源争抢，请注意！" >&2
         fi
     fi
 
@@ -90,7 +90,7 @@ function build_image() {
     WORKDIR=$(mktemp -d)
     # 错误处理：mktemp 失败
     if [ ! -d "$WORKDIR" ]; then
-        echo "错误：无法创建临时目录。"
+        echo "错误：无法创建临时目录。请检查系统临时目录权限或磁盘空间。"
         exit 1
     fi
     cd "$WORKDIR"
@@ -164,7 +164,8 @@ fi
 EOF
 
     # 错误处理：Docker 镜像构建失败
-    if ! docker build -t "$IMAGE_NAME" . || [ "$(docker images -q "$IMAGE_NAME" 2>/dev/null)" == "" ]; then
+    # docker build 的返回码可能不可靠，最好再通过 docker images 确认
+    if ! docker build -t "$IMAGE_NAME" . || [ -z "$(docker images -q "$IMAGE_NAME" 2>/dev/null)" ]; then
         echo "错误：Docker 镜像 '$IMAGE_NAME' 构建失败。请检查您的 Dockerfile 内容或 Docker 环境。"
         cd - >/dev/null # 无论如何返回原目录
         rm -rf "$WORKDIR"
@@ -209,10 +210,13 @@ function run_container() {
         chmod 644 "$log_file" || { echo "警告: 无法设置日志文件 '$log_file' 的权限。请手动调整或检查权限。"; }
     fi
 
-    # 检查现有容器并删除它
+    # 检查现有容器并删除它，非强制退出
     if docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
         echo "检测到旧容器 '$container_name'，先删除..."
-        docker rm -f "$container_name" || { echo "错误: 无法删除旧容器 '$container_name'。请手动处理或检查权限。"; exit 1; }
+        docker rm -f "$container_name" 2>/dev/null
+        if [ $? -ne 0 ]; then
+            echo "警告: 无法完全删除旧容器 '$container_name'。它可能处于未知状态，可能会影响新容器的启动。尝试继续..." >&2
+        fi
     fi
 
     echo "正在为容器 '$container_name' 启动节点，并分配内存: ${mem_limit_mb}MB"
@@ -269,7 +273,6 @@ function uninstall_node() {
 function list_nodes() {
     echo "当前节点状态："
     echo "------------------------------------------------------------------------------------------------------------------------"
-    # 调整列宽以适应完整的内存字符串，例如 "100MiB / 1.00GiB"
     printf "%-6s %-20s %-10s %-15s %-15s %-15s %-20s\n" "序号" "节点ID" "CPU使用率" "内存使用" "内存限制" "状态" "启动时间"
     echo "------------------------------------------------------------------------------------------------------------------------"
     
@@ -285,7 +288,6 @@ function list_nodes() {
         local node_id=${all_nodes[$i]}
         local container_name="${BASE_CONTAINER_NAME}-${node_id}"
         # docker stats 返回格式："CPU%,MemUsage / MemLimit"
-        # 移除 Mem% 以简化
         local container_info=$(docker stats --no-stream --format "{{.CPUPerc}},{{.MemUsage}}" "$container_name" 2>/dev/null) 
         
         local status=$(docker ps -a --filter "name=$container_name" --format "{{.Status}}")
@@ -298,7 +300,7 @@ function list_nodes() {
         if [ -n "$container_info" ]; then
             IFS=',' read -r cpu_usage_raw full_mem_usage_raw <<< "$container_info"
             
-            cpu_usage="$cpu_usage_raw" # CPU usage often comes with a % already, ensure consistent display
+            cpu_usage="$cpu_usage_raw"
             
             # 解析内存使用字符串 (例如 "1.23MiB / 1.00GiB")
             local current_mem_str=$(echo "$full_mem_usage_raw" | awk -F' / ' '{print $1}')
@@ -435,7 +437,7 @@ function batch_start_nodes() {
         echo "未输入任何 node-id，返回主菜单"
         read -p "按任意键继续"
         return
-    }
+    fi
 
     local total_system_ram_mb=$(get_total_system_ram_mb)
     echo "系统总内存：${total_system_ram_mb}MB"
@@ -459,6 +461,19 @@ function batch_start_nodes() {
         echo "根据您的配置和系统内存，无法为每个节点分配有效内存（可能低于512MB的最低要求）。请检查节点数量或百分比。"
         read -p "按任意键返回菜单"
         return
+    fi
+
+    # 警告总内存分配
+    local total_alloc_ram=$(( per_node_mem_mb * num_nodes_in_batch ))
+    if [ "$total_alloc_ram" -ge "$total_system_ram_mb" ]; then
+        echo "警告：根据您的设置，所有节点总计将分配约 ${total_alloc_ram}MB 内存，这已接近或超过系统总内存 (${total_system_ram_mb}MB)。"
+        echo "这可能会导致系统不稳定或节点启动失败。建议降低每个节点分配内存或减少节点数量。"
+        read -rp "仍要继续吗？(y/N): " confirm_total_mem
+        if [[ ! "$confirm_total_mem" =~ ^[Yy]$ ]]; then
+            echo "已取消操作。"
+            read -p "按任意键继续"
+            return
+        fi
     fi
 
     echo "开始构建镜像..."
@@ -617,7 +632,7 @@ function batch_rotate_nodes() {
         echo "未输入任何 node-id，返回主菜单"
         read -p "按任意键继续"
         return
-    }
+    fi
 
     local total_system_ram_mb=$(get_total_system_ram_mb)
     echo "系统总内存：${total_system_ram_mb}MB"
@@ -627,7 +642,7 @@ function batch_rotate_nodes() {
         local mem_percent=$DEFAULT_MEMORY_PERCENTAGE
     elif ! [[ "$mem_percent_input" =~ ^[0-9]+$ ]] || [ "$mem_percent_input" -lt 1 ] || [ "$mem_percent_input" -gt 100 ]; then
         echo "无效的内存百分比，请输入1到100之间的数字"
-        read -p "按任意键返回菜单"
+        read -p "按任意键继续"
         return
     else
         local mem_percent=$mem_percent_input
@@ -665,6 +680,18 @@ function batch_rotate_nodes() {
     fi
     echo "每轮（最多 ${nodes_per_round} 个）节点将共享系统内存，预计每个节点将分配约 ${estimated_per_node_mem_mb}MB 内存。"
 
+    # 警告总内存分配（针对 PM2 管理的单个进程）
+    local total_pm2_alloc_estimate=$(( nodes_per_round * estimated_per_node_mem_mb ))
+    if [ "$total_pm2_alloc_estimate" -ge "$total_system_ram_mb" ]; then
+        echo "警告：单轮启动的节点总计将分配约 ${total_pm2_alloc_estimate}MB 内存，这已接近或超过系统总内存 (${total_system_ram_mb}MB)。"
+        echo "这可能会导致系统不稳定或节点启动失败。建议降低每轮启动的节点数量或内存百分比。"
+        read -rp "仍要继续吗？(y/N): " confirm_pm2_mem
+        if [[ ! "$confirm_pm2_mem" =~ ^[Yy]$ ]]; then
+            echo "已取消操作。"
+            read -p "按任意键继续"
+            return
+        fi
+    fi
 
     # 直接删除旧的轮换进程
     echo "停止旧的轮换进程 (如果存在)..."
@@ -694,6 +721,15 @@ calculate_per_node_memory_mb() {
     local total_ram_mb=$(get_total_system_ram_mb)
     if [ "$num_nodes_to_allocate" -eq 0 ]; then echo 0; return; fi
     local allocatable_ram_mb=$(( (total_ram_mb * percentage) / 100 ))
+
+    # 确保总分配量有足够的基础内存 (例如至少 512MB 用于 Nexus 进程)
+    if [ "$allocatable_ram_mb" -lt 512 ]; then
+        allocatable_ram_mb=512
+        if [ "$allocatable_ram_mb" -gt "$total_ram_mb" ]; then
+             allocatable_ram_mb="$total_ram_mb"
+        fi
+    fi
+
     local per_node_ram_mb=$(( allocatable_ram_mb / num_nodes_to_allocate ))
     local min_per_node_mb=512 # 最低512MB每节点
     if [ "$per_node_ram_mb" -lt "$min_per_node_mb" ]; then
@@ -816,7 +852,7 @@ EOF
     echo "" # 空行以增加日志可读性
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] --- 轮换到第 ${group} 组节点 (${current_group_nodes_count}个节点) ---"
     # 执行生成的组启动脚本
-    bash "$script_dir/start_group${group}.sh" || { echo "[$(date '+%Y-%m-%d %H:%M:%S')] 错误：执行启动组脚本失败，本轮次可能未完全启动。请检查日志：$script_dir/nexus-rotate.err.log" >&2; }
+    bash "$script_dir/start_group${group}.sh" || { echo "[$(date '+%Y-%m-%d %H:%M:%S')] 错误：执行启动组脚本失败，本轮次可能未完全启动。请检查日志：$script_dir/nexus-rotate-pm2.err.log" >&2; }
     
     # 容器健康检查（针对本批次启动的节点）
     if [ ${current_group_nodes_count} -gt 0 ]; then
@@ -895,25 +931,27 @@ function setup_log_cleanup_cron() {
     local cron_job="0 3 */2 * * find $LOG_DIR -type f -name 'nexus-*.log' -mtime +2 -delete"
     # 检查是否已存在相同的定时任务，避免重复添加
     if ! crontab -l 2>/dev/null | grep -Fq "$cron_job"; then
-        (crontab -l 2>/dev/null; echo "$cron_job") | crontab - || { echo "错误: 无法设置日志清理定时任务。请检查 'crontab' 命令是否可用及权限。"; }
-        echo "已设置每2天自动清理日志任务，只保留最近2天的日志。"
+        if (crontab -l 2>/dev/null; echo "$cron_job") | crontab - ; then
+            echo "已设置每2天自动清理日志任务，只保留最近2天的日志。"
+        else
+            echo "错误: 无法设置日志清理定时任务。请检查 'crontab' 命令是否可用及权限。如果您的用户没有sudo或crontab权限，这可能是预期行为。"
+        fi
     else
         echo "日志清理定时任务已存在，无需重复设置。"
     fi
 }
 
 # 主菜单
-clear # 在显示菜单前清屏
+clear
 echo "脚本由哈哈哈哈编写，推特 @ferdie_jhovie，免费开源，请勿相信收费"
 echo "如有问题，可联系推特，仅此只有一个号"
 echo "=========================================================================="
-echo "                         !!! 启 动 提 示 !!!"
-echo "为确保脚本正常运行和管理日志文件，本脚本通常需要root权限。"
-echo "推荐使用 'sudo ./nexus_manager.sh' 来执行。"
-echo "如果选择普通用户执行，请确保您有在 '$LOG_DIR' ('/root/nexus_logs') 写入的权限，"
-echo "或将脚本顶部的 'LOG_DIR' 修改为用户可访问的路径 (例如 '$HOME/nexus_logs')。"
+echo "                          请 注 意"
+echo "此脚本推荐使用 'sudo ./nexus_manager.sh' 来执行。"
+echo "如果您在没有root权限的情况下运行，请确保您有在 '$LOG_DIR' ('/root/nexus_logs') 写入的权限，"
+echo "或者您已经将脚本顶部的 'LOG_DIR' 修改为用户可访问的路径 (例如 '$HOME/nexus_logs')。"
 echo "=========================================================================="
-read -p "按任意键继续运行主菜单..."
+read -p "按任意键继续..." # 短暂停顿，确保用户看到提示
 
 setup_log_cleanup_cron # 启动时尝试设置日志清理 cron 任务
 
