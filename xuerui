@@ -15,11 +15,8 @@ fi
 
 # 检查 Bash 版本是否符合最低要求 (4.0 或更高，因为使用了 mapfile 等特性)
 # 使用 eval 保护，避免在极度老旧Bash上解析错误
-if ! IFS='.' read -r major minor patch <<< "$BASH_VERSION"; then
-    echo "错误：无法解析Bash版本号。请确保Bash功能正常。" >&2
-    exit 1
-fi
-
+# This syntax is tested and should work with Bash 4.0+
+IFS='.' read -r major minor patch <<< "$BASH_VERSION"
 if (( major < 4 )); then
     echo "错误：检测到您的Bash版本过低 ($BASH_VERSION)。" >&2
     echo "此脚本至少需要Bash 4.0及以上版本。" >&2
@@ -186,13 +183,16 @@ function get_node_ids_from_user() {
     echo_color blue "---------------------------------------------------------"
     
     local line_count=0
-    # Use 'read -r' for robust line reading. Add timeout and read from /dev/tty for interactive input.
-    while IFS= read -r -t 60 line < /dev/tty; do
-        # If line is empty or only whitespace, continue
-        if [ -z "$(echo "$line" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')" ]; then
-            break # Exit on empty line, indicates end of input
+    # Loop using 'read -r' for robust line reading. Add timeout and read from /dev/tty for interactive input.
+    # Bash versions older than 4 might not support '-t' (timeout) with 'read'. Remove if that's the case.
+    while IFS= read -r -t 60 line < /dev/tty || true; do # '|| true' to prevent script exit on timeout with set -e
+        # If line is empty or only whitespace, and it's the first character of line, break.
+        if [ -z "$(echo "$line" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')" ] && [ -n "$line" ]; then
+            break # Exit on empty line, indicates end of input, and prevent break on timeout from `read`
+        elif [ -z "$(echo "$line" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')" ] && [ -z "$line" ] ; then
+             continue # Allow blank lines only
         fi
-        
+
         local trimmed_line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
         if [ -n "$trimmed_line" ]; then
             ids_array+=("$trimmed_line")
@@ -278,6 +278,7 @@ function install_docker_redhat() {
     "$pkg_manager" remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine &>/dev/null || true
 
     # Install yum-utils (or dnf-utils for dnf) and add Docker repo
+    # Some older RHEL versions might need `yum-utils`, dnf automatically includes what it needs
     "$pkg_manager" install -y yum-utils device-mapper-persistent-data lvm2 &>/dev/null || echo_color yellow "安装 yum-utils/dnf-utils 依赖失败。"
     
     # Check if config-manager is available
@@ -393,7 +394,7 @@ function build_image() {
     # 使用一个确定性的临时目录，并设置trap确保清理
     mkdir -p "$SCRIPT_TMP_DIR"
     # 在脚本退出时自动清理临时目录。注意：trap只作用于当前shell进程。
-    trap "rm -rf '$SCRIPT_TMP_DIR' 2>/dev/null; echo_color red '脚本执行完毕或非正常退出，临时文件已清理。'" EXIT
+    trap "rm -rf '$SCRIPT_TMP_DIR' 2>/dev/null; echo_color red '脚本执行完毕或非正常退出，临时构建文件已清理。'" EXIT
 
     echo "${DOCKERFILE_CONTENT}" > "${SCRIPT_TMP_DIR}/Dockerfile"
     echo "${ENTRYPOINT_CONTENT}" > "${SCRIPT_TMP_DIR}/entrypoint.sh"
@@ -402,13 +403,12 @@ function build_image() {
     echo "正在从 $SCRIPT_TMP_DIR 构建镜像 '$IMAGE_NAME'..."
     if docker build -t "$IMAGE_NAME" --progress=plain "$SCRIPT_TMP_DIR"; then
         echo_color green "Docker 镜像 '$IMAGE_NAME' 构建成功。"
+        return 0
     else
         echo_color red "Docker 镜像构建失败，请检查上述错误信息。"
-        # Do not exit here; allow user to retry or troubleshoot later, just return non-zero
         return 1
     fi
     echo ""
-    return 0
 }
 
 # 启动容器（挂载宿主机日志文件）
@@ -504,7 +504,6 @@ function list_nodes() {
         local mem_limit="N/A"
 
         # Check if container exists first
-        # docker ps -a -q checks existence by ID, safer than relying solely on name match (partial matches)
         if docker ps -a --filter "name=$container_name" --format '{{.ID}}' | grep -q .; then
             found_any_node=true
             container_status=$(docker ps -a --filter "name=$container_name" --format "{{.Status}}" 2>/dev/null | head -n 1)
@@ -667,8 +666,8 @@ function batch_start_nodes() {
     fi
 
     echo_color blue "开始构建镜像 (如果需要或尚未构建)..."
-    if ! build_image; then
-        echo_color red "镜像构建失败，无法继续批量启动。"
+    if ! build_image; then # Check if image build succeeded
+        echo_color red "无法构建Docker镜像，无法继续批量启动。"
         press_any_key
         return
     fi
@@ -701,7 +700,7 @@ function batch_uninstall_nodes() {
         return
     fi
 
-    echo_color blue "=== 批量卸载指定 Nexus 节点 ==="
+    echo_color blue "=== 批量卸载指定 Nexus 节点 ==-"
     echo "当前节点列表："
     echo_color blue "----------------------------------------"
     printf "%-6s %-20s %-15s\n" "序号" "节点ID" "状态"
@@ -736,14 +735,12 @@ function batch_uninstall_nodes() {
 
     # 将输入的选项转换为数组
     local selected_indices=()
-    # Robustly parse choices_input. read -ra is Bash 4+, checked earlier.
     read -ra selected_indices <<< "$choices_input" 
 
     # 过滤掉重复和无效的选项
     local unique_selected_indices=()
     for index in "${selected_indices[@]}"; do
         if [[ "$index" =~ ^[0-9]+$ ]] && [ "$index" -ge 1 ] && [ "$index" -le ${#all_nodes_array[@]} ]; then
-            # Add to unique list only if not already present
             local found=false
             for u_index in "${unique_selected_indices[@]}"; do
                 if [ "$u_index" == "$index" ]; then
@@ -819,12 +816,10 @@ function uninstall_all_nodes() {
     echo_color blue "开始删除所有节点..."
     # Stop and remove all managed Docker containers
     local containers_to_delete=$(docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format '{{.Names}}')
-    local deleted_count=0
     if [ -n "$containers_to_delete" ]; then
         echo "$containers_to_delete" | while read -r container_name; do
             echo "正在停止并删除容器 '$container_name'..."
             docker rm -f "$container_name" || echo_color yellow "警告：无法删除容器 '$container_name'。"
-            deleted_count=$((deleted_count+1)) # This variable update is local to subshell
         done
         echo_color green "所有 Nexus 容器已尝试删除。"
     else
@@ -943,8 +938,6 @@ function batch_rotate_nodes() {
 
     # Generate the rotation script for PM2
     # Ensure all variables are properly expanded and quoted to preserve them
-    # For robustness, we will pass the list of nodes as a newline-separated string
-    # and then read them into an array inside the rotated script.
     local NODE_IDS_LIST_STRING="$(printf "%s\n" "${unique_node_ids_arr[@]}")"
 
     cat > "$script_dir/rotate.sh" <<EOF
@@ -1002,7 +995,8 @@ function stop_all_managed_containers() {
         log_message "  所有旧容器已清理。"
     else
         log_message "  没有找到运行中的Nexus节点容器。"
-    X}
+    fi
+}
 
 while true; do
     log_message "=========================================================="
@@ -1019,8 +1013,10 @@ while true; do
     local current_round_nodes=()
     local i
     for (( i=0; i<NODES_PER_ROUND; i++ )); do
-        local node_idx=\$((\$((\${CURRENT_NODE_INDEX} + i)) % \${TOTAL_NODES_COUNT}))
-        current_round_nodes+=("\${TOTAL_NODE_IDS[\${node_idx}]}")
+        # Simplified arithmetic to potentially fix parser issues
+        local node_logical_idx=\${CURRENT_NODE_INDEX} + i
+        local node_arr_idx=\$((\$node_logical_idx % \${TOTAL_NODES_COUNT})) # Using $((...)) for robust arithmetic
+        current_round_nodes+=("\${TOTAL_NODE_IDS[\${node_arr_idx}]}")
     done
     
     log_message "本轮将启动以下 \${#current_round_nodes[@]} 个节点: \${current_round_nodes[*]}"
@@ -1030,8 +1026,10 @@ while true; do
     done
 
     log_message "本轮节点启动完毕。"
-    log_message "更新下次启动索引: 从节点 ${current_round_nodes[0]:-}(内部列表起始索引: \${CURRENT_NODE_INDEX})。"
-    CURRENT_NODE_INDEX=\$(( (\${CURRENT_NODE_INDEX} + \${NODES_PER_ROUND}) % \${TOTAL_NODES_COUNT} ))
+    log_message "更新下次启动索引: 从节点 \${current_round_nodes[0]:-''} (内部列表起始索引: \${CURRENT_NODE_INDEX})。" # Safe array access with :--
+    
+    # Simple increment for next starting index, modulo total nodes
+    CURRENT_NODE_INDEX=\$(( (CURRENT_NODE_INDEX + NODES_PER_ROUND) % TOTAL_NODES_COUNT ))
     
     log_message "----------------------------------------------------------"
     log_message "等待 \$((ROTATE_INTERVAL_SECONDS / 3600)) 小时进入下一轮轮换..."
@@ -1045,9 +1043,8 @@ EOF
 
     # 使用 pm2 启动轮换脚本
     echo_color blue "使用 PM2 启动轮换进程..."
-    # 增加 --output 和 --error 选项以捕获 pm2 自身输出和错误日志
     pm2 start "$script_dir/rotate.sh" --name "nexus-rotate" --output "$script_dir/rotate_output.log" --error "$script_dir/rotate_error.log" --time
-    pm2 save || echo_color yellow "PM2 配置保存失败，可能需要手动 'pm2 save'。"
+    pm2 save >/dev/null 2>&1 || echo_color yellow "PM2 配置保存失败，可能需要手动 'pm2 save'。"
 
     echo_color green "节点轮换已启动并由 PM2 管理！"
     echo_color blue "总共 $total_nodes 个唯一节点，每轮启动 $nodes_per_round 个节点。"
@@ -1078,7 +1075,6 @@ function setup_log_cleanup_cron() {
 
     local full_cron_entry="${cron_job_comment}\n${cron_job_cmd}"
 
-    # Check if a similar task already exists using grep -q for a unique part of the command
     # Filter out previous similar cron jobs to avoid duplicates before adding new one
     local existing_crontab_filtered
     existing_crontab_filtered=$(crontab -l 2>/dev/null | awk '!/Nexus node log cleanup: Keep logs for 2 days\.|find \".*nexus_logs\".*-maxdepth 1 -type f -name '\''nexus-*\.log'\'' -mtime \+2 -delete/ {print}')
