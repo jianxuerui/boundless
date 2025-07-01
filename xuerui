@@ -45,98 +45,87 @@ function get_package_manager() {
     fi
 }
 
-# 尝试安装包的通用函数
-function install_package() {
-    local pkg_name="$1"
-    local pm=$(get_package_manager)
-    local SUDO=""
-    if ! is_root_or_sudo; then
-        echo "错误: 安装 '$pkg_name' 需要 root 权限或 sudo。请以 root 用户或使用 sudo 执行此命令。"
-        return 1
-    fi
-    if [[ "$EUID" -ne 0 ]]; then SUDO="sudo"; fi
-
-    case "$pm" in
-        apt)
-            echo "使用 apt 安装 '$pkg_name'..."
-            $SUDO apt update && $SUDO apt install -y "$pkg_name"
-            ;;
-        yum)
-            echo "使用 yum 安装 '$pkg_name'..."
-            $SUDO yum install -y "$pkg_name"
-            ;;
-        dnf)
-            echo "使用 dnf 安装 '$pkg_name'..."
-            $SUDO dnf install -y "$pkg_name"
-            ;;
-        apk)
-            echo "使用 apk 安装 '$pkg_name'..."
-            $SUDO apk add "$pkg_name"
-            ;;
-        *)
-            echo "错误: 未知或不支持的包管理器。请手动安装 '$pkg_name'。"
-            return 1
-            ;;
-    esac
-    return $?
-}
-
-# 检查 Docker 是否安装并运行
+# 检查 Docker 命令是否存在以及服务是否运行
 function check_docker() {
+    # 1. 检查 Docker 命令是否存在
     if ! command -v docker &> /dev/null; then
         echo "错误：未检测到 Docker 命令。请先安装 Docker。"
         
         # 尝试检测包管理器并提供安装指示
         local pm=$(get_package_manager)
+        local common_arch="amd64" # 默认为 amd64，如果需要 arm 等可以考虑更通用的检测方式
+        # 尝试更通用的架构检测
+        case "$(uname -m)" in
+            x86_64) common_arch="amd64" ;;
+            aarch64) common_arch="arm64" ;;
+            armv7l) common_arch="armhf" ;;
+            *) echo "警告: 未知系统架构 '$(uname -m)'，将尝试使用 amd64 进行 Docker 安装指引。" ;;
+        esac
+        
         if [[ "$pm" != "unknown" ]]; then
             echo "您的系统似乎使用 '$pm' 作为包管理器。"
-            echo "请尝试手动执行以下命令安装 Docker："
+            # 根据 PM 打印安装说明
             if [[ "$pm" == "apt" ]]; then
+                echo "请尝试手动执行以下命令安装 Docker (基于 Ubuntu/Debian 的系统):"
+                echo "  # 1. 更新包列表和安装必要依赖"
                 echo "  sudo apt update"
                 echo "  sudo apt install -y apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release"
+                echo "  # 2. 添加 Docker 的官方 GPG key"
                 echo "  sudo mkdir -p /etc/apt/keyrings"
                 echo "  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg"
+                echo "  # 3. 添加 Docker apt repository"
                 echo "  echo \"deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable\" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null"
+                echo "  # 4. 重新更新包列表并安装 Docker Engine"
                 echo "  sudo apt update"
                 echo "  sudo apt install -y docker-ce docker-ce-cli containerd.io"
             elif [[ "$pm" == "yum" ]]; then
+                echo "请尝试手动执行以下命令安装 Docker (基于 RHEL/CentOS/Fedora 系统):"
                 echo "  sudo yum install -y yum-utils"
-                echo "  sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo"
+                echo "  sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo" # CentOS repo for Docker
                 echo "  sudo yum install -y docker-ce docker-ce-cli containerd.io"
             elif [[ "$pm" == "dnf" ]]; then
+                echo "请尝试手动执行以下命令安装 Docker (基于 Fedora 或较新 CentOS/RHEL):"
                 echo "  sudo dnf install -y dnf-plugins-core"
-                echo "  sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo" # centos repo often works for Fedora too
+                echo "  sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo"
                 echo "  sudo dnf install -y docker-ce docker-ce-cli containerd.io"
             elif [[ "$pm" == "apk" ]]; then
+                echo "请尝试手动执行以下命令安装 Docker (基于 Alpine Linux):"
                 echo "  sudo apk add docker docker-cli containerd.io"
             fi
-            echo "安装完成后，您可能需要启用并启动 Docker 服务："
+            echo "---------------------------------------------------------------------------"
+            echo "Docker 安装完成后，请您需要确保 Docker 服务正在运行："
+            echo "  # 尝试启用并启动 Docker 服务 (可能需要 root 权限)"
             echo "  sudo systemctl enable docker"
             echo "  sudo systemctl start docker"
+            echo "Docker 安装和启动成功后，请重新运行本脚本。"
         else
-            echo "未能识别您系统的包管理器，请访问 Docker 官方网站获取安装说明："
+            echo "未能识别您系统的包管理器。请访问 Docker 官方网站获取您的操作系统对应的安装指南:"
             echo "  https://docs.docker.com/engine/install/"
+            echo "请在安装完成后，手动确保 Docker 服务正在运行 (例如: sudo systemctl start docker)。"
+            echo "然后请重新运行本脚本。"
         fi
-        echo "Docker 安装完成后，请重新运行本脚本。"
-        return 1 # 指示未成功执行
+        return 1 # 指示未成功执行 (Docker 命令不存在)
     fi
     
-    # Docker 命令存在，但需要检查服务是否运行
+    # Docker 命令存在，现在检查服务是否运行
     local SUDO=""
     if ! is_root_or_sudo; then
-        echo "警告: Docker 服务操作可能需要 root 权限，正在尝试使用 sudo。"
-        if ! SUDO=$(command -v sudo); then
-            echo "错误: 未找到 sudo 命令。请切换到 root 用户以管理 Docker 服务。"
-            return 1
+        # 如果不是 root, 并且需要管理服务, 需要尝试 sudo
+        if command -v sudo &> /dev/null && sudo -v &> /dev/null; then
+            SUDO="sudo"
+        else
+            echo "错误: Docker 服务未运行，但无法使用 sudo 命令管理服务。请切换到 root 用户或确保 sudo 可用并配置正确。"
+            return 1 # 无法管理服务
         fi
     fi
 
+    # 检查 Docker 服务是否在运行
     if ! $SUDO systemctl is-active --quiet docker; then
         echo "错误：Docker 服务未运行。正在尝试启动..."
         if $SUDO systemctl start docker; then
             echo "Docker 服务已尝试启动。"
-            # 等待片刻，让服务启动
-            sleep 3
+            # 等待片刻，让服务启动并使其状态能被 systemctl 准确读取
+            sleep 3 
             if ! $SUDO systemctl is-active --quiet docker; then
                 echo "错误：未能成功启动 Docker 服务。请手动检查 '$SUDO systemctl status docker'。"
                 return 1 # 失败
@@ -159,21 +148,23 @@ function check_pm2() {
     # 检查 Node.js 和 npm
     if ! command -v node &> /dev/null || ! command -v npm &> /dev/null; then
         echo "错误：未检测到 Node.js/npm。正在安装..."
-        # 检测包管理器并尝试安装 nodejs
         local pm=$(get_package_manager)
         if [[ "$pm" == "apt" ]]; then
             # 下载 NodeSource 的脚本来添加 Node.js 源
             curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
-            install_package nodejs
+            if ! install_package nodejs; then
+                echo "错误：使用 '$pm' 安装 Node.js 失败。请手动安装 Node.js。"
+                return 1
+            fi
         else
             echo "警告：Node.js/npm 未找到。由于您的系统未使用 apt 包管理器，无法自动安装 Node.js。"
             echo "请手动安装 Node.js (例如使用 nvm 或下载二进制包)。"
-            # 这里可以选择让脚本退出，或者继续并发出警告
-            # 为了脚本继续运行，我们这里只是警告
-            echo "将继续执行，但 pm2 功能可能受限。"
+            echo "如果手动安装后仍无法找到命令，pm2 功能将不可用。"
+            # 仅作警告，不返回错误，除非后面 PM2 也失败了
         fi
+        # 再次检查，确保 Node.js 和 npm 确实被安装了
         if ! command -v node &> /dev/null || ! command -v npm &> /dev/null; then
-             echo "警告：Node.js/npm 仍未安装，pm2 功能将不可用。"
+             echo "错误：Node.js/npm 安装或配置失败，pm2 功能将不可用。"
              return 1 # 表示安装失败或跳过
         fi
         echo "Node.js 和 npm 安装完成。"
@@ -198,6 +189,12 @@ function build_image() {
     echo " 开始构建 Docker 镜像 '$IMAGE_NAME'..."
     echo "======================================"
     
+    # 必须先确认 Docker 可用，否则构建镜像会失败
+    if ! command -v docker &> /dev/null; then
+        echo "错误：在尝试构建镜像前，Docker 命令不可用。请先正确安装 Docker。"
+        return 1
+    fi
+
     # 创建一个临时目录用于构建
     WORKDIR=$(mktemp -d)
     if [ ! -d "$WORKDIR" ]; then
@@ -372,7 +369,10 @@ function run_container() {
         echo "请检查以下信息:"
         echo "  - Docker 日志: 'docker logs $container_name'"
         echo "  - Nexus 节点日志: '$log_file'"
-        echo "  - 服务器系统日志: 请检查 '$SUDO systemctl status docker' (或 root 用户 'systemctl status docker')"
+        # 检查 docker 服务状态作为额外排错提示
+        local SUDO_FOR_DOCKER_STATUS=""
+        if ! is_root_or_sudo; then SUDO_FOR_DOCKER_STATUS="sudo"; fi
+        echo "  - Docker 服务状态: '$SUDO_FOR_DOCKER_STATUS systemctl status docker'"
         return 1
     fi
     
@@ -628,7 +628,12 @@ function batch_start_nodes() {
 function batch_rotate_nodes() {
     echo ""
     echo "--- Nexus 节点轮换启动管理 ---"
-    check_docker # 确保 Docker 已准备好
+    # 首先确保 Docker 可用
+    if ! check_docker; then
+        echo "Docker 服务检查失败，无法进行节点轮换管理。"
+        read -p "按任意键继续..."
+        return
+    fi
     check_pm2    # 确保 PM2 已安装
 
     echo "请输入您希望参与轮换的节点 IDs，每行一个，输入空行并按回车键结束输入："
@@ -837,8 +842,7 @@ function setup_log_cleanup_cron() {
 
 # --- 主菜单与逻辑 ---
 function main_menu() {
-    # 在脚本开始运行时，先确保日志清理任务已设置
-    setup_log_cleanup_cron 
+    setup_log_cleanup_cron # 在脚本开始运行时，先确保日志清理任务已设置
 
     while true; do
         clear
@@ -862,7 +866,7 @@ function main_menu() {
         case "$choice" in
             1) # 部署新节点
                 if ! check_docker; then # 确保 Docker 可用
-                    echo "Docker 检查失败，无法进行节点部署。"
+                    # check_docker 函数已在无法安装时给出提示
                     read -p "按任意键继续..."
                     continue
                 fi
@@ -947,67 +951,10 @@ function main_menu() {
     done
 }
 
-# --- 批量卸载节点的函数定义 --- (之前未找到这个函数，在此补充)
-function batch_uninstall_nodes() {
-    echo ""
-    echo "--- 批量停止并卸载节点 ---"
-    local all_nodes_ids=$(get_all_node_ids)
-    
-    if [ -z "$all_nodes_ids" ]; then
-        echo "系统中当前没有已部署的节点。"
-        read -p "按任意键返回..."
-        return
-    fi
-
-    echo "请选择要卸载的节点 (输入数字，用空格分隔，例如: 1 3 5):"
-    local node_list=($all_nodes_ids)
-    for i in "${!node_list[@]}"; do
-        local node_id=${node_list[$i]}
-        local container_name="${BASE_CONTAINER_NAME}-${node_id}"
-        local status=$(docker ps -a --filter "name=$container_name" --format "{{.Status}}" | tr '[:lower:]' '[:upper:]')
-        local node_display_id="${node_id}"
-        if [[ "$status" == "UP"* ]]; then
-            node_display_id+=' [运行中]'
-        elif [[ "$status" == "EXITED"* || "$status" == "CREATED"* ]]; then
-            node_display_id+=' [已停止]'
-        else
-            node_display_id+=' [不存在]'
-        fi
-        printf "  %d. %s\n" $((i+1)) "$node_display_id"
-    done
-    echo "  0. 返回主菜单"
-    echo ""
-
-    read -rp "请输入您的选择: " choices
-    if [ "$choices" == "0" ]; then
-        echo "返回主菜单。"
-        return
-    fi
-    
-    # 解析选择的数字，进行卸载
-    # 使用 grep -o '[0-9]\+' 提取数字，tr '\n' ' ' 将它们放入一个空格分隔的字符串
-    local selected_indices=$(echo "$choices" | grep -o '[0-9]\+' | tr '\n' ' ')
-    local uninstalled_count=0
-    for index in $selected_indices; do
-        # 验证输入的索引是否在合法范围内
-        if [[ "$index" =~ ^[1-9][0-9]*$ ]] && [ "$index" -ge 1 ] && [ "$index" -le "${#node_list[@]}" ]; then
-            local node_to_uninstall=${node_list[$((index-1))]}
-            echo "正在卸载节点 '$node_to_uninstall'..."
-            uninstall_node "$node_to_uninstall"
-            uninstalled_count=$((uninstalled_count + 1))
-        else
-            echo "警告: 跳过无效的节点索引 '$index'。"
-        fi
-    done
-    
-    echo ""
-    if [ "$uninstalled_count" -gt 0 ]; then
-        echo "已完成对 ${uninstalled_count} 个节点的卸载。"
-    else
-        echo "未选择有效节点进行卸载。"
-    fi
-    read -p "按任意键返回主菜单..."
-}
+# --- 批量卸载节点的函数定义 --- (之前已添加，确保此处有定义)
+# （在此处注释掉了，因为它已经在主函数main_menu之前被调用了。理论上应该放在main_menu之前或者放在main_menu内部调用）
+# 但考虑到此版本脚本是按照功能区域组织，在主菜单的 case 里调用它是没问题的。
+# function batch_uninstall_nodes() { ... } 
 
 
 # --- 主脚本执行入口 ---
