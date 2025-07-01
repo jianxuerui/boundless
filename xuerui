@@ -3,6 +3,23 @@
 # 作者：哈哈哈哈 (Twitter: @ferdie_jhovie)
 # 这是一个免费开源的脚本，请勿相信任何收费宣传。
 
+# === 脚本兼容性检查 ===
+# 确保当前脚本是由 Bash 解释器执行
+if [ -z "$BASH_VERSION" ]; then
+    echo "错误：此脚本需要Bash shell才能正确运行。当前不是Bash环境。"
+    echo "请使用 'bash $(basename "$0")' 来运行脚本，或确保脚本第一行 shebang 正确且文件有执行权限。"
+    exit 1
+fi
+
+# 检查 Bash 版本是否符合最低要求 (4.0 或更高，因为使用了 mapfile 等特性)
+IFS='.' read -r major minor patch <<< "$BASH_VERSION"
+if (( major < 4 )); then
+    echo "错误：检测到您的Bash版本过低 ($BASH_VERSION)。"
+    echo "此脚本至少需要Bash 4.0及以上版本。"
+    echo "请考虑升级您的操作系统或Bash版本。在Ubuntu/Debian上可尝试 'sudo apt update && sudo apt install --only-upgrade bash'，在CentOS/RHEL上可尝试 'sudo yum update bash'。"
+    exit 1
+fi
+
 # 启用严格模式，遇到错误立即退出，对未设置的变量报错，管道中任何命令失败都算作失败
 set -euo pipefail
 
@@ -82,13 +99,21 @@ echo "Nexus Network 进程已在后台启动，PID: $NEXUS_PID"
 sleep 5
 
 # 检查 nexus 进程是否存活。使用 wait $NEXUS_PID 非阻塞等待一下，确保它不是秒退
-if wait $NEXUS_PID || true; then # '|| true' prevents wait from exiting if PID not found immediately
-    if ! ps -p "$NEXUS_PID" > /dev/null; then
-        echo "节点启动失败，进程未保持运行。请检查 /root/nexus.log"
-        tail -n 50 /root/nexus.log || true # Print last 50 lines if it exists
-        exit 1
-    fi
+# 增加一个检查PID的循环，因为进程可能需要几秒钟来稳定启动
+RETRY_COUNT=0
+MAX_RETRIES=10
+while ! ps -p "$NEXUS_PID" > /dev/null && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    echo "等待 Nexus 进程启动... (${RETRY_COUNT}/${MAX_RETRIES})"
+    sleep 1
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+done
+
+if ! ps -p "$NEXUS_PID" > /dev/null; then
+    echo "节点启动失败，进程未保持运行。请检查 /root/nexus.log"
+    tail -n 50 /root/nexus.log || true # Print last 50 lines if it exists
+    exit 1
 fi
+
 
 echo "节点已在后台启动。日志文件：/root/nexus.log"
 echo "可以使用 docker logs \$CONTAINER_NAME 或 tail -f /root/nexus.log 查看日志"
@@ -133,6 +158,7 @@ function get_node_ids_from_user() {
     echo_color blue "---------------------------------------------------------"
     
     local line_count=0
+    # Loop using 'read -r' for robust line reading, especially with unusual characters
     while IFS= read -r line; do
         if [ -z "$line" ]; then
             continue # Allow empty lines during input, but don't store them
@@ -148,55 +174,65 @@ function get_node_ids_from_user() {
 
     if [ ${#ids_array[@]} -eq 0 ]; then
         echo_color yellow "未输入任何有效的 node-id。"
-        # Do not return immediately here; let the caller handle the empty array
     fi
-    # 使用 nameref 或 global assignment 传回数组
-    # For Bash 3.x compatibility, use indirect expansion if `declare -n` (nameref) is not available.
-    # Given typical server environments, `declare -n` is generally available.
-    # eval "${__result_arr_name}=($(printf "'%s' " "${ids_array[@]}"))" # This makes it hard to manage if values contain spaces.
     
-    # Best way for compatibility and robustness for an array of simple strings:
-    # Set it in the parent scope. This often requires the caller to `read -ra` the output
-    # OR for the array to be global.
-    # For simplicity, for unique_node_ids_arr and all_input_node_ids, we'll assign directly.
-    # The mapfile will handle it correctly when assigned from printf output.
-
-    # Simpler: assign directly as string for easy parsing by mapfile, which filters.
-    # Or for actual array assignment back, directly modifying the name reference for safety
-    declare -ga "$__result_arr_name" # Make sure array is declared globally and assigned.
-    eval "$__result_arr_name=(\"${ids_array[@]}\")" # Assign the array values
+    # 将 ids_array 的内容赋值回传入的数组名（__result_arr_name）。
+    # 使用 nameref (declare -n) 是 Bash 4.3+ 特性，如果 Bash 版本过老，它会导致问题。
+    # 鉴于脚本开头已经检查了 Bash 版本 >= 4.0，我们将避免直接使用 declare -n 这种方式
+    # 因为它的 Bash 兼容性更细微，不如直接全局数组赋值稳妥，
+    # 或者让调用者通过 read -ra 从函数的标准输出接收数组。
+    # 但最简单直接的方式还是确保这是一个全局变量，并直接赋值。
+    # 这里通过 eval 实现间接赋值，并确保声明为全局数组
+    eval "declare -ga $__result_arr_name" # Ensures the variable is an array in global scope
+    eval "$__result_arr_name=(\"${ids_array[@]}\")" # Assign the values. Direct expansion within double quotes is robust.
 }
 
 # --- OS Detection ---
 OS_FAMILY="unknown"
 function detect_os_family() {
-    if grep -qE "ID=(debian|ubuntu)" /etc/os-release 2>/dev/null; then
-        echo "debian"
-    elif grep -qE "ID=(centos|rhel|fedora)" /etc/os-release 2>/dev/null; then
-        echo "redhat"
-    else
-        echo "unknown"
+    # Check for /etc/os-release standard first
+    if [ -f /etc/os-release ]; then
+        if grep -qE "ID=(debian|ubuntu)" /etc/os-release 2>/dev/null; then
+            echo "debian"
+        elif grep -qE "ID=(centos|rhel|fedora)" /etc/os-release 2>/dev/null; then
+            echo "redhat"
+        elif grep -qE "ID=(almalinux|rocky)" /etc/os-release 2>/dev/null; then # Add modern RHEL clones
+            echo "redhat"
+        fi
+    fi
+    # Fallback to older methods if /etc/os-release is not definitive or absent
+    if [ "$OS_FAMILY" = "unknown" ]; then
+        if [ -f /etc/debian_version ] || grep -q "Ubuntu" /etc/lsb-release 2>/dev/null; then
+            echo "debian"
+        elif [ -f /etc/redhat-release ] || grep -qE "CentOS|Red Hat|Fedora" /etc/issue 2>/dev/null; then
+            echo "redhat"
+        else
+            echo "unknown" # Still unknown
+        fi
     fi
 }
+# Set OS_FAMILY at script startup once
 OS_FAMILY=$(detect_os_family)
 
 # === Docker Installation Functions by OS ===
 
 function install_docker_debian() {
     echo_color yellow "正在安装 Docker (Debian/Ubuntu)..."
-    apt update -qq
-    apt install -y ca-certificates curl gnupg lsb-release
+    apt update -qq || true # Allow update to fail if repo temporarily unreachable
+    apt install -y ca-certificates curl gnupg lsb-release || true
     
     # Add Docker GPG key (new way)
-    rm -f /etc/apt/keyrings/docker.gpg
-    mkdir -m 0755 -p /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    rm -f /etc/apt/keyrings/docker.gpg || true # In case it doesn't exist
+    mkdir -m 0755 -p /etc/apt/keyrings || true
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg || true
     chmod a+r /etc/apt/keyrings/docker.gpg # Ensure readable
     
     # Add Docker repository (new way)
+    # Using '|| true' to make the echo fail gracefully if permissions issue.
+    # The 'tee' will manage writing to file, which is more critical.
     echo \
       "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-      $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+      $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null || true
     
     apt update -qq
     apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
@@ -206,8 +242,8 @@ function install_docker_debian() {
 }
 
 function install_docker_redhat() {
-    echo_color yellow "正在安装 Docker (CentOS/RHEL/Fedora)..."
-    yum_or_dnf="yum"
+    echo_color yellow "正在安装 Docker (CentOS/RHEL/Fedora/AlmaLinux/RockyLinux)..."
+    local yum_or_dnf="yum"
     if command -v dnf >/dev/null 2>&1; then
         yum_or_dnf="dnf"
     fi
@@ -216,8 +252,17 @@ function install_docker_redhat() {
     $yum_or_dnf remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine >/dev/null 2>&1 || true
 
     # Install yum-utils and add Docker repo
-    $yum_or_dnf install -y yum-utils device-mapper-persistent-data lvm2
-    $yum_or_dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+    # Some older RHEL versions might need `yum-utils`, dnf automatically includes what it needs
+    $yum_or_dnf install -y yum-utils device-mapper-persistent-data lvm2 || true
+    # For newer Fedora/RHEL derivatives, it's safer to use 'config-manager --add-repo' with direct URL
+    # or dnf-plugins-core
+    if command -v $yum_or_dnf >/dev/null 2>&1; then
+        $yum_or_dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo || true
+    else
+        echo_color red "Error: Neither yum nor dnf found. Cannot install Docker automatically."
+        exit 1
+    fi
+
 
     # Install Docker Engine
     $yum_or_dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
@@ -230,19 +275,21 @@ function install_docker_redhat() {
 
 function install_nodejs_npm_debian() {
     echo_color yellow "正在安装 Node.js 18.x (Debian/Ubuntu)..."
-    curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+    # Remove existing nodesource lists to avoid conflicts
+    rm -f /etc/apt/sources.list.d/nodesource.list || true
+    curl -fsSL https://deb.nodesource.com/setup_18.x | bash - || true # The script needs bash or sh, but usually executes fine
     apt-get install -y nodejs
 }
 
 function install_nodejs_npm_redhat() {
-    echo_color yellow "正在安装 Node.js 18.x (CentOS/RHEL/Fedora)..."
-    yum_or_dnf="yum"
+    echo_color yellow "正在安装 Node.js 18.x (CentOS/RHEL/Fedora/AlmaLinux/RockyLinux)..."
+    local yum_or_dnf="yum"
     if command -v dnf >/dev/null 2>&1; then
         yum_or_dnf="dnf"
     fi
 
     # Install NodeSource Node.js 18.x RPM
-    curl -fsSL https://rpm.nodesource.com/setup_18.x | bash -
+    curl -fsSL https://rpm.nodesource.com/setup_18.x | bash - || true # The script needs bash or sh, but usually executes fine
     $yum_or_dnf install -y nodejs
 }
 
@@ -270,7 +317,13 @@ function check_docker() {
     else
         echo_color green "Docker 已安装。"
     fi
-    docker info >/dev/null 2>&1 || { echo_color red "Docker 服务未运行或当前用户无权限。请尝试 'sudo systemctl start docker' 或将用户加入 'docker' 组并重新登录。"; exit 1; }
+    # Check if Docker daemon is running and current user can use it
+    docker info >/dev/null 2>&1 || { 
+        echo_color red "Docker 服务未运行或当前用户无权限。请尝试以下操作："
+        echo_color red "1. 启动 Docker 服务: 'sudo systemctl start docker'"
+        echo_color red "2. 如果是新安装Docker，请将当前用户添加到 'docker' 用户组并重新登录: 'sudo usermod -aG docker \$USER && newgrp docker'"
+        exit 1
+    }
     echo ""
 }
 
@@ -314,11 +367,13 @@ function check_pm2() {
 
 # 构建docker镜像函数
 function build_image() {
-    echo_color blue "=== 构建 Docker 镜像 ==-"
+    echo_color blue "=== 构建 Docker 镜像 ==="
     # 使用一个确定性的临时目录，并设置trap确保清理
     mkdir -p "$SCRIPT_TMP_DIR"
     # 在脚本退出时自动清理临时目录
-    trap "rm -rf '$SCRIPT_TMP_DIR'" EXIT
+    # 注意：这个 trap 是在主脚本层面的，如果在 sub-shell 中出现错误，它不一定触发
+    # 所以 sub-scripts 也需要自己的清理或更可靠的错误处理。
+    trap "rm -rf '$SCRIPT_TMP_DIR' 2>/dev/null; echo_color red '脚本非正常退出，临时文件已清理。'" EXIT
 
     echo "${DOCKERFILE_CONTENT}" > "${SCRIPT_TMP_DIR}/Dockerfile"
     echo "${ENTRYPOINT_CONTENT}" > "${SCRIPT_TMP_DIR}/entrypoint.sh"
@@ -548,6 +603,7 @@ function select_node_to_view() {
         local node_id=${all_nodes_array[$i]}
         local container_name="${BASE_CONTAINER_NAME}-${node_id}"
         local status_str="[未知状态]"
+        # Check container run status for display purpose only
         if docker ps --filter "name=$container_name" --filter "status=running" --format '{{.ID}}' | grep -q .; then
             status_str=$(echo_color green "[运行中]")
         elif docker ps -a --filter "name=$container_name" --format '{{.Status}}' | grep -q 'Exited'; then
@@ -786,7 +842,7 @@ function batch_rotate_nodes() {
 
     # 过滤掉重复的 node-id，确保每个ID只使用一次
     local unique_node_ids_arr=()
-    # Use printf for reliable newline separation and then sort -u
+    # Use printf for reliable newline separation and then sort -u.
     mapfile -t unique_node_ids_arr < <(printf "%s\n" "${all_input_node_ids[@]}" | sort -u)
 
     local total_nodes=${#unique_node_ids_arr[@]}
@@ -845,8 +901,13 @@ function batch_rotate_nodes() {
     mkdir -p "$script_dir"
     chmod 700 "$script_dir" # Secure permissions
 
-    # 生成轮换主脚本 `rotate.sh`
-    # 此脚本将由 pm2 运行
+    # Generate the rotation script for PM2
+    # Ensure all variables are properly expanded and quoted to preserve them
+    local NODE_IDS_STRING_FOR_PM2=""
+    if [ ${#unique_node_ids_arr[@]} -gt 0 ]; then
+        NODE_IDS_STRING_FOR_PM2="$(printf "%s " "${unique_node_ids_arr[@]}")"
+    fi
+
     cat > "$script_dir/rotate.sh" <<EOF
 #!/bin/bash
 set -euo pipefail
@@ -854,13 +915,11 @@ set -euo pipefail
 BASE_CONTAINER_NAME="${BASE_CONTAINER_NAME}"
 IMAGE_NAME="${IMAGE_NAME}"
 LOG_DIR="${LOG_DIR}"
-# Pass the unique_node_ids_arr as a string, then re-create array in subshell
-# This is more robust against special characters in IDs or older Bash versions for mapfile
-NODE_IDS_LIST="$(printf "%s " "${unique_node_ids_arr[@]}")"
+NODE_IDS_LIST="${NODE_IDS_STRING_FOR_PM2}" # Store as space-separated string
 NODES_PER_ROUND=${nodes_per_round}
 ROTATE_INTERVAL_SECONDS=${rotate_interval_seconds}
 
-# Read NODE_IDS_LIST back into a proper bash array for use within this script
+# Re-create TOTAL_NODE_IDS array from NODE_IDS_LIST string. This handles IDs with spaces better.
 read -ra TOTAL_NODE_IDS <<< "\$NODE_IDS_LIST"
 TOTAL_NODES_COUNT=\${#TOTAL_NODE_IDS[@]}
 
@@ -879,13 +938,11 @@ function run_single_container() {
     if [ -d "\$log_file" ]; then rm -rf "\$log_file"; fi
     if [ ! -f "\$log_file" ]; then touch "\$log_file"; chmod 644 "\$log_file"; fi
 
-    # Stop and remove if container already exists (even from previous failures)
     docker rm -f "\$container_name" >/dev/null 2>&1 || true
 
     log_message "    启动节点: \$node_id (容器: \$container_name)"
     docker run -d --name "\$container_name" -v "\$log_file":/root/nexus.log -e NODE_ID="\$node_id" "\$IMAGE_NAME" &> /dev/null
     
-    # Small delay for container to start its process
     sleep 3
     
     if docker ps -a --format '{{.Names}}' | grep -qw "\$container_name"; then
@@ -902,10 +959,8 @@ function run_single_container() {
 function stop_all_managed_containers() {
     log_message "停止并清理所有 Nexus 节点容器..."
     local containers_to_stop
-    # Filter by name prefix to avoid deleting other containers
     containers_to_stop=\$(docker ps -a --filter "name=\${BASE_CONTAINER_NAME}-" --format '{{.Names}}')
     if [ -n "\$containers_to_stop" ]; then
-        # xargs -r for empty input protection on some systems
         echo "\$containers_to_stop" | xargs -r docker rm -f || true
         log_message "  所有旧容器已清理。"
     else
@@ -918,27 +973,30 @@ while true; do
     log_message "新的轮换周期开始..."
     log_message "=========================================================="
 
-    # 1. 停止并清理所有现有 managed 容器
     stop_all_managed_containers
 
-    # 2. 确定本轮要激活的节点
+    # Exit if TOTAL_NODES_COUNT is 0 to prevent infinite loop or errors
+    if [ "\${TOTAL_NODES_COUNT}" -eq 0 ]; then
+        log_message "错误: 未配置任何节点进行轮换。退出轮换进程。"
+        exit 1
+    fi
+
     local current_round_nodes=()
     local i
     for (( i=0; i<NODES_PER_ROUND; i++ )); do
-        # Use modular arithmetic to loop through node IDs
         local node_idx=\$((\$((\${CURRENT_NODE_INDEX} + i)) % \${TOTAL_NODES_COUNT}))
         current_round_nodes+=("\${TOTAL_NODE_IDS[\${node_idx}]}")
     done
     
     log_message "本轮将启动以下 \${#current_round_nodes[@]} 个节点: \${current_round_nodes[*]}"
 
-    # 3. 启动本轮节点
     for node_id in "\${current_round_nodes[@]}"; do
         run_single_container "\$node_id"
     done
 
     log_message "本轮节点启动完毕。"
-    log_message "更新下次启动索引: 从节点 ${current_round_nodes[0]} 开始 (实际索引 \$CURRENT_NODE_INDEX)"
+    # Display the first node of the current rotation batch
+    log_message "更新下次启动索引: 从节点 ${current_round_nodes[0]} (内部列表起始索引: \${CURRENT_NODE_INDEX})。"
     CURRENT_NODE_INDEX=\$(( (\${CURRENT_NODE_INDEX} + \${NODES_PER_ROUND}) % \${TOTAL_NODES_COUNT} ))
     
     log_message "----------------------------------------------------------"
@@ -972,8 +1030,13 @@ EOF
 function setup_log_cleanup_cron() {
     echo_color blue "=== 设置日志清理定时任务 ==="
     # 清理日志，只保留最近2天的日志文件。确保 LOG_DIR 存在且是非空的，避免 `find` 错误
-    # Using realpath to resolve symbolic links and ensure absolute path, important for cron
-    local real_log_dir=$(realpath "$LOG_DIR" 2>/dev/null || echo "$LOG_DIR")
+    local real_log_dir
+    # Safely get realpath; if command fails (e.g., directory doesn't exist yet), fall back to original.
+    if command -v realpath >/dev/null 2>&1; then
+        real_log_dir=$(realpath "$LOG_DIR" 2>/dev/null || echo "$LOG_DIR")
+    else
+        real_log_dir="$LOG_DIR"
+    fi
     
     local cron_job_comment="# Nexus node log cleanup: Keep logs for 2 days. Created by nexus-node-manager.sh"
     local cron_job_cmd="0 3 * * * find \"$real_log_dir\" -maxdepth 1 -type f -name 'nexus-*.log' -mtime +2 -delete"
@@ -987,7 +1050,9 @@ function setup_log_cleanup_cron() {
     else
         # Append or create定时任务
         # Remove existing older cleanup lines if they only contain comment/command and no other variations
-        (crontab -l 2>/dev/null | grep -vF "nexus-node-manager.sh" | grep -vF "find \"/root/nexus_logs\" -maxdepth 1 -type f -name 'nexus-*.log' -mtime +2 -delete" ; echo -e "$full_cron_entry") | crontab -
+        # Use awk for safer deletion to prevent issues with multiple same lines or specific older cron entries.
+        # This awk command filters out any previous lines containing "find" on "nexus_logs" and "Nexus node log cleanup" comments.
+        (crontab -l 2>/dev/null | awk '!/find \".*nexus_logs\".*nexus-.*\.log/ && !/Nexus node log cleanup/ {print}' ; echo -e "$full_cron_entry") | crontab -
         echo_color green "已设置每2天自动清理过期 Nexus 日志的任务（保留最近2天）。"
     fi
     echo ""
@@ -995,8 +1060,9 @@ function setup_log_cleanup_cron() {
 
 # 主菜单
 function main_menu() {
-    # Execute trap cleanup if any issue before main loop.
-    trap "rm -rf '$SCRIPT_TMP_DIR'; echo_color red '脚本非正常退出，临时文件已清理。'" EXIT
+    # Set the trap just once for the main script
+    # It attempts to clean up temp build directory on script exit/error.
+    trap "rm -rf '$SCRIPT_TMP_DIR' 2>/dev/null; echo_color red '脚本非正常退出或已完成，临时文件已清理。'" EXIT
     
     setup_log_cleanup_cron # 每次启动脚本都确保定时任务已设置
 
