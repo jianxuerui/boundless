@@ -8,7 +8,7 @@
 #                   增强了系统兼容性与用户体验。
 #
 #       AUTHOR: 哈哈哈哈 (Github/Twitter: @ferdie_jhovie)
-#       VERSION: 1.5.1 (修复 Dockerfile RUN 中 IF 解析问题，Nexus CLI v0.8.17 集成)
+#       VERSION: 1.5.1 (修复 Dockerfile RUN 中 IF 解析问题，增强兼容性，Nexus CLI v0.8.17 集成)
 #     LAST CHANGE: 2024-07-27
 #
 #===============================================================================
@@ -124,13 +124,14 @@ function check_docker() {
         
         # 安装必要的依赖
         install_utility_if_not_exists "curl" "curl" || { echo "[!] Docker 安装依赖: curl 安装失败，请手动安装。"; return 1; }
+        # 确保 gpg 可用，以添加 NodeSource apt 源和 Docker apt 源
         install_utility_if_not_exists "gpg" "gnupg" "gpg" || { echo "[!] Docker 安装依赖: gpg/gnupg 安装失败，请手动安装。"; return 1; }
         install_utility_if_not_exists "wget" "wget" || echo "  [!] 提示: wget 未安装，部分 Docker 安装方法可能受影响。"
 
         # 尝试使用官方便捷安装脚本
         echo "[-] 尝试使用 Docker 官方便捷脚本安装..."
         local docker_install_script_url="https://get.docker.com/"
-        local temp_docker_install_script=$(mktemp)
+        local temp_docker_install_script=$(mktemp) # 使用 mktemp 创建临时文件
         
         if ! curl -fsSL "$docker_install_script_url" -o "$temp_docker_install_script"; then
             echo "[!] 错误: 下载 Docker 安装脚本失败。请检查网络连接或手动安装。"
@@ -225,9 +226,14 @@ function check_nodejs_and_pm2() {
             local node_version_to_install="18.x"
             echo "  [*] 配置 NodeSource 以安装 Node.js ${node_version_to_install}..."
             # 添加 node_source.list 的创建逻辑，并处理 key
-            if ! install_utility_if_not_exists "curl" "curl" || \
-               ! command -v gpg &>/dev/null && install_utility_if_not_exists "gpg" "gnupg" "gpg" || \
-               ! curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg || \
+            # 确保 curl 和 gpg 可用
+            install_utility_if_not_exists "curl" "curl" || { echo "[!] Node.js 安装依赖: curl 安装失败，请手动安装。"; return 1; }
+            if ! command -v gpg &>/dev/null && ! install_utility_if_not_exists "gpg" "gnupg" "gpg"; then
+                 echo "[!] Node.js 安装依赖: gpg/gnupg 安装失败，请手动安装。"; return 1;
+            fi
+            
+            # 尝试导入 GPG key 并设置 apt 源
+            if ! curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg || \
                ! echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${node_version_to_install} nodistro main" | sudo tee /etc/apt/sources.list.d/nodesource.list > /dev/null || \
                ! sudo apt-get update -qq || \
                ! sudo apt-get install -y -qq nodejs; then
@@ -361,7 +367,7 @@ RUN set -ex; \
     fi; \
     chmod +x nexus-network; \
     echo "[-] Nexus CLI ${SPECIFIC_NEXUS_CLI_VERSION} 下载并安装到 /root/.nexus/bin/nexus-network。"; \
-    # 验证安装，使用 set -x 使验证步骤清晰
+    # 验证安装，使用 set -x 使验证步骤清晰，整个 if 块作为 shell 命令的一部分
     if [ ! -f nexus-network ] || [ ! -x nexus-network ]; then \
         echo "[!] Nexus CLI 安装失败，二进制文件未找到或不可执行！"; \
         exit 1; \
@@ -524,9 +530,9 @@ function run_container() {
         return 1
     fi
 
-    # 计算内存分配，使用 `scale=0` 并四舍五入
+    # 计算内存分配，使用 `scale=4` 来提高 bc 的精度，最后 `printf "%.0f"` 四舍五入取整
     local allocated_mem_float=$(echo "$host_total_mem_mb * $CONTAINER_MEM_RATIO" | bc)
-    local allocated_mem_mb=$(printf "%.0f" $(echo "scale=4; $allocated_mem_float / 1024" | bc)) # 转换成 MB，并保留几位小数以确保精度
+    local allocated_mem_mb=$(printf "%.0f" $(echo "scale=4; $allocated_mem_float / 1024" | bc)) # 转换成 MB
 
     # 应用最大和最小内存限制
     if (( allocated_mem_mb > CONTAINER_MEM_MAX_MB )); then allocated_mem_mb="$CONTAINER_MEM_MAX_MB"; fi
@@ -1210,7 +1216,7 @@ while true; do
                     if run_container "$NODE_ID"; then
                         echo "[+] 节点 '$NODE_ID' 启动请求已发送。"
                     else
-                        echo "[!] 启动节点 '$node_id' 的容器失败。"
+                        echo "[!] 启动节点 '$NODE_ID' 的容器失败。"
                     fi
                 fi
             fi
