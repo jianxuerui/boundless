@@ -9,7 +9,7 @@ LOG_DIR="/root/nexus_logs" # 默认日志目录
 #                         !!! 重 要 提 示 !!!
 # 本脚本将在 '$LOG_DIR' 路径下创建日志目录和文件。
 # 默认路径 '/root/nexus_logs' 通常需要 root 权限。
-# 请使用 'sudo ./nexus_manager.sh' 命令运行此脚本，以确保所有功能正常工作。
+# 请务必使用 'sudo ./nexus_manager.sh' 命令运行此脚本，以确保所有功能正常工作。
 # 如果您不希望使用 '/root' 目录，请修改上方 'LOG_DIR' 变量为其他路径，
 # 例如：LOG_DIR="$HOME/nexus_logs" (这将使用当前用户家目录下的nexus_logs)。
 # ==========================================================================
@@ -104,6 +104,8 @@ ENV PROVER_ID_FILE=/root/.nexus/node-id
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     bash \
+    # screen can be useful for debugging if needed, but not for final setup.
+    # screen is removed from Dockerfile to keep image slim, as it is no longer part of entrypoint logic
     && rm -rf /var/lib/apt/lists/*
 
 # 自动下载安装最新版 nexus-network
@@ -121,9 +123,13 @@ EOF
 set -e
 
 PROVER_ID_FILE="/root/.nexus/node-id"
+NEXUS_LOG_FILE="/root/nexus.log" # 容器内部的日志文件路径
+
+# Ensure the log directory exists within the container (even if bind mounted, it's good practice)
+mkdir -p "\$(dirname "\$NEXUS_LOG_FILE")"
 
 if [ -z "\$NODE_ID" ]; then
-    echo "错误：未设置 NODE_ID 环境变量"
+    echo "错误：未设置 NODE_ID 环境变量" >&2
     exit 1
 fi
 
@@ -131,18 +137,37 @@ echo "\$NODE_ID" > "\$PROVER_ID_FILE"
 echo "使用的 node-id: \$NODE_ID"
 
 if ! command -v nexus-network >/dev/null 2>&1; then
-    echo "错误：nexus-network 未安装或不可用"
+    echo "错误：nexus-network 未安装或不可用" >&2
     exit 1
 fi
 
 echo "启动 nexus-network 节点..."
-# 使用 exec 将 nexus-network 设为容器主进程，以便 Docker 正确处理信号。
-# 日志将输出到 /root/nexus.log。
-exec nexus-network start --node-id "\$NODE_ID" &>> /root/nexus.log
+# 在后台运行 nexus-network，并将其标准输出和错误重定向到 NEXUS_LOG_FILE。
+nexus-network start --node-id "\$NODE_ID" &>> "\$NEXUS_LOG_FILE" &
+NEXUS_PID=\$! # 捕获后台进程的 PID
+
+# 等待一小段时间，让 nexus-network 有机会启动或输出初始错误
+sleep 5
+
+# 检查 nexus-network 进程是否仍然在运行 (即没有立即崩溃退出)
+if kill -0 "\$NEXUS_PID" 2>/dev/null; then
+    echo "节点已在后台启动 (PID: \$NEXUS_PID)。"
+    echo "日志文件：\$NEXUS_LOG_FILE"
+    echo "容器将通过跟踪日志保持运行。"
+    # 使用 'exec tail -f' 将 'tail -f' 设置为容器的主进程 (PID 1)
+    # 这会使容器保持运行，并实时输出日志。如果 'tail -f' 退出，容器也会退出。
+    exec tail -f "\$NEXUS_LOG_FILE"
+else
+    echo "节点启动失败，nexus-network 进程已退出。请检查日志获取详细信息。" >&2
+    echo "--- \$NEXUS_LOG_FILE 最后内容 ---" >&2
+    tail -n 20 "\$NEXUS_LOG_FILE" >&2 || echo "(无法读取日志文件或文件为空)" >&2
+    echo "-------------------------------" >&2
+    exit 1
+fi
 EOF
 
     # 错误处理：Docker 镜像构建失败
-    if ! docker build -t "$IMAGE_NAME" .; then
+    if ! docker build -t "$IMAGE_NAME" . || [ "$(docker images -q "$IMAGE_NAME" 2>/dev/null)" == "" ]; then
         echo "错误：Docker 镜像 '$IMAGE_NAME' 构建失败。请检查您的 Dockerfile 内容或 Docker 环境。"
         cd - >/dev/null # 无论如何返回原目录
         rm -rf "$WORKDIR"
@@ -196,19 +221,28 @@ function run_container() {
     echo "正在为容器 '$container_name' 启动节点，并分配内存: ${mem_limit_mb}MB"
     # 使用 -m 参数设置内存限制
     if ! docker run -d --name "$container_name" -v "$log_file":/root/nexus.log -e NODE_ID="$node_id" -m "${mem_limit_mb}m" "$IMAGE_NAME"; then
-        echo "错误：Docker 容器 '$container_name' 启动失败。请检查日志，错误详情如下："
-        docker logs "$container_name" # 尝试显示日志以帮助诊断
+        echo "错误：Docker 容器 '$container_name' 启动失败。请检查日志，错误详情如下：" >&2
+        docker logs "$container_name" 2>&1 # 显示日志以帮助诊断
         exit 1 # 启动失败是关键错误，直接退出
     fi
 
-    echo "容器 '$container_name' 已启动！"
-    sleep 3 # 给Docker和nexus-network一点时间启动
-
-    # 可选检查：如果容器在启动后立即退出
-    if ! docker ps --filter "name=$container_name" --filter "status=running" --format "{{.Names}}" | grep -qw "$container_name"; then
-        echo "警告：容器 '$container_name' 启动后似乎没有保持运行，可能已退出。请检查容器日志获取详细信息。"
-        docker logs "$container_name" # 显示日志以供诊断
-        read -rp "按任意键继续 (或 Ctrl+C 退出)..." # 不在此处立即退出，让用户决定
+    echo "容器 '$container_name' 已启动！等待检查其运行状态..."
+    
+    # 首次检查，给予5秒时间
+    sleep 5
+    if docker ps --filter "name=$container_name" --filter "status=running" --format "{{.Names}}" | grep -qw "$container_name"; then
+        echo "容器 '$container_name' 成功启动并正在运行。"
+    else
+        # 尝试再次检查，总共等待10秒
+        echo "容器 '$container_name' 未在5秒内完全启动，再次等待5秒..."
+        sleep 5
+        if docker ps --filter "name=$container_name" --filter "status=running" --format "{{.Names}}" | grep -qw "$container_name"; then
+            echo "容器 '$container_name' 在10秒内成功启动并正在运行。"
+        else
+            echo "警告：容器 '$container_name' 启动后似乎没有保持运行（在10秒内）。这可能意味着 'nexus-network' 进程启动后立即退出了。" >&2
+            echo "请立即使用 'docker logs $container_name' 命令查看日志以诊断问题。" >&2
+            read -rp "按任意键继续 (或 Ctrl+C 退出)..." # 不在此处立即退出，让用户决定
+        fi
     fi
 }
 
@@ -253,7 +287,8 @@ function list_nodes() {
     for i in "${!all_nodes[@]}"; do
         local node_id=${all_nodes[$i]}
         local container_name="${BASE_CONTAINER_NAME}-${node_id}"
-        # docker stats 返回格式："CPU%,MemUsage / MemLimit,Mem% (Mem% 这里被移除了以简化)"
+        # docker stats 返回格式："CPU%,MemUsage / MemLimit"
+        # 移除 Mem% 以简化
         local container_info=$(docker stats --no-stream --format "{{.CPUPerc}},{{.MemUsage}}" "$container_name" 2>/dev/null) 
         
         local status=$(docker ps -a --filter "name=$container_name" --format "{{.Status}}")
@@ -437,7 +472,7 @@ function batch_start_nodes() {
     for node_id in "${node_ids[@]}"; do
         echo "正在启动节点 $node_id ..."
         run_container "$node_id" "$per_node_mem_mb"
-        sleep 2 # 添加短暂延迟
+        sleep 2 # 添加短暂延迟，避免Docker命令之间过快导致问题
     done
 
     echo "所有节点启动完成！"
@@ -649,8 +684,7 @@ function batch_rotate_nodes() {
         exit 1
     fi
 
-    # 内存计算的辅助函数，用于嵌入到生成的脚本中
-    # 这些变量需要是硬编码的，以确保生成的脚本是独立的
+    # 内存计算的辅助函数，用于嵌入到生成的脚本中 (注意是模板，因为 LOG_DIR 可能会变)
     local mem_calc_block_template='
 # --- 内存分配逻辑 (由主脚本生成) ---
 get_total_system_ram_mb() {
@@ -690,19 +724,19 @@ calculate_per_node_memory_mb() {
 #!/bin/bash
 set -e
 
-# These are hardcoded to match the main script's globals and ensure self-containment
+# 这些是硬编码的，用于确保自包含。需要与主脚本的全局变量一致。
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:latest"
-LOG_DIR="/root/nexus_logs" # Consistent with main script's global LOG_DIR
+LOG_DIR="$LOG_DIR" # 使用主脚本中的 LOG_DIR 路径
 
-# 确保日志目录存在且可写 (在 host 上创建)
-mkdir -p "\$LOG_DIR" || { echo "[$(date '+%Y-%m-%d %H:%M:%S')] 错误：无法创建日志目录 '\$LOG_DIR'。请检查权限。" >&2; exit 1; }
+# 确保宿主机的日志目录存在且可写 (在 host 上操作)
+mkdir -p "\$LOG_DIR" || { echo "[$(date '+%Y-%m-%d %H:%M:%S')] 错误：\$0 无法创建日志目录 '\$LOG_DIR'。请检查权限。" >&2; exit 1; }
 if [ ! -d "\$LOG_DIR" ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 错误：日志目录 '\$LOG_DIR' 未能成功创建。" >&2;
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 错误：\$0 日志目录 '\$LOG_DIR' 未能成功创建。" >&2;
     exit 1
 fi
 if [ ! -w "\$LOG_DIR" ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 错误：日志目录 '\$LOG_DIR' 不可写。请检查权限。" >&2;
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 错误：\$0 日志目录 '\$LOG_DIR' 不可写。请检查权限。" >&2;
     exit 1
 fi
 
@@ -714,14 +748,14 @@ MEMORY_PERCENTAGE_TOTAL_ALLOC=${mem_percent} # 用于所有Nexus节点的系统�
 PER_NODE_MEM_MB=\$(calculate_per_node_memory_mb "\$NUM_NODES_THIS_ROUND" "\$MEMORY_PERCENTAGE_TOTAL_ALLOC")
 
 if [ "\$PER_NODE_MEM_MB" -eq 0 ]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 警告: 无法为本轮节点分配有效内存。跳过启动本轮次。" >&2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 警告: \$0 无法为本轮节点分配有效内存。跳过启动本轮次。" >&2
     exit 1
 fi
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] 本轮将启动 ${current_group_nodes_count} 个节点，每个节点分配 \${PER_NODE_MEM_MB}MB 内存。"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] \$0 本轮将启动 ${current_group_nodes_count} 个节点，每个节点分配 \${PER_NODE_MEM_MB}MB 内存。"
 
 # 停止并删除所有与 BASE_CONTAINER_NAME 匹配的现有容器，确保只有本轮次节点运行
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] 停止并删除所有现有 Nexus 容器..."
-# 使用 || true 防止没有容器时 xargs 报错，这会阻止轮换脚本的继续执行
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] \$0 停止并删除所有现有 Nexus 容器..."
+# 使用 || true 防止没有容器时 xargs 报错，防止它导致 PM2 守护进程意外停止
 docker ps -a --filter "name=\${BASE_CONTAINER_NAME}" --format "{{.Names}}" | xargs -r docker rm -f || true
 
 # 启动第${group}组节点
@@ -731,22 +765,23 @@ EOF
         for (( i=start_idx; i<end_idx; i++ )); do
             local node_id=${node_ids[$i]}
             local container_name="${BASE_CONTAINER_NAME}-${node_id}"
-            local log_file="${LOG_DIR}/nexus-${node_id}.log" # 这是指宿主机上的路径
+            local log_file_host="${LOG_DIR}/nexus-${node_id}.log" # 这是指宿主机上的路径
 
             # 确保宿主机上的日志文件已准备好用于卷挂载
-            # 优先检查是否存在目录冲突
+            # 优先检查是否存在目录冲突，确保文件可创建
             echo "
-if [ -d \"$log_file\" ]; then
-    echo \"[$(date '+%Y-%m-%d %H:%M:%S')] 警告: 日志文件路径 '$log_file' 冲突，是目录。将尝试删除以便创建文件。\" >&2
-    rm -rf \"$log_file\" || { echo \"[$(date '+%Y-%m-%d %H:%M:%S')] 错误: 无法删除目录 '$log_file'。请手动删除或检查权限。\" >&2; exit 1; }
+if [ -d \"$log_file_host\" ]; then
+    echo \"[$(date '+%Y-%m-%d %H:%M:%S')] \$0 警告: 日志文件路径 '$log_file_host' 冲突，是一个目录。将尝试删除以便创建文件。\" >&2
+    rm -rf \"$log_file_host\" || { echo \"[$(date '+%Y-%m-%d %H:%M:%S')] \$0 错误: 无法删除目录 '$log_file_host'。请手动删除或检查权限。\" >&2; }
 fi
-[ -f \"$log_file\" ] || touch \"$log_file\" || { echo \"[$(date '+%Y-%m-%d %H:%M:%S')] 错误: 无法创建日志文件 '$log_file'。请检查目录权限。\" >&2; exit 1; }
-chmod 644 \"$log_file\" || { echo \"[$(date '+%Y-%m-%d %H:%M:%S')] 警告: 无法设置日志文件 '$log_file' 的权限。\" >&2; }
+# 创建或确认日志文件存在，并设置权限
+[ -f \"$log_file_host\" ] || touch \"$log_file_host\" || { echo \"[$(date '+%Y-%m-%d %H:%M:%S')] \$0 错误: 无法创建日志文件 '$log_file_host'。请检查目录权限。\" >&2; exit 1; }
+chmod 644 \"$log_file_host\" || { echo \"[$(date '+%Y-%m-%d %H:%M:%S')] \$0 警告: 无法设置日志文件 '$log_file_host' 的权限。\" >&2; }
 " >> "$script_dir/start_group${group}.sh"
 
-            echo "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] 正在启动节点 '$node_id' ...\"" >> "$script_dir/start_group${group}.sh"
-            # Docker run 命令也添加错误处理
-            echo "docker run -d --name \"\$container_name\" -v \"\$log_file\":/root/nexus.log -e NODE_ID=\"\$node_id\" -m \"\${PER_NODE_MEM_MB}m\" \"\$IMAGE_NAME\" || { echo \"[$(date '+%Y-%m-%d %H:%M:%S')] 错误: 容器 \$container_name 启动失败。\" >&2; docker logs \"\$container_name\" >&2; }" >> "$script_dir/start_group${group}.sh"
+            echo "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] \$0 正在启动节点 '$node_id' ...\"" >> "$script_dir/start_group${group}.sh"
+            # Docker run 命令也添加错误处理，防止启动失败影响 PM2
+            echo "docker run -d --name \"\$container_name\" -v \"$log_file_host\":/root/nexus.log -e NODE_ID=\"\$node_id\" -m \"\${PER_NODE_MEM_MB}m\" \"\$IMAGE_NAME\" || { echo \"[$(date '+%Y-%m-%d %H:%M:%S')] \$0 错误: 容器 \$container_name 启动失败。\" >&2; docker logs \"\$container_name\" >&2; }" >> "$script_dir/start_group${group}.sh"
             echo "sleep 1" >> "$script_dir/start_group${group}.sh" # 同批次节点间短暂延迟
         done
         echo "sleep 5" >> "$script_dir/start_group${group}.sh" # 组内节点启动后稍作停顿
@@ -758,11 +793,15 @@ chmod 644 \"$log_file\" || { echo \"[$(date '+%Y-%m-%d %H:%M:%S')] 警告: 无�
 set -e
 
 # 在开始轮换前确保日志目录可写
-mkdir -p "$LOG_DIR" || { echo "[$(date '+%Y-%m-%d %H:%M:%S')] 轮换错误：无法创建日志目录 '\$LOG_DIR'。" >&2; exit 1; }
+mkdir -p "$LOG_DIR" || { echo "[$(date '+%Y-%m-%d %H:%M:%S')] 轮换脚本错误：无法创建日志目录 '\$LOG_DIR'。" >&2; exit 1; }
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] 启动 Nexus 节点轮换任务。"
 echo "总共有 ${total_nodes} 个节点，将分为 ${num_groups} 组，每轮启动 ${nodes_per_round} 个节点（最后一组可能不足）。"
 echo "轮换周期：2小时。"
+
+# 从主脚本继承所有节点ID以便健康检查
+declare -a ALL_NODE_IDS=( ${node_ids[@]} )
+BASE_CONTAINER_NAME="$BASE_CONTAINER_NAME"
 
 while true; do
 EOF
@@ -780,38 +819,47 @@ EOF
     echo "" # 空行以增加日志可读性
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] --- 轮换到第 ${group} 组节点 (${current_group_nodes_count}个节点) ---"
     # 执行生成的组启动脚本
-    bash "$script_dir/start_group${group}.sh" || { echo "[$(date '+%Y-%m-%d %H:%M:%S')] 错误：执行启动组脚本失败，本轮次可能未完全启动。" >&2; }
+    bash "$script_dir/start_group${group}.sh" || { echo "[$(date '+%Y-%m-%d %H:%M:%S')] 错误：执行启动组脚本失败，本轮次可能未完全启动。请检查日志：$script_dir/nexus-rotate.err.log" >&2; }
     
     # 容器健康检查（针对本批次启动的节点）
     if [ ${current_group_nodes_count} -gt 0 ]; then
         local check_interval=5 # 秒
         local max_checks=6   # 检查总时长 30 秒 (6 * 5)
-        local launched_node_prefix="${BASE_CONTAINER_NAME}-" 
+        local launched_nodes_count=0
+        local expected_nodes=${current_group_nodes_count} # 本轮次预期启动的节点数量
 
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 检查本轮次节点启动状态..."
         for ((c=1; c<=max_checks; c++)); do
-            local all_running=true
-            for i_check in $(seq $start_idx $((end_idx-1))); do
-                local node_id_check="${node_ids[$i_check]}"
-                local container_name_check="\${launched_node_prefix}\${node_id_check}"
-                if ! docker ps --filter "name=\${container_name_check}" --filter "status=running" --format "{{.Names}}" | grep -qw "\${container_name_check}"; then
-                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 节点 \${node_id_check} 仍在启动或已退出，等待中... (检查 \$c/${max_checks})" >&2
-                    docker logs "\${container_name_check}" 2>&1 | tail -n 5 >&2 # 显示最后5行日志
-                    all_running=false
-                    break
+            launched_nodes_count=0
+            for i_check in \$(seq $start_idx $((end_idx-1))); do
+                local node_id_check="\${ALL_NODE_IDS[\$i_check]}"
+                local container_name_check="\${BASE_CONTAINER_NAME}-\${node_id_check}"
+                if docker ps --filter "name=\${container_name_check}" --filter "status=running" --format "{{.Names}}" | grep -qw "\${container_name_check}"; then
+                    launched_nodes_count=\$((launched_nodes_count + 1))
+                else
+                    # 仅显示那些预期运行但实际未运行的容器的日志，以节省输出
+                    if docker ps -a --filter "name=\${container_name_check}" --format "{{.Names}}" | grep -qw "\${container_name_check}"; then # 如果容器存在但未运行
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 节点 \${node_id_check} (容器 \${container_name_check}) 尚未运行，请检查日志... (检查 \$c/\$max_checks)" >&2
+                        docker logs "\${container_name_check}" 2>&1 | tail -n 10 >&2 # 显示最后10行日志
+                    else # 容器甚至没有创建成功
+                         echo "[$(date '+%Y-%m-%d %H:%M:%M')] 节点 \${node_id_check} (容器 \${container_name_check}) 未能创建或已消失，请检查日志... (检查 \$c/\$max_checks)" >&2
+                    fi
                 fi
             done
-            if \$all_running; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] 本轮所有节点启动并运行正常。"
+
+            if [ "\$launched_nodes_count" -eq "\$expected_nodes" ]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] 本轮所有预期节点 (${expected_nodes}个) 启动并运行正常。"
                 break
             elif [ \$c -eq \$max_checks ]; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] 警告: 部分本轮节点启动后未持续运行。请检查上述错误日志以获取详情。" >&2
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] 警告: 部分本轮节点启动后未持续运行 (${launched_nodes_count}/${expected_nodes}个在运行)。请检查上述错误日志以获取详情。" >&2
+            else
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] 仅有 \${launched_nodes_count}/${expected_nodes} 个节点在运行，继续等待... (检查 \$c/\$max_checks)"
             fi
             sleep \$check_interval
         done
     fi
 
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 第 ${group} 组节点已启动。等待2小时进行下一次轮换..."
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 第 ${group} 组节点已完成检查。等待2小时进行下一次轮换..."
     sleep 7200 # 2 小时 = 7200 秒
 
 EOF
@@ -824,13 +872,19 @@ EOF
     chmod +x "$script_dir"/*.sh
 
     # 使用 pm2 启动轮换脚本，并将输出重定向到文件
-    pm2 start "$script_dir/rotate.sh" --name "nexus-rotate" --output "$script_dir/nexus-rotate.log" --error "$script_dir/nexus-rotate.err.log" || { echo "错误: PM2 启动轮换进程失败。请检查 pm2 是否正常工作。"; exit 1; }
+    # PM2 日志文件路径单独定义，方便查看
+    local pm2_out_log="$script_dir/nexus-rotate-pm2.log"
+    local pm2_err_log="$script_dir/nexus-rotate-pm2.err.log"
+
+    pm2 start "$script_dir/rotate.sh" --name "nexus-rotate" --output "$pm2_out_log" --error "$pm2_err_log" || { echo "错误: PM2 启动轮换进程失败。请检查 pm2 是否正常工作。"; exit 1; }
     pm2 save --force || echo "警告: PM2 保存配置失败，这可能导致下次系统重启后 pm2 进程不会自动恢复。"
 
     echo "节点轮换已启动！"
     echo "使用 'pm2 status' 查看运行状态"
-    echo "使用 'pm2 logs nexus-rotate' 或 'tail -f $script_dir/nexus-rotate.log' 查看轮换日志"
-    echo "使用 'pm2 logs nexus-rotate --err' 或 'tail -f $script_dir/nexus-rotate.err.log' 查看轮换错误日志"
+    echo "轮换任务标准输出日志: '$pm2_out_log'"
+    echo "轮换任务错误输出日志: '$pm2_err_log'"
+    echo "使用 'pm2 logs nexus-rotate' 或 'tail -f $pm2_out_log' 查看轮换日志"
+    echo "使用 'pm2 logs nexus-rotate --err' 或 'tail -f $pm2_err_log' 查看轮换错误日志"
     echo "使用 'pm2 stop nexus-rotate' 停止轮换进程"
     echo "使用 'pm2 delete nexus-rotate' 删除轮换进程（将导致永久停止）"
     read -p "按任意键返回菜单"
