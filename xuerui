@@ -3,25 +3,42 @@
 # 作者：哈哈哈哈 (Twitter: @ferdie_jhovie)
 # 这是一个免费开源的脚本，请勿相信任何收费宣传。
 
-# === 脚本兼容性检查 ===
-# 确保当前脚本是由 Bash 解释器执行
+# === 脚本兼容性检查与强制执行Bash ===
+# 如果当前不是Bash环境，尝试使用Bash重新执行脚本。
+# 这是解决许多语法错误问题的关键步骤，特别是在默认shell为dash的系统上。
 if [ -z "$BASH_VERSION" ]; then
-    echo "错误：此脚本需要Bash shell才能正确运行。当前不是Bash环境。"
-    echo "请使用 'bash $(basename "$0")' 来运行脚本，或确保脚本第一行 shebang 正确且文件有执行权限。"
+    echo "警告：检测到脚本未由Bash执行。正在尝试使用 '/bin/bash' 重新执行。" >&2
+    exec /bin/bash "$0" "$@" # Re-execute script with Bash
+    echo "错误：无法通过 /bin/bash 重新执行脚本。请手动使用 'bash $0' 运行。" >&2
     exit 1
 fi
 
 # 检查 Bash 版本是否符合最低要求 (4.0 或更高，因为使用了 mapfile 等特性)
-IFS='.' read -r major minor patch <<< "$BASH_VERSION"
+# 使用 eval 保护，避免在极度老旧Bash上解析错误
+if ! IFS='.' read -r major minor patch <<< "$BASH_VERSION"; then
+    echo "错误：无法解析Bash版本号。请确保Bash功能正常。" >&2
+    exit 1
+fi
+
 if (( major < 4 )); then
-    echo "错误：检测到您的Bash版本过低 ($BASH_VERSION)。"
-    echo "此脚本至少需要Bash 4.0及以上版本。"
-    echo "请考虑升级您的操作系统或Bash版本。在Ubuntu/Debian上可尝试 'sudo apt update && sudo apt install --only-upgrade bash'，在CentOS/RHEL上可尝试 'sudo yum update bash'。"
+    echo "错误：检测到您的Bash版本过低 ($BASH_VERSION)。" >&2
+    echo "此脚本至少需要Bash 4.0及以上版本。" >&2
+    echo "请考虑升级您的操作系统或Bash版本。" >&2
+    echo "在Ubuntu/Debian上可尝试 'sudo apt update && sudo apt install --only-upgrade bash'" >&2
+    echo "在CentOS/RHEL上可尝试 'sudo yum update bash' 或 'sudo dnf update bash'" >&2
     exit 1
 fi
 
 # 启用严格模式，遇到错误立即退出，对未设置的变量报错，管道中任何命令失败都算作失败
 set -euo pipefail
+
+# === DEBUG 模式 ===
+# 可以通过在运行脚本前设置 DEBUG_MODE=true 来启用详细调试输出
+# 例如: DEBUG_MODE=true bash ./your_script.sh
+if [ "${DEBUG_MODE:-false}" = "true" ]; then
+    echo "DEBUG MODE IS ON. Verbose output enabled." >&2
+    set -x # Enable command tracing for debugging
+fi
 
 # === 全局变量定义 ===
 BASE_CONTAINER_NAME="nexus-node"
@@ -43,11 +60,15 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     bash \
     procps \
     locales \
+    tzdata \
     && rm -rf /var/lib/apt/lists/* \
     # 生成和设置UTF-8语言环境以避免某些容器运行时警告
     && locale-gen en_US.UTF-8 \
     && update-locale LANG=en_US.UTF-8 \
-    && echo "LANG=\"en_US.UTF-8\"" > /etc/default/locale
+    && echo "LANG=\"en_US.UTF-8\"" > /etc/default/locale \
+    # 设置时区，避免交互式提示
+    && ln -fs /usr/share/zoneinfo/Etc/UTC /etc/localtime \
+    && dpkg-reconfigure --frontend noninteractive tzdata
 
 ENV LANG en_US.UTF-8
 ENV LANGUAGE en_US:en
@@ -88,9 +109,6 @@ fi
 screen -S nexus -X quit >/dev/null 2>&1 || true
 
 echo "启动 nexus-network 节点..."
-# 以前在 screen 中运行 nexus-network，并重定向到 /root/nexus.log。
-# 现在直接在后台启动，然后用 tail -f 保持容器主进程存活并收集日志，这更符合Docker的日志机制。
-# 如果 nexus-network 停止，tail 会停止，容器会退出。
 nexus-network start --node-id "${NODE_ID}" &>> /root/nexus.log &
 NEXUS_PID=$!
 echo "Nexus Network 进程已在后台启动，PID: $NEXUS_PID"
@@ -98,19 +116,19 @@ echo "Nexus Network 进程已在后台启动，PID: $NEXUS_PID"
 # 简短的延迟，让 nexus 进程有机会启动并写入一些日志
 sleep 5
 
-# 检查 nexus 进程是否存活。使用 wait $NEXUS_PID 非阻塞等待一下，确保它不是秒退
-# 增加一个检查PID的循环，因为进程可能需要几秒钟来稳定启动
+# 检查 nexus 进程是否存活。增加重试机制。
 RETRY_COUNT=0
 MAX_RETRIES=10
 while ! ps -p "$NEXUS_PID" > /dev/null && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    echo "等待 Nexus 进程启动... (${RETRY_COUNT}/${MAX_RETRIES})"
+    echo "等待 Nexus 进程启动... (尝试 $((RETRY_COUNT + 1))/${MAX_RETRIES})"
     sleep 1
     RETRY_COUNT=$((RETRY_COUNT + 1))
 done
 
 if ! ps -p "$NEXUS_PID" > /dev/null; then
     echo "节点启动失败，进程未保持运行。请检查 /root/nexus.log"
-    tail -n 50 /root/nexus.log || true # Print last 50 lines if it exists
+    # Print last 50 lines for debugging, ignoring errors if file doesn't exist
+    tail -n 50 /root/nexus.log || true
     exit 1
 fi
 
@@ -121,7 +139,16 @@ echo "可以使用 docker logs \$CONTAINER_NAME 或 tail -f /root/nexus.log 查�
 # 保持容器运行，并通过tail -f显示日志
 echo "==== 实时日志 (Press Ctrl+C to exit) ===="
 # Use 'exec tail -f' to replace current shell with tail, ensuring correct PID 1 behavior
+# This means if tail exits (e.g., Ctrl+C), the container will stop.
 exec tail -f /root/nexus.log
+
+# This part will only be reached if tail -f somehow fails or exits without stopping container
+# Best practice for Docker: your ENTRYPOINT should run one main foreground process.
+# If 'tail -f' exits, kill the background nexus process to ensure container shuts down clean.
+# However, `exec tail -f` replaces the shell, so the shell won't reach here anyway.
+# This code block is largely symbolic unless `exec` is not used.
+wait $NEXUS_PID 2>/dev/null || true # Wait for nexus process to exit
+echo "Nexus process finished/container stopping."
 EOF
 )
 
@@ -148,8 +175,9 @@ function press_any_key() {
 }
 
 # 从用户那里获取多个 node-id
+# result_arr_name: 变量名，函数会将输入结果赋值给此全局数组
 function get_node_ids_from_user() {
-    local __result_arr_name=$1
+    local result_arr_name="$1"
     local ids_array=()
     echo ""
     echo_color blue "---------------------------------------------------------"
@@ -158,17 +186,18 @@ function get_node_ids_from_user() {
     echo_color blue "---------------------------------------------------------"
     
     local line_count=0
-    # Loop using 'read -r' for robust line reading, especially with unusual characters
-    while IFS= read -r line; do
-        if [ -z "$line" ]; then
-            continue # Allow empty lines during input, but don't store them
+    # Use 'read -r' for robust line reading. Add timeout and read from /dev/tty for interactive input.
+    while IFS= read -r -t 60 line < /dev/tty; do
+        # If line is empty or only whitespace, continue
+        if [ -z "$(echo "$line" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')" ]; then
+            break # Exit on empty line, indicates end of input
         fi
-        # Strip leading/trailing whitespace
-        line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-        if [ -n "$line" ]; then # Ensure line is not empty after stripping whitespace
-            ids_array+=("$line")
+        
+        local trimmed_line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+        if [ -n "$trimmed_line" ]; then
+            ids_array+=("$trimmed_line")
             line_count=$((line_count+1))
-            echo "已输入: $line (共 $line_count 个)"
+            echo "已输入: $trimmed_line (共 $line_count 个)"
         fi
     done
 
@@ -176,40 +205,39 @@ function get_node_ids_from_user() {
         echo_color yellow "未输入任何有效的 node-id。"
     fi
     
-    # 将 ids_array 的内容赋值回传入的数组名（__result_arr_name）。
-    # 使用 nameref (declare -n) 是 Bash 4.3+ 特性，如果 Bash 版本过老，它会导致问题。
-    # 鉴于脚本开头已经检查了 Bash 版本 >= 4.0，我们将避免直接使用 declare -n 这种方式
-    # 因为它的 Bash 兼容性更细微，不如直接全局数组赋值稳妥，
-    # 或者让调用者通过 read -ra 从函数的标准输出接收数组。
-    # 但最简单直接的方式还是确保这是一个全局变量，并直接赋值。
-    # 这里通过 eval 实现间接赋值，并确保声明为全局数组
-    eval "declare -ga $__result_arr_name" # Ensures the variable is an array in global scope
-    eval "$__result_arr_name=(\"${ids_array[@]}\")" # Assign the values. Direct expansion within double quotes is robust.
+    # 将 ids_array 的内容赋值回传入的数组名（result_arr_name）。
+    # 使用 eval 配合 declare -ga 来确保传入的名称在全局作用域中被正确创建/赋值为数组。
+    eval "declare -ga $result_arr_name"
+    eval "$result_arr_name=(\"${ids_array[@]}\")" # 使用 "${array[@]}" 进行扩展和双引号包裹，保证值中包含空格也能正确传递。
 }
 
 # --- OS Detection ---
 OS_FAMILY="unknown"
 function detect_os_family() {
-    # Check for /etc/os-release standard first
+    local family="unknown"
     if [ -f /etc/os-release ]; then
+        # Newer Linux systems
         if grep -qE "ID=(debian|ubuntu)" /etc/os-release 2>/dev/null; then
-            echo "debian"
-        elif grep -qE "ID=(centos|rhel|fedora)" /etc/os-release 2>/dev/null; then
-            echo "redhat"
-        elif grep -qE "ID=(almalinux|rocky)" /etc/os-release 2>/dev/null; then # Add modern RHEL clones
-            echo "redhat"
+            family="debian"
+        elif grep -qE "ID=(centos|rhel|fedora|almalinux|rocky)" /etc/os-release 2>/dev/null; then
+            family="redhat"
+        fi
+    elif [ -f /etc/lsb-release ]; then
+        # Older Ubuntu/Debian fallback
+        if grep -q "DISTRIB_ID=Ubuntu" /etc/lsb-release 2>/dev/null; then
+            family="debian"
         fi
     fi
-    # Fallback to older methods if /etc/os-release is not definitive or absent
-    if [ "$OS_FAMILY" = "unknown" ]; then
-        if [ -f /etc/debian_version ] || grep -q "Ubuntu" /etc/lsb-release 2>/dev/null; then
-            echo "debian"
-        elif [ -f /etc/redhat-release ] || grep -qE "CentOS|Red Hat|Fedora" /etc/issue 2>/dev/null; then
-            echo "redhat"
-        else
-            echo "unknown" # Still unknown
+
+    # Fallback for even older systems if /etc/os-release and /etc/lsb-release fail
+    if [ "$family" = "unknown" ]; then
+        if [ -f /etc/debian_version ]; then
+            family="debian"
+        elif [ -f /etc/redhat-release ] || [ -f /etc/centos-release ] || [ -f /etc/fedora-release ]; then
+            family="redhat"
         fi
     fi
+    echo "$family"
 }
 # Set OS_FAMILY at script startup once
 OS_FAMILY=$(detect_os_family)
@@ -218,79 +246,73 @@ OS_FAMILY=$(detect_os_family)
 
 function install_docker_debian() {
     echo_color yellow "正在安装 Docker (Debian/Ubuntu)..."
-    apt update -qq || true # Allow update to fail if repo temporarily unreachable
-    apt install -y ca-certificates curl gnupg lsb-release || true
+    apt update -qq || echo_color yellow "apt update 失败，可能存在网络问题或APT源配置不当。" # Allow update to fail gracefully
+    apt install -y ca-certificates curl gnupg lsb-release || echo_color red "安装基本工具失败。"
     
-    # Add Docker GPG key (new way)
-    rm -f /etc/apt/keyrings/docker.gpg || true # In case it doesn't exist
-    mkdir -m 0755 -p /etc/apt/keyrings || true
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg || true
-    chmod a+r /etc/apt/keyrings/docker.gpg # Ensure readable
+    # Add Docker GPG key (new way for modern Debian/Ubuntu)
+    rm -f /etc/apt/keyrings/docker.gpg 2>/dev/null || true # Ensure no old key exists
+    mkdir -m 0755 -p /etc/apt/keyrings || echo_color red "创建 /etc/apt/keyrings 目录失败。"
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg || echo_color red "下载 Docker GPG 密钥失败。"
+    chmod a+r /etc/apt/keyrings/docker.gpg # Ensure readable by all users (for apt)
     
-    # Add Docker repository (new way)
-    # Using '|| true' to make the echo fail gracefully if permissions issue.
-    # The 'tee' will manage writing to file, which is more critical.
+    # Add Docker repository
     echo \
       "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-      $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null || true
+      $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null || echo_color red "添加 Docker APT 源失败。"
     
-    apt update -qq
-    apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    apt update -qq || echo_color yellow "第二次 apt update 失败。"
+    apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || echo_color red "安装 Docker CE 组件失败。"
 
-    systemctl enable docker || true
-    systemctl start docker || true
+    systemctl enable docker &>/dev/null || echo_color yellow "启用 Docker 服务失败，可能不是Systemd系统。"
+    systemctl start docker &>/dev/null || echo_color yellow "启动 Docker 服务失败。"
 }
 
 function install_docker_redhat() {
     echo_color yellow "正在安装 Docker (CentOS/RHEL/Fedora/AlmaLinux/RockyLinux)..."
-    local yum_or_dnf="yum"
+    local pkg_manager="yum"
     if command -v dnf >/dev/null 2>&1; then
-        yum_or_dnf="dnf"
+        pkg_manager="dnf"
     fi
 
-    # Remove old Docker versions
-    $yum_or_dnf remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine >/dev/null 2>&1 || true
+    # Remove old Docker versions gracefully
+    "$pkg_manager" remove -y docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine &>/dev/null || true
 
-    # Install yum-utils and add Docker repo
-    # Some older RHEL versions might need `yum-utils`, dnf automatically includes what it needs
-    $yum_or_dnf install -y yum-utils device-mapper-persistent-data lvm2 || true
-    # For newer Fedora/RHEL derivatives, it's safer to use 'config-manager --add-repo' with direct URL
-    # or dnf-plugins-core
-    if command -v $yum_or_dnf >/dev/null 2>&1; then
-        $yum_or_dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo || true
-    else
-        echo_color red "Error: Neither yum nor dnf found. Cannot install Docker automatically."
-        exit 1
+    # Install yum-utils (or dnf-utils for dnf) and add Docker repo
+    "$pkg_manager" install -y yum-utils device-mapper-persistent-data lvm2 &>/dev/null || echo_color yellow "安装 yum-utils/dnf-utils 依赖失败。"
+    
+    # Check if config-manager is available
+    if ! command -v "$pkg_manager" config-manager >/dev/null 2>&1 && [ "$pkg_manager" = "yum" ]; then
+        echo_color yellow "yum-config-manager 未找到，尝试安装 dnf-plugins-core 或 yum-utils..."
+        "$pkg_manager" install -y dnf-plugins-core yum-utils || echo_color red "无法安装配置管理器工具。"
     fi
 
+    "$pkg_manager" config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo || echo_color red "添加 Docker Yum/DNF 源失败。"
 
     # Install Docker Engine
-    $yum_or_dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+    "$pkg_manager" install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin || echo_color red "安装 Docker CE 组件失败。"
 
-    systemctl enable docker || true
-    systemctl start docker || true
+    systemctl enable docker &>/dev/null || echo_color yellow "启用 Docker 服务失败，可能不是Systemd系统。"
+    systemctl start docker &>/dev/null || echo_color yellow "启动 Docker 服务失败。"
 }
 
 # === Node.js/PM2 Installation Functions by OS ===
 
 function install_nodejs_npm_debian() {
     echo_color yellow "正在安装 Node.js 18.x (Debian/Ubuntu)..."
-    # Remove existing nodesource lists to avoid conflicts
-    rm -f /etc/apt/sources.list.d/nodesource.list || true
-    curl -fsSL https://deb.nodesource.com/setup_18.x | bash - || true # The script needs bash or sh, but usually executes fine
-    apt-get install -y nodejs
+    rm -f /etc/apt/sources.list.d/nodesource.list 2>/dev/null || true # Clean old NodeSource entries
+    curl -fsSL https://deb.nodesource.com/setup_18.x | bash - || echo_color red "Node.js 安装脚本下载或执行失败。" # NodeSource script often needs specific shell behavior
+    apt-get install -y nodejs || echo_color red "安装 Node.js 包失败。"
 }
 
 function install_nodejs_npm_redhat() {
     echo_color yellow "正在安装 Node.js 18.x (CentOS/RHEL/Fedora/AlmaLinux/RockyLinux)..."
-    local yum_or_dnf="yum"
+    local pkg_manager="yum"
     if command -v dnf >/dev/null 2>&1; then
-        yum_or_dnf="dnf"
+        pkg_manager="dnf"
     fi
 
-    # Install NodeSource Node.js 18.x RPM
-    curl -fsSL https://rpm.nodesource.com/setup_18.x | bash - || true # The script needs bash or sh, but usually executes fine
-    $yum_or_dnf install -y nodejs
+    curl -fsSL https://rpm.nodesource.com/setup_18.x | bash - || echo_color red "Node.js 安装脚本下载或执行失败。"
+    "$pkg_manager" install -y nodejs || echo_color red "安装 Node.js 包失败。"
 }
 
 # === Main Checks ===
@@ -309,7 +331,7 @@ function check_docker() {
         esac
 
         if ! command -v docker >/dev/null 2>&1; then
-            echo_color red "Docker 安装失败，请检查日志并手动安装。"
+            echo_color red "Docker 安装失败，请检查上述日志或手动安装。"
             exit 1
         else
             echo_color green "Docker 安装成功并已启动。"
@@ -317,13 +339,13 @@ function check_docker() {
     else
         echo_color green "Docker 已安装。"
     fi
-    # Check if Docker daemon is running and current user can use it
-    docker info >/dev/null 2>&1 || { 
-        echo_color red "Docker 服务未运行或当前用户无权限。请尝试以下操作："
-        echo_color red "1. 启动 Docker 服务: 'sudo systemctl start docker'"
-        echo_color red "2. 如果是新安装Docker，请将当前用户添加到 'docker' 用户组并重新登录: 'sudo usermod -aG docker \$USER && newgrp docker'"
+    # Check if Docker daemon is running and current user has permissions
+    if ! docker info >/dev/null 2>&1; then
+        echo_color red "Docker 服务未运行或当前用户无权限。请尝试以下操作：" >&2
+        echo_color red "1. 启动 Docker 服务: 'sudo systemctl start docker'" >&2
+        echo_color red "2. 如果是新安装Docker，请将当前用户添加到 'docker' 用户组并重新登录: 'sudo usermod -aG docker \$USER && newgrp docker' 或完全重新登录SSH会话。" >&2
         exit 1
-    }
+    fi
     echo ""
 }
 
@@ -352,13 +374,13 @@ function check_pm2() {
 
     if ! command -v pm2 >/dev/null 2>&1; then
         echo_color yellow "检测到未安装 pm2，正在安装..."
-        npm install -g pm2
+        npm install -g pm2 || echo_color red "PM2 安装失败，请检查 npm 配置和网络连接。"
         if ! command -v pm2 >/dev/null 2>&1; then
             echo_color red "pm2 安装失败，请检查日志。"
             exit 1
         fi
         echo_color green "pm2 安装成功。"
-        pm2 save >/dev/null 2>&1 || true # Save process list for future restarts
+        pm2 save >/dev/null 2>&1 || true # Save process list for future restarts (non-critical if it fails)
     else
         echo_color green "pm2 已安装。"
     fi
@@ -370,22 +392,23 @@ function build_image() {
     echo_color blue "=== 构建 Docker 镜像 ==="
     # 使用一个确定性的临时目录，并设置trap确保清理
     mkdir -p "$SCRIPT_TMP_DIR"
-    # 在脚本退出时自动清理临时目录
-    # 注意：这个 trap 是在主脚本层面的，如果在 sub-shell 中出现错误，它不一定触发
-    # 所以 sub-scripts 也需要自己的清理或更可靠的错误处理。
-    trap "rm -rf '$SCRIPT_TMP_DIR' 2>/dev/null; echo_color red '脚本非正常退出，临时文件已清理。'" EXIT
+    # 在脚本退出时自动清理临时目录。注意：trap只作用于当前shell进程。
+    trap "rm -rf '$SCRIPT_TMP_DIR' 2>/dev/null; echo_color red '脚本执行完毕或非正常退出，临时文件已清理。'" EXIT
 
     echo "${DOCKERFILE_CONTENT}" > "${SCRIPT_TMP_DIR}/Dockerfile"
     echo "${ENTRYPOINT_CONTENT}" > "${SCRIPT_TMP_DIR}/entrypoint.sh"
 
     # 添加 --progress=plain 选项，显示详细构建日志
+    echo "正在从 $SCRIPT_TMP_DIR 构建镜像 '$IMAGE_NAME'..."
     if docker build -t "$IMAGE_NAME" --progress=plain "$SCRIPT_TMP_DIR"; then
         echo_color green "Docker 镜像 '$IMAGE_NAME' 构建成功。"
     else
         echo_color red "Docker 镜像构建失败，请检查上述错误信息。"
-        exit 1
+        # Do not exit here; allow user to retry or troubleshoot later, just return non-zero
+        return 1
     fi
     echo ""
+    return 0
 }
 
 # 启动容器（挂载宿主机日志文件）
@@ -420,8 +443,10 @@ function run_container() {
     if docker run -d --name "$container_name" -v "$log_file":/root/nexus.log -e NODE_ID="$node_id" "$IMAGE_NAME"; then
         echo_color green "容器 '$container_name' 已启动！"
         echo_color green "查看日志请执行：'docker logs -f $container_name'"
+        return 0
     else
         echo_color red "容器 '$container_name' 启动失败。请检查 Docker 日志或运行 'docker logs $container_name' 查看详情。"
+        return 1
     fi
 }
 
@@ -433,10 +458,10 @@ function uninstall_node() {
 
     echo "停止并删除容器 '$container_name'..."
     if docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
-        docker rm -f "$container_name" >/dev/null || echo_color yellow "警告：无法删除容器 '$container_name'。"
+        docker rm -f "$container_name" >/dev/null || echo_color yellow "警告：无法删除容器 '$container_name' (可能权限不足或其他问题)。"
         echo_color green "容器 '$container_name' 已删除。"
     else
-        echo_color yellow "容器 '$container_name' 不存在，跳过删除。"
+        echo_color yellow "容器 '$container_name' 不存在或已停止，跳过删除。"
     fi
 
     if [ -f "$log_file" ]; then
@@ -474,12 +499,12 @@ function list_nodes() {
         
         local container_status=""
         local container_created=""
-        local stats_output=""
         local cpu_usage="N/A"
         local mem_usage="N/A"
         local mem_limit="N/A"
 
         # Check if container exists first
+        # docker ps -a -q checks existence by ID, safer than relying solely on name match (partial matches)
         if docker ps -a --filter "name=$container_name" --format '{{.ID}}' | grep -q .; then
             found_any_node=true
             container_status=$(docker ps -a --filter "name=$container_name" --format "{{.Status}}" 2>/dev/null | head -n 1)
@@ -487,31 +512,29 @@ function list_nodes() {
 
             # Try to get docker stats only if the container is running
             if [[ "$container_status" == Up* ]]; then
-                stats_output=$(docker stats --no-stream --format "{{.CPUPerc}}::{{.MemUsage}}" "$container_name" 2>/dev/null)
+                local stats_output=$(docker stats --no-stream --format "{{.CPUPerc}}::{{.MemUsage}}" "$container_name" 2>/dev/null)
                 if [ -n "$stats_output" ]; then
                     IFS='::' read -r cpu_percent mem_full <<< "$stats_output"
                     cpu_usage="$cpu_percent"
                     
                     # Split memory usage string (e.g., "1.23MiB / 2GiB")
-                    # Assuming format "XXXUnit / YYYUnit"
                     local parts=($mem_full)
                     mem_usage="${parts[0]} ${parts[1]}" # e.g. "1.23 MiB"
                     mem_limit="${parts[3]} ${parts[4]}" # e.g. "2 GiB" (if parts[2] is '/')
                 fi
             fi
 
-            # Color the status output
+            # Color the status output. sed removes ANSI codes for alignment.
             local display_status_colored=""
-            local display_status=$(echo "$container_status" | cut -d' ' -f1) # Get first word like "Up" or "Exited"
-            if [[ "$display_status" == "Up" ]]; then
+            local display_status_short=$(echo "$container_status" | cut -d' ' -f1) # "Up" or "Exited"
+            if [[ "$display_status_short" == "Up" ]]; then
                 display_status_colored=$(echo_color green "${container_status}")
-            elif [[ "$display_status" == "Exited" ]]; then
+            elif [[ "$display_status_short" == "Exited" ]]; then
                 display_status_colored=$(echo_color red "${container_status}")
             else
-                display_status_colored=$(echo_color yellow "${container_status}")
+                display_status_colored=$(echo_color yellow "${container_status}") # Unknown/Other status
             fi
             
-            # Print row. `sed` removes ANSI codes for string length calculation for alignment.
             printf "%-6d %-20s %-25s %-12s %-12s %-10s %-25s\n" \
                 $((i+1)) \
                 "$node_id" \
@@ -644,19 +667,26 @@ function batch_start_nodes() {
     fi
 
     echo_color blue "开始构建镜像 (如果需要或尚未构建)..."
-    build_image
+    if ! build_image; then
+        echo_color red "镜像构建失败，无法继续批量启动。"
+        press_any_key
+        return
+    fi
 
     echo_color blue "开始启动节点..."
     local start_count=0
     for node_id in "${node_ids_array[@]}"; do
-        run_container "$node_id"
-        start_count=$((start_count+1))
-        # 进度提示
-        echo_color blue "已启动 ${start_count}/${#node_ids_array[@]} 个节点..."
-        sleep 1 # 添加短暂延迟，避免同时启动太多容器对系统造成冲击
+        if run_container "$node_id"; then
+            start_count=$((start_count+1))
+            echo_color blue "已启动 ${start_count}/${#node_ids_array[@]} 个节点..."
+            sleep 1 # 添加短暂延迟，避免同时启动太多容器对系统造成冲击
+        else
+            echo_color red "节点 '$node_id' 启动失败，继续尝试启动下一个节点..."
+            sleep 1
+        fi
     done
 
-    echo_color green "所有指定节点启动完成！"
+    echo_color green "所有指定节点启动尝试完成！成功启动 $start_count 个节点。"
     echo_color blue "使用 '2. 显示所有节点状态' 查看节点信息。"
     press_any_key
 }
@@ -706,7 +736,8 @@ function batch_uninstall_nodes() {
 
     # 将输入的选项转换为数组
     local selected_indices=()
-    read -ra selected_indices <<< "$choices_input" # Reads into an array, splitting by whitespace
+    # Robustly parse choices_input. read -ra is Bash 4+, checked earlier.
+    read -ra selected_indices <<< "$choices_input" 
 
     # 过滤掉重复和无效的选项
     local unique_selected_indices=()
@@ -748,13 +779,16 @@ function batch_uninstall_nodes() {
     fi
 
     echo_color blue "开始卸载选定节点..."
+    local uninstall_count=0
     for choice_idx in "${unique_selected_indices[@]}"; do
         local selected_node=${all_nodes_array[$((choice_idx-1))]}
         uninstall_node "$selected_node"
+        uninstall_count=$((uninstall_count+1))
+        echo_color blue "已卸载 ${uninstall_count}/${#unique_selected_indices[@]} 个节点..."
         sleep 0.5 # Give a small breather between deletions
     done
 
-    echo_color green "批量卸载完成！"
+    echo_color green "批量卸载完成！成功卸载 $uninstall_count 个节点。"
     press_any_key
 }
 
@@ -785,11 +819,14 @@ function uninstall_all_nodes() {
     echo_color blue "开始删除所有节点..."
     # Stop and remove all managed Docker containers
     local containers_to_delete=$(docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format '{{.Names}}')
+    local deleted_count=0
     if [ -n "$containers_to_delete" ]; then
         echo "$containers_to_delete" | while read -r container_name; do
             echo "正在停止并删除容器 '$container_name'..."
             docker rm -f "$container_name" || echo_color yellow "警告：无法删除容器 '$container_name'。"
+            deleted_count=$((deleted_count+1)) # This variable update is local to subshell
         done
+        echo_color green "所有 Nexus 容器已尝试删除。"
     else
         echo_color yellow "没有找到任何 Nexus 容器可供删除。"
     fi
@@ -822,7 +859,7 @@ function uninstall_all_nodes() {
         fi
     fi
 
-    echo_color green "所有 Nexus 节点已删除完成！"
+    echo_color green "所有 Nexus 节点相关内容已删除完成！"
     press_any_key
 }
 
@@ -842,7 +879,6 @@ function batch_rotate_nodes() {
 
     # 过滤掉重复的 node-id，确保每个ID只使用一次
     local unique_node_ids_arr=()
-    # Use printf for reliable newline separation and then sort -u.
     mapfile -t unique_node_ids_arr < <(printf "%s\n" "${all_input_node_ids[@]}" | sort -u)
 
     local total_nodes=${#unique_node_ids_arr[@]}
@@ -890,7 +926,11 @@ function batch_rotate_nodes() {
     fi
 
     echo_color blue "开始构建镜像 (如果需要或尚未构建)..."
-    build_image
+    if ! build_image; then
+        echo_color red "镜像构建失败，无法启动轮换进程。"
+        press_any_key
+        return
+    fi
 
     # 清理旧的 pm2 进程
     echo_color yellow "停止并删除旧的轮换进程 'nexus-rotate' (如果存在)..."
@@ -903,10 +943,9 @@ function batch_rotate_nodes() {
 
     # Generate the rotation script for PM2
     # Ensure all variables are properly expanded and quoted to preserve them
-    local NODE_IDS_STRING_FOR_PM2=""
-    if [ ${#unique_node_ids_arr[@]} -gt 0 ]; then
-        NODE_IDS_STRING_FOR_PM2="$(printf "%s " "${unique_node_ids_arr[@]}")"
-    fi
+    # For robustness, we will pass the list of nodes as a newline-separated string
+    # and then read them into an array inside the rotated script.
+    local NODE_IDS_LIST_STRING="$(printf "%s\n" "${unique_node_ids_arr[@]}")"
 
     cat > "$script_dir/rotate.sh" <<EOF
 #!/bin/bash
@@ -915,12 +954,13 @@ set -euo pipefail
 BASE_CONTAINER_NAME="${BASE_CONTAINER_NAME}"
 IMAGE_NAME="${IMAGE_NAME}"
 LOG_DIR="${LOG_DIR}"
-NODE_IDS_LIST="${NODE_IDS_STRING_FOR_PM2}" # Store as space-separated string
 NODES_PER_ROUND=${nodes_per_round}
 ROTATE_INTERVAL_SECONDS=${rotate_interval_seconds}
 
-# Re-create TOTAL_NODE_IDS array from NODE_IDS_LIST string. This handles IDs with spaces better.
-read -ra TOTAL_NODE_IDS <<< "\$NODE_IDS_LIST"
+# Read node IDs into an array
+# Using IFS=\$'\n' to correctly handle IDs with spaces or other special chars (though unlikely for Node IDs)
+# And `mapfile` which is reliable.
+mapfile -t TOTAL_NODE_IDS <<< "${NODE_IDS_LIST_STRING}"
 TOTAL_NODES_COUNT=\${#TOTAL_NODE_IDS[@]}
 
 CURRENT_NODE_INDEX=0 # Global index to track starting node for current round
@@ -935,24 +975,21 @@ function run_single_container() {
     local log_file="\${LOG_DIR}/nexus-\${node_id}.log"
 
     mkdir -p "\${LOG_DIR}"
-    if [ -d "\$log_file" ]; then rm -rf "\$log_file"; fi
+    if [ -d "\$log_file" ]; then rm -rf "\$log_file"; fi # Clean up if it was a directory from prior error
     if [ ! -f "\$log_file" ]; then touch "\$log_file"; chmod 644 "\$log_file"; fi
 
     docker rm -f "\$container_name" >/dev/null 2>&1 || true
 
     log_message "    启动节点: \$node_id (容器: \$container_name)"
-    docker run -d --name "\$container_name" -v "\$log_file":/root/nexus.log -e NODE_ID="\$node_id" "\$IMAGE_NAME" &> /dev/null
-    
-    sleep 3
-    
-    if docker ps -a --format '{{.Names}}' | grep -qw "\$container_name"; then
+    if docker run -d --name "\$container_name" -v "\$log_file":/root/nexus.log -e NODE_ID="\$node_id" "\$IMAGE_NAME" &> /dev/null; then
+        sleep 3 # Give it a moment to initialize
         if docker inspect --format='{{.State.Running}}' "\$container_name" 2>/dev/null | grep -q "true"; then
             log_message "      节点 \$node_id 启动成功。"
         else
-            log_message "      节点 \$node_id 启动，但未运行起来。检查 docker logs \$container_name。"
+            log_message "      节点 \$node_id 启动，但容器未运行起来。检查 docker logs \$container_name。"
         fi
     else
-        log_message "      节点 \$node_id 容器未成功创建！"
+        log_message "      节点 \$node_id 容器未成功创建或启动失败！"
     fi
 }
 
@@ -961,12 +998,11 @@ function stop_all_managed_containers() {
     local containers_to_stop
     containers_to_stop=\$(docker ps -a --filter "name=\${BASE_CONTAINER_NAME}-" --format '{{.Names}}')
     if [ -n "\$containers_to_stop" ]; then
-        echo "\$containers_to_stop" | xargs -r docker rm -f || true
+        echo "\$containers_to_stop" | xargs -r docker rm -f || true # xargs -r for empty input protection
         log_message "  所有旧容器已清理。"
     else
         log_message "  没有找到运行中的Nexus节点容器。"
-    fi
-}
+    X}
 
 while true; do
     log_message "=========================================================="
@@ -975,7 +1011,6 @@ while true; do
 
     stop_all_managed_containers
 
-    # Exit if TOTAL_NODES_COUNT is 0 to prevent infinite loop or errors
     if [ "\${TOTAL_NODES_COUNT}" -eq 0 ]; then
         log_message "错误: 未配置任何节点进行轮换。退出轮换进程。"
         exit 1
@@ -995,8 +1030,7 @@ while true; do
     done
 
     log_message "本轮节点启动完毕。"
-    # Display the first node of the current rotation batch
-    log_message "更新下次启动索引: 从节点 ${current_round_nodes[0]} (内部列表起始索引: \${CURRENT_NODE_INDEX})。"
+    log_message "更新下次启动索引: 从节点 ${current_round_nodes[0]:-}(内部列表起始索引: \${CURRENT_NODE_INDEX})。"
     CURRENT_NODE_INDEX=\$(( (\${CURRENT_NODE_INDEX} + \${NODES_PER_ROUND}) % \${TOTAL_NODES_COUNT} ))
     
     log_message "----------------------------------------------------------"
@@ -1010,15 +1044,16 @@ EOF
     chmod +x "$script_dir/rotate.sh"
 
     # 使用 pm2 启动轮换脚本
+    echo_color blue "使用 PM2 启动轮换进程..."
     # 增加 --output 和 --error 选项以捕获 pm2 自身输出和错误日志
-    pm2 start "$script_dir/rotate.sh" --name "nexus-rotate" --output "$script_dir/rotate_output.log" --error "$script_dir/rotate_error.log"
-    pm2 save
+    pm2 start "$script_dir/rotate.sh" --name "nexus-rotate" --output "$script_dir/rotate_output.log" --error "$script_dir/rotate_error.log" --time
+    pm2 save || echo_color yellow "PM2 配置保存失败，可能需要手动 'pm2 save'。"
 
     echo_color green "节点轮换已启动并由 PM2 管理！"
     echo_color blue "总共 $total_nodes 个唯一节点，每轮启动 $nodes_per_round 个节点。"
     echo_color blue "每 ${rotate_interval_hours} 小时轮换一次，确保节点持续在线且循环运行。"
     echo_color blue "使用 'pm2 status' 查看 PM2 进程状态。"
-    echo_color blue "使用 'pm2 logs nexus-rotate' 查看轮换进程的实时日志。"
+    echo_color blue "使用 'pm2 logs nexus-rotate --lines 50' 查看轮换进程的实时日志。"
     echo_color blue "使用 'pm2 stop nexus-rotate' 停止轮换， 'pm2 delete nexus-rotate' 删除轮换进程。"
     echo_color blue "注意：如果您想暂停，请使用 'pm2 stop nexus-rotate'；想要彻底移除，使用 'pm2 delete nexus-rotate' 后，请手动执行 6.删除全部节点 或 3.批量停止并卸载指定节点 再次清理已启动的容器。"
 
@@ -1031,28 +1066,28 @@ function setup_log_cleanup_cron() {
     echo_color blue "=== 设置日志清理定时任务 ==="
     # 清理日志，只保留最近2天的日志文件。确保 LOG_DIR 存在且是非空的，避免 `find` 错误
     local real_log_dir
-    # Safely get realpath; if command fails (e.g., directory doesn't exist yet), fall back to original.
     if command -v realpath >/dev/null 2>&1; then
         real_log_dir=$(realpath "$LOG_DIR" 2>/dev/null || echo "$LOG_DIR")
     else
-        real_log_dir="$LOG_DIR"
+        real_log_dir="$LOG_DIR" # Fallback if realpath is not available
     fi
     
     local cron_job_comment="# Nexus node log cleanup: Keep logs for 2 days. Created by nexus-node-manager.sh"
+    # Ensure -maxdepth 1 to only affect files directly in LOG_DIR, not subdirectories.
     local cron_job_cmd="0 3 * * * find \"$real_log_dir\" -maxdepth 1 -type f -name 'nexus-*.log' -mtime +2 -delete"
 
-    # Combine comment and command
     local full_cron_entry="${cron_job_comment}\n${cron_job_cmd}"
 
     # Check if a similar task already exists using grep -q for a unique part of the command
-    if crontab -l 2>/dev/null | grep -qF "find \"$real_log_dir\" -maxdepth 1 -type f -name 'nexus-*.log' -mtime +2 -delete"; then
+    # Filter out previous similar cron jobs to avoid duplicates before adding new one
+    local existing_crontab_filtered
+    existing_crontab_filtered=$(crontab -l 2>/dev/null | awk '!/Nexus node log cleanup: Keep logs for 2 days\.|find \".*nexus_logs\".*-maxdepth 1 -type f -name '\''nexus-*\.log'\'' -mtime \+2 -delete/ {print}')
+
+    # Add the new cron entry only if it doesn't already exist literally
+    if echo "$existing_crontab_filtered" | grep -qF "$cron_job_cmd"; then
         echo_color green "日志清理定时任务已存在，无需重复设置。"
     else
-        # Append or create定时任务
-        # Remove existing older cleanup lines if they only contain comment/command and no other variations
-        # Use awk for safer deletion to prevent issues with multiple same lines or specific older cron entries.
-        # This awk command filters out any previous lines containing "find" on "nexus_logs" and "Nexus node log cleanup" comments.
-        (crontab -l 2>/dev/null | awk '!/find \".*nexus_logs\".*nexus-.*\.log/ && !/Nexus node log cleanup/ {print}' ; echo -e "$full_cron_entry") | crontab -
+        echo -e "$existing_crontab_filtered\n$full_cron_entry" | crontab -
         echo_color green "已设置每2天自动清理过期 Nexus 日志的任务（保留最近2天）。"
     fi
     echo ""
@@ -1060,9 +1095,8 @@ function setup_log_cleanup_cron() {
 
 # 主菜单
 function main_menu() {
-    # Set the trap just once for the main script
-    # It attempts to clean up temp build directory on script exit/error.
-    trap "rm -rf '$SCRIPT_TMP_DIR' 2>/dev/null; echo_color red '脚本非正常退出或已完成，临时文件已清理。'" EXIT
+    # Set the trap just once for the main script, on script exit/error.
+    trap "rm -rf '$SCRIPT_TMP_DIR' 2>/dev/null; echo_color red '脚本执行完毕或非正常退出，临时构建文件已清理。'" EXIT
     
     setup_log_cleanup_cron # 每次启动脚本都确保定时任务已设置
 
@@ -1073,6 +1107,7 @@ function main_menu() {
         echo ""
         echo_color blue "========== Nexus 多节点管理 =========="
         echo_color blue "当前检测到操作系统家族: $(echo_color yellow "$OS_FAMILY")"
+        echo_color blue "当前Bash版本: $(echo_color yellow "$BASH_VERSION")"
         echo_color blue "------------------------------------"
         echo_color blue "1. 安装并启动新节点 (单个)"
         echo_color blue "2. 显示所有节点状态"
@@ -1083,9 +1118,10 @@ function main_menu() {
         echo_color blue "7. 退出"
         echo_color blue "==================================="
 
+        local choice
         read -rp "$(echo_color blue "请输入选项(1-7): ")" choice
 
-        case "$choice" in # Quote choice to prevent globbing
+        case "$choice" in
             1)
                 check_docker
                 read -rp "$(echo_color blue "请输入您的 node-id: ")" NODE_ID
@@ -1094,9 +1130,13 @@ function main_menu() {
                     press_any_key
                     continue
                 fi
-                build_image
+                if ! build_image; then # Check if image build succeeded
+                    echo_color red "无法构建Docker镜像，无法启动节点。"
+                    press_any_key
+                    continue
+                fi
                 run_container "$NODE_ID"
-                echo_color green "单个节点 '$NODE_ID' 启动成功！请等待其数据同步。"
+                echo_color green "单个节点 '$NODE_ID' 启动流程完成。"
                 press_any_key
                 ;;
             2)
