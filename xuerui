@@ -234,7 +234,8 @@ LABEL description="Nexus Node Image"
 # 设置非交互模式，防止 apt 命令弹出确认对话框
 ENV DEBIAN_FRONTEND=noninteractive
 # !!! 确保 ENV 值都加上双引号，以防 shell 解释或 # 注释的混淆 !!!
-ENV NODE_ID="" # 节点ID由 Docker 运行时注入
+# 节点ID由 Docker 运行时注入
+ENV NODE_ID="" 
 ENV PROVER_ID_FILE="/root/.nexus/node-id"
 
 # 安装基本工具和 Nexus 运行所需的环境
@@ -725,7 +726,7 @@ function batch_rotate_nodes() {
 
     # 输入验证
     if ! [[ "$nodes_per_round" =~ ^[1-9][0-9]*$ ]] || [ "$nodes_per_round" -gt "$total_nodes" ]; then
-        echo "输入无效。请确保每批启动的节点数量是大于等于 1 的整数，并且不超过总节点数 (${total_nodes})。"
+        echo "输入无效。请确保每批启动的节点数量是大于等于 1 的整数，并且不超过总节点数 (${total_nodes})"。"
         read -p "按任意键返回..."
         return
     fi
@@ -796,7 +797,23 @@ EOF
             mkdir -p "$LOG_DIR" && touch "$log_file" && chmod 644 "$log_file" && chown $(whoami):$(whoami) "$log_file"
 
             echo "echo \"[$(date '+%Y-%m-%d %H:%M:%S')]  ->  尝试启动节点 '$node_id' (容器: '$container_name')\"" >> "$group_script"
-            echo "run_container \"$node_id\"" >> "$group_script"
+            # 这里的 run_container 调用需要被替换为实际的 docker run 命令，因为 group_script 是独立的，不能调用父脚本的函数
+            # 但是，由于 run_container 函数内部已包含 Docker 资源限制逻辑，直接拷贝更完整且减少重复代码。
+            # 更好的做法是在 rotate_manager.sh 中通过 source 命令包含主脚本，以便可以调用 run_container。
+            # 为了简单起见，我这里选择把核心逻辑直接放到 start_group*.sh 中，但需要对 run_container 做精简或提取。
+            # 最简单粗暴但也有效的：直接复制 run_container 的核心 docker run 命令
+            echo "local MEM_LIMIT=\"${DEFAULT_MEMORY_LIMIT}\"" >> "$group_script"
+            echo "local CPUS_LIMIT=\"${DEFAULT_CPUS_LIMIT}\"" >> "$group_script"
+            echo "local NODE_IMAGE_NAME=\"${IMAGE_NAME}\"" >> "$group_script"
+            
+            # 使用docker run 命令，保持和run_container相同的逻辑
+            echo "docker run -d \\" >> "$group_script"
+            echo "        --name \"${container_name}\" \\" >> "$group_script"
+            echo "        --memory \"\${MEM_LIMIT}\" \\" >> "$group_script"
+            echo "        --cpus \"\${CPUS_LIMIT}\" \\" >> "$group_script"
+            echo "        -v \"${log_file}\":\"/root/nexus.log\" \\" >> "$group_script"
+            echo "        -e NODE_ID=\"${node_id}\" \\" >> "$group_script"
+            echo "        \"\${NODE_IMAGE_NAME}\" > /dev/null" >> "$group_script"
             echo "if [ \$? -eq 0 ]; then" >> "$group_script"
             echo "  echo \"[$(date '+%Y-%m-%d %H:%M:%S')]      ->  节点 '$node_id' 启动命令执行成功（请通过 list_nodes 或 docker logs 确认实际状态）\"" >> "$group_script"
             echo "else" >> "$group_script"
