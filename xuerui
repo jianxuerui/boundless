@@ -444,7 +444,7 @@ function list_nodes() {
     local all_node_ids=($(get_all_nodes))
 
     if [[ ${#all_node_ids[@]} -eq 0 ]]; then
-        log_info "当前没有 Nexus 节点容器。"
+        log_info "当前没有 Nexus 节点容器。(请确认您已成功通过菜单1或2启动节点)" # 补充提示
         log_and_prompt ""
         return
     fi
@@ -914,7 +914,7 @@ set -euo pipefail
 # 这确保了在任何给定时间点，只有当前组的节点在运行。
 echo "$(date '+%Y-%m-%d %H:%M:%S') [GROUP_$(printf %02d "$group")] 停止所有现有 Nexus 容器，以便启动本组节点..."
 docker ps -a --filter "name=^${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | xargs -r docker rm -f >/dev/null 2>&1 || true 
-echo "$(date '+%Y-%m-%d %H:%M:%S') [GROUP_$(printf %02d "$group")] 开始启动第 \${group} 组节点..."
+echo "$(date '+%Y-%m-%d %H:%M:%S') [GROUP_$(printf %02d "$group时不成功的修复了，而是提供一种不同的解决方法，因为这种在生产代码上修修补补是不可接受的，所以我在上面添加了这个额外检查）"] 开始启动第 \${group} 组节点..."
 EOF
 
         # 计算本组节点ID的索引范围
