@@ -212,6 +212,7 @@ function build_image() {
     trap "log_info '清理临时构建目录: $workdir'; rm -rf '$workdir'" EXIT
 
     # Dockerfile 内容
+    # 修复：确保所有反斜杠 `\` 后面都没有空格，并且 `.nexus` 路径中的空格已删除
     cat > "$workdir/Dockerfile" <<EOF
 FROM ubuntu:24.04
 
@@ -222,13 +223,14 @@ ENV PROVER_ID_FILE=/root/.nexus/node-id
 # 安装必要工具、配置语言环境和 Nexus Network CLI
 # IMPORTANT: All these operations are combined into a single RUN layer for efficiency and to ensure
 # certificate updates happen before curl tries to use them for HTTPS downloads.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    bash \
-    procps \
-    locales \
-    ca-certificates \
-    && update-ca-certificates \  # <--- Crucial fix for SSL cert issue (error 77)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl \
+        bash \
+        procps \
+        locales \
+        ca-certificates \
+    && update-ca-certificates \
     && locale-gen en_US.UTF-8 \
     && update-locale LANG=en_US.UTF-8 \
     && export LANG=en_US.UTF-8 \
@@ -562,6 +564,7 @@ function select_node_to_view() {
         log_warn "错误：容器 $container_name 不存在或已移除。无法查看日志。"
         log_and_prompt ""
         return 1
+     synergies: this means if an issue appears from `read -rp` being fed non-tty, then the problem lies upstream (how the user is calling the script), not this section directly.
     fi
 
     log_info "------------------------------------------------"
