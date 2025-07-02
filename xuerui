@@ -94,7 +94,7 @@ function check_docker() {
         else
              # Fallback for older systems
              log_warn "新的 Docker APT 仓库添加方式失败，尝试旧方式。"
-             if ! add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $os_codename stable"; then
+             if ! add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu "$os_codename" stable"; then
                  log_error "添加 Docker APT 仓库失败。";
              fi
         fi
@@ -120,6 +120,7 @@ function check_docker() {
 # 检查并安装 Node.js/npm/pm2
 function check_pm2() {
     local installed_node=false
+    local installed_npm=false
     local installed_pm2=false
 
     if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
@@ -133,6 +134,7 @@ function check_pm2() {
             if apt-get install -y nodejs; then
                 log_info "Node.js/npm 安装完成。"
                 installed_node=true
+                installed_npm=true
             else
                 log_error "安装 Node.js 失败。"
             fi
@@ -141,22 +143,40 @@ function check_pm2() {
         fi
     else
         log_info "Node.js/npm 已安装。"
+        installed_node=true
+        installed_npm=true
     fi
 
-    if ! command -v pm2 >/dev/null 2>&1; then
-        log_info "检测到未安装 pm2，正在尝试安装..."
-        log_info "安装 pm2 (全局)..."
-        npm cache clean --force >/dev/null 2>&1 || log_warn "npm 缓存清理失败，可能不会影响 PM2 安装。"
-        if npm install -g pm2; then
-            log_info "pm2 安装完成。"
-            installed_pm2=true
+    # Check for npm command specifically if node is installed but npm isn't for some reason.
+    if [[ "$installed_node" == true ]] && ! command -v npm >/dev/null 2>&1; then
+        log_warn "Node.js 已安装但 npm 命令缺失。尝试安装 npm..."
+        if apt install -y npm; then
+            log_info "npm 安装完成。"
+            installed_npm=true
         else
-            log_error "安装 pm2 失败。请检查 npm 安装是否正常或网络连接。"
+            log_error "安装 npm 失败。请检查系统源或网络。"
+        fi
+    fi
+
+    if [[ "$installed_npm" == true ]]; then
+        if ! command -v pm2 >/dev/null 2>&1; then
+            log_info "检测到未安装 pm2，正在尝试安装..."
+            log_info "安装 pm2 (全局)..."
+            npm cache clean --force >/dev/null 2>&1 || log_warn "npm 缓存清理失败，可能不会影响 PM2 安装。"
+            if npm install -g pm2; then
+                log_info "pm2 安装完成。"
+                installed_pm2=true
+            else
+                log_error "安装 pm2 失败。请检查 npm 安装是否正常或网络连接。"
+            fi
+        else
+            log_info "pm2 已安装。"
+            installed_pm2=true
         fi
     else
-        log_info "pm2 已安装。"
-        installed_pm2=true
+        log_warn "NPM 未安装或安装失败，无法检查或安装PM2。PM2是Node.js工具，依赖NPM。"
     fi
+
 
     if [[ "$installed_pm2" == true ]]; then
         log_info "尝试配置 PM2 为系统启动服务..."
@@ -199,25 +219,24 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PROVER_ID_FILE=/root/.nexus/node-id
 
-# 安装必要工具和 Nexus Network CLI
+# 安装必要工具、配置语言环境和 Nexus Network CLI
+# IMPORTANT: All these operations are combined into a single RUN layer for efficiency and to ensure
+# certificate updates happen before curl tries to use them for HTTPS downloads.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     bash \
     procps \
     locales \
-    && rm -rf /var/lib/apt/lists/*
-
-# 确保 locales 设置正确，避免 Nexus Network 的启动警告或错误
-RUN locale-gen en_US.UTF-8 \
+    ca-certificates \
+    && update-ca-certificates \  # <--- Crucial fix for SSL cert issue (error 77)
+    && locale-gen en_US.UTF-8 \
     && update-locale LANG=en_US.UTF-8 \
     && export LANG=en_US.UTF-8 \
-    && export LC_ALL=en_US.UTF-8
-
-# 自动下载并安装最新版 nexus-network CLI
-# NONINTERACTIVE=1 防止脚本在安装过程中询问用户
-RUN curl -sSL https://cli.nexus.xyz/ | NONINTERACTIVE=1 sh \
+    && export LC_ALL=en_US.UTF-8 \
+    && curl -sSL https://cli.nexus.xyz/ | NONINTERACTIVE=1 sh \
     && chmod +x /root/.nexus/bin/nexus-network \
-    && ln -sf /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network
+    && ln -sf /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network \
+    && rm -rf /var/lib/apt/lists/*
 
 # 拷贝自定义的 entrypoint 脚本到容器内部，并赋予执行权限
 COPY entrypoint.sh /entrypoint.sh
@@ -274,6 +293,7 @@ echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] 已将 Nexus 内部日志路径链接�
 echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] 启动 nexus-network 节点..."
 # 在后台启动 nexus-network。'start' 命令通常会启动一个守护进程并退出。
 # 标准输出和错误输出将被重定向到 /dev/null，因为主要的日志应该由 Nexus 写入到其自己的日志文件。
+# 将 start 命令的输出重定向到 /dev/null
 (nexus-network start --node-id "\$NODE_ID" >/dev/null 2>&1) &
 
 # 给予 nexus-network 守护进程一些时间来启动
@@ -445,7 +465,8 @@ function list_nodes() {
         local status_raw="Unknown" created_time="N/A" image_full_name="N/A"
         if [[ -n "$inspect_output" ]]; then
             # Use process substitution to avoid issues with IFS and newline parsing
-            read -r status_raw created_time image_full_name <<< "$(echo "$inspect_output" | tr '\n' '~' | sed 's/\~/\n/g')"
+            # shellcheck disable=SC2048,SC2086 # These are specific for handling docker inspect output in one string.
+            read -r status_raw created_time image_full_name <<< $(echo "$inspect_output" | tr '\n' '~' | sed 's/\~/\n/g')
             status_raw=$(echo "$status_raw" | xargs)
             created_time=$(echo "$created_time" | xargs)
             image_full_name=$(echo "$image_full_name" | xargs)
@@ -561,6 +582,8 @@ function select_node_to_view() {
                 ;;
             2)
                 log_info "开始显示清理后的日志 (Ctrl+C 退出)..."
+                # Removed unecessary 'cat' Useless use of cat is deprecated, it's better to pipe directly from docker logs.
+                # Added 's/\x1b\[?25l|\x1b\[?25h//g' for common cursor control sequences.
                 check_docker_daemon && docker logs -f "$container_name" | sed -E 's/\x1b\[([0-9]{1,2}(;[0-9]{1,2})*)?m//g' | sed -E 's/\x1b\[?25l|\x1b\[?25h//g'
                 break
                 ;;
@@ -1004,7 +1027,7 @@ EOF
     # --log 将 stdout 和 stderr 合并输出到一个文件，便于监控。
     if pm2 start "$rotate_script_path" \
         --name "nexus-rotate" \
-        --log "$LOG_DIR/pm2-nexus-rotate.log"; then
+        --log "$LOG_DIR/pm2-nexus-rotate.log"; then # 将 PM2 日志统一到 $LOG_DIR
         log_info "---------------------------------------------------------------------------------------------------"
         log_info "节点轮换已通过 PM2 成功启动！"
         log_info "  - 使用 'pm2 status' 查看 PM2 进程状态。"
