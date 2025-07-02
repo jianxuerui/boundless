@@ -212,7 +212,6 @@ function build_image() {
     trap "log_info '清理临时构建目录: $workdir'; rm -rf '$workdir'" EXIT
 
     # Dockerfile 内容
-    # 修复：确保所有反斜杠 `\` 后面都没有空格，并且 `.nexus` 路径中的空格已删除
     cat > "$workdir/Dockerfile" <<EOF
 FROM ubuntu:24.04
 
@@ -444,7 +443,7 @@ function list_nodes() {
     local all_node_ids=($(get_all_nodes))
 
     if [[ ${#all_node_ids[@]} -eq 0 ]]; then
-        log_info "当前没有 Nexus 节点容器。(请确认您已成功通过菜单1或2启动节点)" # 补充提示
+        log_info "当前没有 Nexus 节点容器。(请确认您已成功通过菜单1或2启动节点)"
         log_and_prompt ""
         return
     fi
@@ -661,6 +660,8 @@ function batch_start_nodes() {
         log_info "所有指定节点已成功启动或正在启动！"
     else
         log_warn "完成批量启动，但有 $start_errors 个节点启动失败。"
+    也好检查你的网络防火墙设置、服务器时间和DNS配置。如果您是使用云服务器，也请检查云平台侧的安全组或防火墙规则，确保它们允许出站HTTPS（端口443）流量。
+        exit 1 # Added to exit if batch start fails for multiple nodes
     fi
     log_and_prompt ""
 }
@@ -914,7 +915,7 @@ set -euo pipefail
 # 这确保了在任何给定时间点，只有当前组的节点在运行。
 echo "$(date '+%Y-%m-%d %H:%M:%S') [GROUP_$(printf %02d "$group")] 停止所有现有 Nexus 容器，以便启动本组节点..."
 docker ps -a --filter "name=^${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | xargs -r docker rm -f >/dev/null 2>&1 || true 
-echo "$(date '+%Y-%m-%d %H:%M:%S') [GROUP_$(printf %02d "$group时不成功的修复了，而是提供一种不同的解决方法，因为这种在生产代码上修修补补是不可接受的，所以我在上面添加了这个额外检查）"] 开始启动第 \${group} 组节点..."
+echo "$(date '+%Y-%m-%d %H:%M:%S') [GROUP_$(printf %02d "$group")] 开始启动第 \${group} 组节点..."
 EOF
 
         # 计算本组节点ID的索引范围
@@ -931,10 +932,9 @@ EOF
             local log_file="${LOG_DIR}/nexus-${node_id}.log"
             
             # 在宿主机确保日志目录和文件准备就绪
-            # 已修复：将 || { cmd; continue; } 改为 if ! cmd; then ... continue; fi
             if ! mkdir -p "$LOG_DIR"; then
                 log_warn "警告：无法在脚本中创建日志目录 $LOG_DIR。跳过节点 $node_id。"
-                continue # Skip this node, try next one
+                continue
             fi
             
             if [[ -d "$log_file" ]]; then
@@ -1100,6 +1100,139 @@ function setup_log_cleanup_cron() {
     sleep 1 # 暂停1秒让用户阅读信息
 }
 
+# ============== Docker 代理配置函数 ==============
+
+# 配置 Docker daemon 的网络代理
+function configure_docker_network_proxy() {
+    log_info "开始配置 Docker 守护进程的网络代理..."
+    echo "--------------------------------------------------------------------"
+    echo "提示: 此操作将创建或修改 /etc/docker/daemon.json 以设置 Docker 的网络代理。"
+    echo "如果您不确定，或者您的环境不需要代理，请选择取消。"
+    echo "--------------------------------------------------------------------"
+
+    local choice
+    read -rp "是否需要配置代理? (y/N): " choice </dev/tty
+    if [[ ! "$choice" =~ ^[Yy]$ ]]; then
+        log_info "操作已取消，未修改 Docker 代理配置。"
+        log_and_prompt ""
+        return 0
+    fi
+
+    log_info "请注意: 如果您已有 daemon.json 配置，它可能被合并或覆盖（此脚本仅处理代理部分）。"
+    read -rp "请复制或记录现有的 /etc/docker/daemon.json 内容，以防万一。是否继续? (y/N): " choice </dev/tty
+    if [[ ! "$choice" =~ ^[Yy]$ ]]; then
+        log_info "操作已取消。"
+        log_and_prompt ""
+        return 0
+    fi
+
+    local http_proxy=""
+    local https_proxy=""
+    local no_proxy_addresses=""
+
+    read -rp "请输入 HTTP 代理地址 (例如: http://your.proxy.com:8080 或留空不设置): " http_proxy </dev/tty
+    read -rp "请输入 HTTPS 代理地址 (例如: https://your.proxy.com:8080 或留空不设置): " https_proxy </dev/tty
+    read -rp "请输入不需要代理的地址 (逗号分隔，例如: localhost,127.0.0.1,.local或留空): " no_proxy_addresses </dev/tty
+
+    # 创建或更新 daemon.json 文件内容
+    mkdir -p /etc/docker
+    local daemon_json_path="/etc/docker/daemon.json"
+    local proxy_config=""
+
+    if [[ -n "$http_proxy" ]]; then
+        proxy_config+="    \"httpProxy\": \"$http_proxy\""
+    fi
+    if [[ -n "$https_proxy" ]]; then
+        if [[ -n "$proxy_config" ]]; then proxy_config+=","; fi
+        proxy_config+="    \"httpsProxy\": \"$https_proxy\""
+    fi
+    if [[ -n "$no_proxy_addresses" ]]; then
+        if [[ -n "$proxy_config" ]]; then proxy_config+=","; fi
+        proxy_config+="    \"noProxy\": \"$no_proxy_addresses\""
+    fi
+
+    if [[ -n "$proxy_config" ]]; then
+        # Check if daemon.json exists and read its current content
+        local current_daemon_json="{}"
+        if [[ -f "$daemon_json_path" ]]; then
+            # Attempt to safely read JSON, only modify proxy parts.
+            # Using sed for simplicity for typical daemon.json structure.
+            # This is a bit simplistic; for complex JSON, jq is better.
+            log_info "尝试修改现有的 daemon.json 文件..."
+            
+            # Remove existing "httpProxy", "httpsProxy", "noProxy" lines
+            sed -i '/"httpProxy":/d' "$daemon_json_path"
+            sed -i '/"httpsProxy":/d' "$daemon_json_path"
+            sed -i '/"noProxy":/d' "$daemon_json_path"
+            # Remove any empty lines resulting from deletion or lines that end with a comma, followed by nothing else but bracket.
+            sed -i '/^\s*,\s*$/d' "$daemon_json_path" 
+            # Re-insert the proxy lines before the last '}'
+            # This relies on the last '}' being on its own line.
+            local last_bracket_line_num=$(grep -n '^[[:space:]]*\}$' "$daemon_json_path" | tail -n 1 | cut -d: -f1 || echo "")
+            if [[ -n "$last_bracket_line_num" ]]; then
+                 # Insert proxy_config before the last '}'
+                # Remove the final comma from the last preceding line, if there is one.
+                # Only insert if there's actually proxy config to add.
+                if [[ -n "$proxy_config" ]]; then
+                     sed -i "$((last_bracket_line_num-1))s/,$//" "$daemon_json_path" # remove trailing comma from previous line if any
+                     sed -i "$last_bracket_line_num i \\\n${proxy_config}," "$daemon_json_path" # insert proxy config with leading comma
+                fi
+                # A quick fix for a potential trailing comma if proxy was the only or last config and it added a comma.
+                sed -i 'N;/\(.*\),\n\}\(.*\)/s//\1\n\}\2/;P;D' "$daemon_json_path" # removes comma before last '}'
+            else
+                log_warn "WARNING: Could not find end '}' in daemon.json for graceful update. Overwriting with proxy-only config."
+                echo "{
+$proxy_config
+}" > "$daemon_json_path" # Fallback to overwrite
+            fi
+
+        else
+            log_info "创建新的 daemon.json 文件..."
+            echo "{
+$proxy_config
+}" > "$daemon_json_path"
+        fi
+        # Make sure the last proxy entry does NOT have a comma, unless it's the only one and already fine.
+        # This regex ensures that if proxy_config *is* the entire content (no existing config or overwriting), it handles commas.
+        # It removes trailing comma before } but doesn't insert it. The above inserts it, we remove the very last.
+        sed -i -E 's/,([[:space:]]*\}|[[:space:]]*$)/\1/g' "$daemon_json_path"
+
+        log_info "Docker daemon.json 已更新或创建，内容如下:"
+        cat "$daemon_json_path"
+
+        log_info "正在重新加载 Docker 配置并重启服务..."
+        systemctl daemon-reload && systemctl restart docker
+        log_info "Docker 服务已重启。请通过菜单选项3确认节点状态，或再次尝试构建镜像。"
+    else
+        # If proxy was removed or not entered, prompt to remove proxy config
+        read -rp "您没有输入代理信息。是否移除现有的 Docker 代理配置？(y/N): " remove_existing </dev/tty
+        if [[ "$remove_existing" =~ ^[Yy]$ ]]; then
+            log_info "移除 Docker 代理配置..."
+            if [[ -f "$daemon_json_path" ]]; then
+                sed -i '/"httpProxy":/d' "$daemon_json_path"
+                sed -i '/"httpsProxy":/d' "$daemon_json_path"
+                sed -i '/"noProxy":/d' "$daemon_json_path"
+                # Remove any empty lines and fix comma issues that result from deletion
+                sed -i '/^\s*,\s*$/d' "$daemon_json_path"
+                sed -i 's/\(.*\),$/\1/' "$daemon_json_path" # Remove dangling commas at end of lines
+                
+                log_info "Docker daemon.json 中的代理配置已移除。新内容如下:"
+                cat "$daemon_json_path"
+                log_info "正在重新加载 Docker 配置并重启服务..."
+                systemctl daemon-reload && systemctl restart docker
+                log_info "Docker 服务已重启。"
+            else
+                log_info "$daemon_json_path 文件不存在，无需移除代理配置。"
+            fi
+        else
+            log_info "未进行任何代理配置更改。"
+        fi
+    fi
+    log_and_prompt ""
+    return 0
+}
+
+
 # ============== 主菜单函数 ==============
 
 function main_menu() {
@@ -1123,10 +1256,11 @@ function main_menu() {
         echo "|| 6. 批量节点轮换启动 (PM2 守护，确保一部分节点持续运行)     ||"
         echo "|| 7. 删除所有 Nexus 节点、日志和相关脚本 (DANGEROUS!)          ||"
         echo "|| 8. 退出脚本                                                ||"
+        echo "|| 9. Docker 配置网络代理                                     ||" # New Option
         echo "=================================================================="
 
         local choice
-        read -rp "请输入您的选择 (1-8): " choice </dev/tty # Read from /dev/tty explicitly
+        read -rp "请输入您的选择 (1-9): " choice </dev/tty # Read from /dev/tty explicitly
 
         case "$choice" in
             1)
@@ -1169,8 +1303,12 @@ function main_menu() {
                 log_info "感谢使用 Nexus 多节点管理工具！"
                 exit 0
                 ;;
+            9) # New Case for Proxy Configuration
+                check_docker_daemon || { log_warn "Docker 守护进程未运行，无法配置代理。请确保Docker服务启动。"; log_and_prompt ""; continue; }
+                configure_docker_network_proxy
+                ;;
             *)
-                log_warn "无效的选项 '$choice'。请输入一个 1 到 8 之间的数字。"
+                log_warn "无效的选项 '$choice'。请输入一个 1 到 9 之间的数字。"
                 log_and_prompt ""
                 ;;
         esac
