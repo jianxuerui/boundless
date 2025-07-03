@@ -1,502 +1,608 @@
 #!/bin/bash
 set -e
-set -o pipefail
 
-# ==============================================================================
-# Nexus 多节点管理脚本 (修复增强版 v2)
-#
-# v2 更新:
-# - 【核心修复】新增自动时间同步功能，解决因系统时间不准导致的 SSL/APT 错误。
-# - 【功能增强】“删除全部节点”功能增加彻底清理选项，可一并删除脚本自身目录。
-#
-# 特性:
-# - 自动检测并校准系统时间。
-# - 自动检测操作系统 (Debian/Ubuntu/CentOS/RHEL) 并使用对应包管理器。
-# - 自动处理 sudo 权限，无需强制使用 root 用户运行。
-# - 文件和日志存储在用户主目录 (~/nexus-node-manager)，更整洁。
-#
-# 脚本由哈哈哈哈编写，推特 @ferdie_jhovie，免费开源，请勿相信收费
-# ==============================================================================
-
-# --- 全局配置 ---
-SCRIPT_HOME="$HOME/nexus-node-manager"
-LOG_DIR="$SCRIPT_HOME/logs"
-SCRIPT_DIR="$SCRIPT_HOME/scripts"
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:latest"
-
-# --- 颜色定义 ---
-COLOR_RESET='\033[0m'
-COLOR_RED='\033[0;31m'
-COLOR_GREEN='\033[0;32m'
-COLOR_YELLOW='\033[0;33m'
-COLOR_BLUE='\033[0;34m'
-COLOR_CYAN='\033[0;36m'
-
-# --- 日志函数 ---
-log_info() { echo -e "${COLOR_BLUE}INFO: $1${COLOR_RESET}"; }
-log_success() { echo -e "${COLOR_GREEN}SUCCESS: $1${COLOR_RESET}"; }
-log_warn() { echo -e "${COLOR_YELLOW}WARN: $1${COLOR_RESET}"; }
-log_error() { echo -e "${COLOR_RED}ERROR: $1${COLOR_RESET}"; exit 1; }
-
-# --- 权限和系统检测 ---
-SUDO_CMD=""
-PKG_MANAGER=""
-
-# 【新功能】检查并同步系统时间
-function check_and_sync_time() {
-    log_info "正在检查并同步系统时间，以避免网络和安装错误..."
-    # 提前定义 sudo，即使在 detect_os_and_privileges 之前
-    if [[ $EUID -ne 0 ]]; then SUDO_CMD="sudo"; fi
-
-    if command -v timedatectl >/dev/null 2>&1; then
-        # 优先使用 systemd-timesyncd
-        $SUDO_CMD timedatectl set-ntp true >/dev/null 2>&1 || true
-        # 重启服务以立即生效
-        $SUDO_CMD systemctl restart systemd-timesyncd.service >/dev/null 2>&1 || true
-        log_success "时间同步服务(systemd-timesyncd)已启用。"
-    elif command -v ntpdate >/dev/null 2>&1; then
-        # 使用 ntpdate 作为备选
-        $SUDO_CMD ntpdate pool.ntp.org || log_warn "ntpdate 同步失败，可能是网络问题。脚本将继续，但后续操作可能失败。"
-        log_success "已使用 ntpdate 尝试同步时间。"
-    else
-        # 如果都没有，则尝试安装 ntpdate
-        log_warn "未找到时间同步工具，尝试安装 ntpdate..."
-        case "$PKG_MANAGER" in
-            apt) $SUDO_CMD apt-get install -y ntpdate >/dev/null ;;
-            yum|dnf) $SUDO_CMD $PKG_MANAGER install -y ntpdate >/dev/null ;;
-            *) log_warn "无法自动安装 ntpdate。请手动同步系统时间！"; return ;;
-        esac
-        $SUDO_CMD ntpdate pool.ntp.org || log_warn "ntpdate 同步失败，可能是网络问题。"
-        log_success "已安装 ntpdate 并尝试同步时间。"
-    fi
-    log_info "当前系统时间: $(date)"
-    sleep 1 # 短暂停顿，让用户看到时间
-}
-
-function detect_os_and_privileges() {
-    # 检查权限
-    if [[ $EUID -ne 0 ]]; then
-        if command -v sudo >/dev/null 2>&1; then
-            SUDO_CMD="sudo"
-        else
-            log_error "请以 root 用户身份运行此脚本，或者安装 'sudo'。"
-        fi
-    fi
-
-    # 检查操作系统
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS=$NAME
-        if [[ $ID == "ubuntu" || $ID == "debian" || $ID_LIKE == "debian" ]]; then
-            PKG_MANAGER="apt"
-        elif [[ $ID == "centos" || $ID == "rhel" || $ID == "fedora" || $ID_LIKE == "rhel" ]]; then
-            PKG_MANAGER="yum"
-            if command -v dnf >/dev/null 2>&1; then PKG_MANAGER="dnf"; fi
-        else
-            log_error "不支持的操作系统: $OS. 目前仅支持 Debian/Ubuntu 和 CentOS/RHEL/Fedora 系列。"
-        fi
-        log_info "检测到操作系统: $OS, 使用包管理器: $PKG_MANAGER"
-    else
-        log_error "无法检测操作系统，/etc/os-release 文件不存在。"
-    fi
-}
-
+LOG_DIR="/root/nexus_logs"
 
 # 检查 Docker 是否安装
 function check_docker() {
     if ! command -v docker >/dev/null 2>&1; then
-        log_warn "检测到未安装 Docker，正在安装..."
-        case "$PKG_MANAGER" in
-            apt)
-                $SUDO_CMD apt-get update
-                $SUDO_CMD apt-get install -y apt-transport-https ca-certificates curl software-properties-common
-                curl -fsSL https://download.docker.com/linux/ubuntu/gpg | $SUDO_CMD gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-                echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | $SUDO_CMD tee /etc/apt/sources.list.d/docker.list > /dev/null
-                $SUDO_CMD apt-get update
-                $SUDO_CMD apt-get install -y docker-ce docker-ce-cli containerd.io
-                ;;
-            yum|dnf)
-                $SUDO_CMD $PKG_MANAGER install -y yum-utils
-                $SUDO_CMD yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-                $SUDO_CMD $PKG_MANAGER install -y docker-ce docker-ce-cli containerd.io
-                ;;
-            *) log_error "无法为当前操作系统自动安装 Docker。" ;;
-        esac
-        $SUDO_CMD systemctl enable docker
-        $SUDO_CMD systemctl start docker
-        log_success "Docker 安装并启动成功。"
-    fi
-    if [ -n "$SUDO_CMD" ]; then
-        $SUDO_CMD usermod -aG docker "$USER" >/dev/null 2>&1 || true
+        echo "检测到未安装 Docker，正在安装..."
+        apt update
+        apt install -y apt-transport-https ca-certificates curl software-properties-common
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+        add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+        apt update
+        apt install -y docker-ce
+        systemctl enable docker
+        systemctl start docker
     fi
 }
 
 # 检查 Node.js/npm/pm2 是否安装
 function check_pm2() {
     if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
-        log_warn "检测到未安装 Node.js/npm，正在安装..."
-        curl -fsSL https://deb.nodesource.com/setup_18.x | $SUDO_CMD -E bash -
-        case "$PKG_MANAGER" in
-            apt) $SUDO_CMD apt-get install -y nodejs ;;
-            yum|dnf) $SUDO_CMD $PKG_MANAGER install -y nodejs ;;
-            *) log_error "无法为当前操作系统自动安装 Node.js。" ;;
-        esac
-        log_success "Node.js/npm 安装成功。"
+        echo "检测到未安装 Node.js/npm，正在安装..."
+        curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+        apt-get install -y nodejs
     fi
     if ! command -v pm2 >/dev/null 2>&1; then
-        log_warn "检测到未安装 pm2，正在安装..."
-        $SUDO_CMD npm install -g pm2
-        log_success "pm2 安装成功。"
+        echo "检测到未安装 pm2，正在安装..."
+        npm install -g pm2
     fi
 }
 
 # 构建docker镜像函数
 function build_image() {
-    log_info "正在检查并构建 Docker 镜像: $IMAGE_NAME..."
     WORKDIR=$(mktemp -d)
     cd "$WORKDIR"
+
     cat > Dockerfile <<EOF
 FROM ubuntu:24.04
-ARG DEBIAN_FRONTEND=noninteractive
+
+ENV DEBIAN_FRONTEND=noninteractive
 ENV PROVER_ID_FILE=/root/.nexus/node-id
-RUN apt-get update && apt-get install -y curl screen bash && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && apt-get install -y \
+    curl \
+    screen \
+    bash \
+    && rm -rf /var/lib/apt/lists/*
+
+# 自动下载安装最新版 nexus-network
 RUN curl -sSL https://cli.nexus.xyz/ | NONINTERACTIVE=1 sh \
     && ln -sf /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network
+
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
+
 ENTRYPOINT ["/entrypoint.sh"]
 EOF
-    cat > entrypoint.sh <<'EOF'
+
+    cat > entrypoint.sh <<EOF
 #!/bin/bash
 set -e
+
 PROVER_ID_FILE="/root/.nexus/node-id"
-LOG_FILE="/root/nexus.log"
-if [ -z "$NODE_ID" ]; then
+
+if [ -z "\$NODE_ID" ]; then
     echo "错误：未设置 NODE_ID 环境变量"
     exit 1
 fi
-touch $LOG_FILE && chmod 666 $LOG_FILE
-echo "$NODE_ID" > "$PROVER_ID_FILE"
-echo "使用的 node-id: $NODE_ID" | tee -a $LOG_FILE
+
+echo "\$NODE_ID" > "\$PROVER_ID_FILE"
+echo "使用的 node-id: \$NODE_ID"
+
 if ! command -v nexus-network >/dev/null 2>&1; then
-    echo "错误：nexus-network 未安装或不可用" | tee -a $LOG_FILE
+    echo "错误：nexus-network 未安装或不可用"
     exit 1
 fi
+
 screen -S nexus -X quit >/dev/null 2>&1 || true
-echo "启动 nexus-network 节点..." | tee -a $LOG_FILE
-screen -dmS nexus bash -c "nexus-network start --node-id \$NODE_ID &>> \$LOG_FILE"
+
+echo "启动 nexus-network 节点..."
+screen -dmS nexus bash -c "nexus-network start --node-id \$NODE_ID &>> /root/nexus.log"
+
 sleep 3
+
 if screen -list | grep -q "nexus"; then
-    echo "节点已在后台启动。" | tee -a $LOG_FILE
+    echo "节点已在后台启动。"
+    echo "日志文件：/root/nexus.log"
+    echo "可以使用 docker logs \$CONTAINER_NAME 查看日志"
 else
-    echo "节点启动失败，请检查日志。" | tee -a $LOG_FILE
-    cat $LOG_FILE
+    echo "节点启动失败，请检查日志。"
+    cat /root/nexus.log
     exit 1
 fi
-tail -f $LOG_FILE
+
+tail -f /root/nexus.log
 EOF
-    $SUDO_CMD docker build -t "$IMAGE_NAME" .
-    log_success "Docker 镜像构建完成。"
-    cd - >/dev/null && rm -rf "$WORKDIR"
+
+    docker build -t "$IMAGE_NAME" .
+
+    cd -
+    rm -rf "$WORKDIR"
 }
 
-# 启动容器
+# 启动容器（挂载宿主机日志文件）
 function run_container() {
     local node_id=$1
     local container_name="${BASE_CONTAINER_NAME}-${node_id}"
     local log_file="${LOG_DIR}/nexus-${node_id}.log"
-    if $SUDO_CMD docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
-        log_warn "检测到旧容器 $container_name，将自动删除并重建..."
-        $SUDO_CMD docker rm -f "$container_name" >/dev/null
+
+    if docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
+        echo "检测到旧容器 $container_name，先删除..."
+        docker rm -f "$container_name"
     fi
-    mkdir -p "$LOG_DIR" && touch "$log_file"
-    log_info "正在启动容器 $container_name..."
-    $SUDO_CMD docker run -d --name "$container_name" -v "$log_file":/root/nexus.log -e NODE_ID="$node_id" "$IMAGE_NAME"
-    log_success "容器 $container_name 已成功启动！日志路径: $log_file"
+
+    # 确保日志目录存在
+    mkdir -p "$LOG_DIR"
+    
+    # 确保宿主机日志文件存在并有写权限
+    if [ ! -f "$log_file" ]; then
+        touch "$log_file"
+        chmod 644 "$log_file"
+    fi
+
+    docker run -d --name "$container_name" -v "$log_file":/root/nexus.log -e NODE_ID="$node_id" "$IMAGE_NAME"
+    echo "容器 $container_name 已启动！"
 }
 
-# 停止并卸载单个节点
+# 停止并卸载容器和镜像、删除日志
 function uninstall_node() {
     local node_id=$1
     local container_name="${BASE_CONTAINER_NAME}-${node_id}"
     local log_file="${LOG_DIR}/nexus-${node_id}.log"
-    log_info "正在停止并删除容器 $container_name..."
-    $SUDO_CMD docker rm -f "$container_name" >/dev/null 2>&1 || log_warn "容器 $container_name 不存在或已被删除。"
+
+    echo "停止并删除容器 $container_name..."
+    docker rm -f "$container_name" 2>/dev/null || echo "容器不存在或已停止"
+
     if [ -f "$log_file" ]; then
-        log_info "正在删除日志文件 $log_file ..."
+        echo "删除日志文件 $log_file ..."
         rm -f "$log_file"
+    else
+        echo "日志文件不存在：$log_file"
     fi
+
+    echo "节点 $node_id 已卸载完成。"
 }
 
-# 显示所有节点状态
+# 显示所有运行中的节点
 function list_nodes() {
-    clear && log_info "正在获取当前节点状态..."
-    local all_nodes
-    all_nodes=($(get_all_nodes))
-    if [ ${#all_nodes[@]} -eq 0 ]; then
-        log_warn "当前未部署任何 Nexus 节点。"
-        read -n 1 -s -r -p "按任意键返回主菜单..."
-        return
-    fi
-    local container_names
-    container_names=$(printf "%s-%s\n" "$BASE_CONTAINER_NAME" "${all_nodes[@]}")
-    local stats_data
-    stats_data=$($SUDO_CMD docker stats --no-stream --format "{{.Name}},{{.CPUPerc}},{{.MemUsage}}" $container_names 2>/dev/null)
-    local ps_data
-    ps_data=$($SUDO_CMD docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}},{{.Status}},{{.CreatedAt}}")
-    echo "======================================================================================================"
-    printf "%-4s %-25s %-12s %-20s %-15s %-20s\n" "ID" "节点ID" "CPU" "内存使用" "状态" "创建时间"
-    echo "------------------------------------------------------------------------------------------------------"
+    echo "当前节点状态："
+    echo "------------------------------------------------------------------------------------------------------------------------"
+    printf "%-6s %-20s %-10s %-10s %-10s %-20s %-20s\n" "序号" "节点ID" "CPU使用率" "内存使用" "内存限制" "状态" "启动时间"
+    echo "------------------------------------------------------------------------------------------------------------------------"
+    
+    local all_nodes=($(get_all_nodes))
     for i in "${!all_nodes[@]}"; do
         local node_id=${all_nodes[$i]}
         local container_name="${BASE_CONTAINER_NAME}-${node_id}"
-        local ps_line=$(echo "$ps_data" | grep "^${container_name},")
-        local status=$(echo "$ps_line" | cut -d',' -f2)
-        local created_time=$(echo "$ps_line" | cut -d',' -f3)
-        local stat_line=$(echo "$stats_data" | grep "^${container_name},")
-        if [ -n "$stat_line" ]; then
-            local cpu_usage=$(echo "$stat_line" | cut -d',' -f2)
-            local mem_usage=$(echo "$stat_line" | cut -d',' -f3)
-            printf "%-4d %-25s %-12s %-20s %-15s %-20s\n" $((i+1)) "$node_id" "$cpu_usage" "$mem_usage" "$(echo $status | cut -d' ' -f1-2)" "$created_time"
+        local container_info=$(docker stats --no-stream --format "{{.CPUPerc}},{{.MemUsage}},{{.MemPerc}}" $container_name 2>/dev/null)
+        
+        if [ -n "$container_info" ]; then
+            # 解析容器信息
+            IFS=',' read -r cpu_usage mem_usage mem_limit mem_perc <<< "$container_info"
+            local status=$(docker ps -a --filter "name=$container_name" --format "{{.Status}}")
+            local created_time=$(docker ps -a --filter "name=$container_name" --format "{{.CreatedAt}}")
+            
+            # 格式化内存显示
+            mem_usage=$(echo $mem_usage | sed 's/\([0-9.]*\)\([A-Za-z]*\)/\1 \2/')
+            mem_limit=$(echo $mem_limit | sed 's/\([0-9.]*\)\([A-Za-z]*\)/\1 \2/')
+            
+            # 显示节点信息
+            printf "%-6d %-20s %-10s %-10s %-10s %-20s %-20s\n" \
+                $((i+1)) \
+                "$node_id" \
+                "$cpu_usage" \
+                "$mem_usage" \
+                "$mem_limit" \
+                "$(echo $status | cut -d' ' -f1)" \
+                "$created_time"
         else
-            printf "%-4d %-25s %-12s %-20s %-15s %-20s\n" $((i+1)) "$node_id" "N/A" "N/A" "$(echo $status | cut -d' ' -f1-2)" "$created_time"
+            # 如果容器不存在或未运行
+            local status=$(docker ps -a --filter "name=$container_name" --format "{{.Status}}")
+            local created_time=$(docker ps -a --filter "name=$container_name" --format "{{.CreatedAt}}")
+            if [ -n "$status" ]; then
+                printf "%-6d %-20s %-10s %-10s %-10s %-20s %-20s\n" \
+                    $((i+1)) \
+                    "$node_id" \
+                    "N/A" \
+                    "N/A" \
+                    "N/A" \
+                    "$(echo $status | cut -d' ' -f1)" \
+                    "$created_time"
+            fi
         fi
     done
-    echo "======================================================================================================"
-    read -n 1 -s -r -p "按任意键返回主菜单..."
+    echo "------------------------------------------------------------------------------------------------------------------------"
+    echo "提示："
+    echo "- CPU使用率：显示容器CPU使用百分比"
+    echo "- 内存使用：显示容器当前使用的内存"
+    echo "- 内存限制：显示容器内存使用限制"
+    echo "- 状态：显示容器的运行状态"
+    echo "- 启动时间：显示容器的创建时间"
+    read -p "按任意键返回菜单"
 }
 
-# 获取所有节点ID
+# 获取所有运行中的节点ID
+function get_running_nodes() {
+    docker ps --filter "name=${BASE_CONTAINER_NAME}" --filter "status=running" --format "{{.Names}}" | sed "s/${BASE_CONTAINER_NAME}-//"
+}
+
+# 获取所有节点ID（包括已停止的）
 function get_all_nodes() {
-    $SUDO_CMD docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}" | sed "s/${BASE_CONTAINER_NAME}-//" | sort
+    docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}" | sed "s/${BASE_CONTAINER_NAME}-//"
 }
 
-# 选择并查看节点日志
-function select_node_to_view() {
-    local all_nodes
-    all_nodes=($(get_all_nodes))
-    if [ ${#all_nodes[@]} -eq 0 ]; then log_warn "当前没有可查看的节点。"; read -n 1 -s -r -p "按任意键返回..."; return; fi
-    echo "请选择要查看日志的节点：" && echo "0. 返回主菜单"
-    for i in "${!all_nodes[@]}"; do
-        local status=$($SUDO_CMD docker ps -a --filter "name=${BASE_CONTAINER_NAME}-${all_nodes[$i]}" --format "{{.Status}}")
-        if [[ $status == Up* ]]; then
-            printf "%-4d 节点 %s [%b运行中%b]\n" $((i+1)) "${all_nodes[$i]}" "$COLOR_GREEN" "$COLOR_RESET"
+# 查看节点日志
+function view_node_logs() {
+    local node_id=$1
+    local container_name="${BASE_CONTAINER_NAME}-${node_id}"
+    
+    if docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
+        echo "请选择日志查看模式："
+        echo "1. 原始日志（可能包含颜色代码）"
+        echo "2. 清理后的日志（移除颜色代码）"
+        read -rp "请选择(1-2): " log_mode
+
+        echo "查看日志，按 Ctrl+C 退出日志查看"
+        if [ "$log_mode" = "2" ]; then
+            docker logs -f "$container_name" | sed 's/\x1b\[[0-9;]*m//g' | sed 's/\x1b\[?25l//g' | sed 's/\x1b\[?25h//g'
         else
-            printf "%-4d 节点 %s [%b已停止%b]\n" $((i+1)) "${all_nodes[$i]}" "$COLOR_RED" "$COLOR_RESET"
+            docker logs -f "$container_name"
+        fi
+    else
+        echo "容器未运行，请先安装并启动节点（选项1）"
+        read -p "按任意键返回菜单"
+    fi
+}
+
+# 批量启动多个节点
+function batch_start_nodes() {
+    echo "请输入多个 node-id，每行一个，输入空行结束："
+    echo "（输入完成后按回车键，然后按 Ctrl+D 结束输入）"
+    
+    local node_ids=()
+    while read -r line; do
+        if [ -n "$line" ]; then
+            node_ids+=("$line")
         fi
     done
-    read -rp "请输入选项(0-${#all_nodes[@]}): " choice
-    if [[ ! "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 0 ] || [ "$choice" -gt ${#all_nodes[@]} ]; then
-        log_warn "无效的选项。" && sleep 1 && return
-    fi
-    [ "$choice" -eq 0 ] && return
-    local selected_node=${all_nodes[$((choice-1))]}
-    log_info "正在显示日志 (节点: $selected_node)，按 Ctrl+C 退出。"
-    sleep 1
-    # 移除ANSI颜色代码，使日志更干净
-    $SUDO_CMD docker logs -f "${BASE_CONTAINER_NAME}-${selected_node}" | sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g'
-}
 
-# 批量启动节点
-function batch_start_nodes() {
-    log_info "进入批量启动模式。请输入多个 node-id，每行一个，输入空行后按 Ctrl+D 结束。"
-    mapfile -t node_ids
-    # 过滤掉数组中的空元素
-    node_ids=(${node_ids[@]})
-    if [ ${#node_ids[@]} -eq 0 ]; then log_warn "未输入任何 node-id，操作取消。"; sleep 1; return; fi
-    log_info "共 ${#node_ids[@]} 个节点待启动。" && check_docker && build_image
+    if [ ${#node_ids[@]} -eq 0 ]; then
+        echo "未输入任何 node-id，返回主菜单"
+        read -p "按任意键继续"
+        return
+    fi
+
+    echo "开始构建镜像..."
+    build_image
+
+    echo "开始启动节点..."
     for node_id in "${node_ids[@]}"; do
-        [ -n "$node_id" ] && run_container "$node_id" && sleep 1
+        echo "正在启动节点 $node_id ..."
+        run_container "$node_id"
+        sleep 2  # 添加短暂延迟，避免同时启动太多容器
     done
-    log_success "所有节点启动任务已提交！"
-    read -n 1 -s -r -p "按任意键返回主菜单..."
+
+    echo "所有节点启动完成！"
+    read -p "按任意键返回菜单"
 }
 
-# 卸载全部节点
-function uninstall_all_nodes() {
-    local all_nodes
-    all_nodes=($(get_all_nodes))
-    if [ ${#all_nodes[@]} -eq 0 ]; then log_warn "当前没有任何节点可卸载。"; read -n 1 -s -r -p "按任意键返回..."; return; fi
-
-    log_warn "警告：此操作将删除所有 Nexus 节点容器及其日志！"
-    read -rp "您确定要继续吗？(y/N): " confirm
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then log_info "操作已取消。"; sleep 1; return; fi
-
-    log_info "开始删除所有节点容器..."
-    local container_ids=$($SUDO_CMD docker ps -a --filter "name=${BASE_CONTAINER_NAME}" -q)
-    [ -n "$container_ids" ] && $SUDO_CMD docker rm -f $container_ids >/dev/null
-
-    log_info "正在删除所有节点日志..."
-    [ -d "$LOG_DIR" ] && rm -rf "$LOG_DIR"
-    log_success "所有节点已成功卸载！"
+# 选择要查看的节点
+function select_node_to_view() {
+    local all_nodes=($(get_all_nodes))
     
-    log_warn "您是否还想删除本管理脚本及其所有相关文件？"
-    log_warn "这将删除整个目录: $SCRIPT_HOME"
-    read -rp "输入 'delete' 确认彻底删除，输入其他任意键则保留: " final_confirm
-    if [ "$final_confirm" == "delete" ]; then
-        log_info "正在进行彻底清理..."
-        $SUDO_CMD pm2 delete nexus-rotate >/dev/null 2>&1 || true
-        $SUDO_CMD pm2 save --force >/dev/null 2>&1 || true
-        # 从crontab中移除任务
-        (crontab -l 2>/dev/null | grep -v -F "find $LOG_DIR") | crontab -
-        rm -rf "$SCRIPT_HOME"
-        log_success "所有相关文件已删除。脚本将退出。"
-        exit 0
-    else
-        log_info "脚本文件已保留。"
+    if [ ${#all_nodes[@]} -eq 0 ]; then
+        echo "当前没有节点"
+        read -p "按任意键返回菜单"
+        return
     fi
-    read -n 1 -s -r -p "按任意键返回主菜单..."
+
+    echo "请选择要查看的节点："
+    echo "0. 返回主菜单"
+    for i in "${!all_nodes[@]}"; do
+        local node_id=${all_nodes[$i]}
+        local container_name="${BASE_CONTAINER_NAME}-${node_id}"
+        local status=$(docker ps -a --filter "name=$container_name" --format "{{.Status}}")
+        if [[ $status == Up* ]]; then
+            echo "$((i+1)). 节点 $node_id [运行中]"
+        else
+            echo "$((i+1)). 节点 $node_id [已停止]"
+        fi
+    done
+
+    read -rp "请输入选项(0-${#all_nodes[@]}): " choice
+
+    if [ "$choice" = "0" ]; then
+        return
+    fi
+
+    if [ "$choice" -ge 1 ] && [ "$choice" -le ${#all_nodes[@]} ]; then
+        local selected_node=${all_nodes[$((choice-1))]}
+        view_node_logs "$selected_node"
+    else
+        echo "无效的选项"
+        read -p "按任意键继续"
+    fi
+}
+
+# 批量停止并卸载节点
+function batch_uninstall_nodes() {
+    local all_nodes=($(get_all_nodes))
+    
+    if [ ${#all_nodes[@]} -eq 0 ]; then
+        echo "当前没有节点"
+        read -p "按任意键返回菜单"
+        return
+    fi
+
+    echo "当前节点状态："
+    echo "----------------------------------------"
+    echo "序号  节点ID                状态"
+    echo "----------------------------------------"
+    for i in "${!all_nodes[@]}"; do
+        local node_id=${all_nodes[$i]}
+        local container_name="${BASE_CONTAINER_NAME}-${node_id}"
+        local status=$(docker ps -a --filter "name=$container_name" --format "{{.Status}}")
+        if [[ $status == Up* ]]; then
+            printf "%-6d %-20s [运行中]\n" $((i+1)) "$node_id"
+        else
+            printf "%-6d %-20s [已停止]\n" $((i+1)) "$node_id"
+        fi
+    done
+    echo "----------------------------------------"
+
+    echo "请选择要删除的节点（可多选，输入数字，用空格分隔）："
+    echo "0. 返回主菜单"
+    
+    read -rp "请输入选项(0 或 数字，用空格分隔): " choices
+
+    if [ "$choices" = "0" ]; then
+        return
+    fi
+
+    # 将输入的选项转换为数组
+    read -ra selected_choices <<< "$choices"
+    
+    # 验证输入并执行卸载
+    for choice in "${selected_choices[@]}"; do
+        if [ "$choice" -ge 1 ] && [ "$choice" -le ${#all_nodes[@]} ]; then
+            local selected_node=${all_nodes[$((choice-1))]}
+            echo "正在卸载节点 $selected_node ..."
+            uninstall_node "$selected_node"
+        else
+            echo "跳过无效选项: $choice"
+        fi
+    done
+
+    echo "批量卸载完成！"
+    read -p "按任意键返回菜单"
+}
+
+# 删除全部节点
+function uninstall_all_nodes() {
+    local all_nodes=($(get_all_nodes))
+    
+    if [ ${#all_nodes[@]} -eq 0 ]; then
+        echo "当前没有节点"
+        read -p "按任意键返回菜单"
+        return
+    fi
+
+    echo "警告：此操作将删除所有节点！"
+    echo "当前共有 ${#all_nodes[@]} 个节点："
+    for node_id in "${all_nodes[@]}"; do
+        echo "- $node_id"
+    done
+    
+    read -rp "确定要删除所有节点吗？(y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "已取消操作"
+        read -p "按任意键返回菜单"
+        return
+    fi
+
+    echo "开始删除所有节点..."
+    for node_id in "${all_nodes[@]}"; do
+        echo "正在卸载节点 $node_id ..."
+        uninstall_node "$node_id"
+    done
+
+    # 删除 /root/nexus_scripts 目录
+    if [ -d "/root/nexus_scripts" ]; then
+        echo "删除 /root/nexus_scripts 目录..."
+        rm -rf "/root/nexus_scripts"
+    else
+        echo "/root/nexus_scripts 目录不存在"
+    fi
+
+    echo "所有节点已删除完成！"
+    read -p "按任意键返回菜单"
 }
 
 # 批量节点轮换启动
 function batch_rotate_nodes() {
-    check_docker && check_pm2 && build_image
-    log_info "进入批量轮换启动模式。请输入多个 node-id，每行一个，按 Ctrl+D 结束。"
-    mapfile -t node_ids
-    node_ids=(${node_ids[@]})
-    if [ ${#node_ids[@]} -eq 0 ]; then log_warn "未输入任何 node-id，操作取消。"; sleep 1; return; fi
-
-    local total_nodes=${#node_ids[@]}
-    local default_nodes_per_round=$(( (total_nodes + 1) / 2 ))
-    read -rp "请输入每两小时要启动的节点数量 (默认为 ${default_nodes_per_round}): " nodes_per_round
-    nodes_per_round=${nodes_per_round:-$default_nodes_per_round}
-    if ! [[ "$nodes_per_round" =~ ^[0-9]+$ ]] || [ "$nodes_per_round" -lt 1 ]; then log_error "无效的节点数量，请输入一个正整数。"; fi
+    check_pm2
+    echo "请输入多个 node-id，每行一个，输入空行结束："
+    echo "（输入完成后按回车键，然后按 Ctrl+D 结束输入）"
     
-    local num_groups=$(( (total_nodes + nodes_per_round - 1) / nodes_per_round ))
-    log_info "节点将分为 $num_groups 组进行轮换，每组最多 ${nodes_per_round} 个节点。"
-    log_info "停止可能存在的旧轮换进程..."
-    $SUDO_CMD pm2 delete nexus-rotate >/dev/null 2>&1 || true
-    
-    mkdir -p "$SCRIPT_DIR"
-    local rotate_script_path="$SCRIPT_DIR/rotate.sh"
-    
-    # 使用代码块一次性写入文件，更高效
-    {
-        echo '#!/bin/bash'
-        echo 'set -e'
-        echo 'while true; do'
-    } > "$rotate_script_path"
-    
-    for (( i = 0; i < total_nodes; i += nodes_per_round )); do
-        local group_nodes=("${node_ids[@]:i:nodes_per_round}")
-        local group_num=$(( i / nodes_per_round + 1 ))
-        {
-            echo "    echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] 准备启动第 ${group_num} 组节点 (${#group_nodes[@]}个)...\""
-            echo "    echo '清理旧容器...'"
-            echo "    $SUDO_CMD docker ps -a --filter \"name=${BASE_CONTAINER_NAME}\" -q | xargs -r $SUDO_CMD docker rm -f"
-        } >> "$rotate_script_path"
-        
-        for node_id in "${group_nodes[@]}"; do
-            local log_file="${LOG_DIR}/nexus-${node_id}.log"
-            {
-                echo "    mkdir -p \"$LOG_DIR\" && touch \"$log_file\""
-                echo "    echo \"启动节点 $node_id...\""
-                echo "    $SUDO_CMD docker run -d --name \"${BASE_CONTAINER_NAME}-${node_id}\" -v \"$log_file\":/root/nexus.log -e NODE_ID=\"$node_id\" \"$IMAGE_NAME\""
-                echo "    sleep 5"
-            } >> "$rotate_script_path"
-        done
-        
-        {
-            echo "    echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] 第 ${group_num} 组已启动，等待2小时...\""
-            echo "    sleep 7200"
-        } >> "$rotate_script_path"
-    done
-    echo "done" >> "$rotate_script_path"
-    
-    chmod +x "$rotate_script_path"
-    $SUDO_CMD pm2 start "$rotate_script_path" --name "nexus-rotate"
-    $SUDO_CMD pm2 save --force
-    
-    log_success "节点轮换已成功启动！"
-    echo -e "${COLOR_CYAN}使用 '$SUDO_CMD pm2 logs nexus-rotate' 查看轮换日志${COLOR_RESET}"
-    read -n 1 -s -r -p "按任意键返回主菜单..."
-}
-
-# 批量卸载节点
-function batch_uninstall_nodes() {
-    local all_nodes
-    all_nodes=($(get_all_nodes))
-    if [ ${#all_nodes[@]} -eq 0 ]; then log_warn "当前没有任何节点可供卸载。"; read -n 1 -s -r -p "按任意键返回..."; return; fi
-
-    echo "请选择要卸载的节点 (可多选，用空格分隔，例如 '1 3 4'):"
-    echo "0. 返回主菜单"
-    echo "all. 卸载所有节点"
-    for i in "${!all_nodes[@]}"; do printf "%-4d %s\n" $((i+1)) "${all_nodes[$i]}"; done
-    
-    read -rp "请输入选项: " choices
-    [ "$choices" == "0" ] && return
-    if [[ "$choices" == "all" ]]; then uninstall_all_nodes; return; fi
-
-    read -ra selected_indices <<< "$choices"
-    for index in "${selected_indices[@]}"; do
-        if [[ "$index" =~ ^[0-9]+$ ]] && [ "$index" -ge 1 ] && [ "$index" -le ${#all_nodes[@]} ]; then
-            uninstall_node "${all_nodes[$((index-1))]}"
-            log_success "节点 ${all_nodes[$((index-1))]} 已卸载。"
-        else
-            log_warn "跳过无效选项: $index"
+    local node_ids=()
+    while read -r line; do
+        if [ -n "$line" ]; then
+            node_ids+=("$line")
         fi
     done
-    
-    log_success "选定的节点已卸载完成！"
-    read -n 1 -s -r -p "按任意键返回主菜单..."
+
+    if [ ${#node_ids[@]} -eq 0 ]; then
+        echo "未输入任何 node-id，返回主菜单"
+        read -p "按任意键继续"
+        return
+    fi
+
+    # 设置每两小时启动的节点数量
+    read -rp "请输入每两小时要启动的节点数量（默认：${#node_ids[@]}的一半，向上取整）: " nodes_per_round
+    if [ -z "$nodes_per_round" ]; then
+        nodes_per_round=$(( (${#node_ids[@]} + 1) / 2 ))
+    fi
+
+    # 验证输入
+    if ! [[ "$nodes_per_round" =~ ^[0-9]+$ ]] || [ "$nodes_per_round" -lt 1 ] || [ "$nodes_per_round" -gt ${#node_ids[@]} ]; then
+        echo "无效的节点数量，请输入1到${#node_ids[@]}之间的数字"
+        read -p "按任意键返回菜单"
+        return
+    fi
+
+    # 计算需要多少组
+    local total_nodes=${#node_ids[@]}
+    local num_groups=$(( (total_nodes + nodes_per_round - 1) / nodes_per_round ))
+    echo "节点将分为 $num_groups 组进行轮换"
+
+    # 直接删除旧的轮换进程
+    echo "停止旧的轮换进程..."
+    pm2 delete nexus-rotate 2>/dev/null || true
+
+    echo "开始构建镜像..."
+    build_image
+
+    # 创建启动脚本目录
+    local script_dir="/root/nexus_scripts"
+    mkdir -p "$script_dir"
+
+    # 为每组创建启动脚本
+    for ((group=1; group<=num_groups; group++)); do
+        cat > "$script_dir/start_group${group}.sh" <<EOF
+#!/bin/bash
+set -e
+
+# 停止并删除所有现有容器
+docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}" | xargs -r docker rm -f
+
+# 启动第${group}组节点
+EOF
+    done
+
+    # 添加节点到对应的启动脚本
+    for i in "${!node_ids[@]}"; do
+        local node_id=${node_ids[$i]}
+        local container_name="${BASE_CONTAINER_NAME}-${node_id}"
+        local log_file="${LOG_DIR}/nexus-${node_id}.log"
+        
+        # 计算节点属于哪一组
+        local group_num=$(( i / nodes_per_round + 1 ))
+        if [ $group_num -gt $num_groups ]; then
+            group_num=$num_groups
+        fi
+        
+        # 确保日志目录和文件存在
+        mkdir -p "$LOG_DIR"
+        # 如果日志文件是目录，先删除
+        if [ -d "$log_file" ]; then
+            rm -rf "$log_file"
+        fi
+        # 如果日志文件不存在则新建
+        if [ ! -f "$log_file" ]; then
+            touch "$log_file"
+            chmod 644 "$log_file"
+        fi
+
+        # 添加到对应组的启动脚本
+        echo "echo \"[$(date '+%Y-%m-%d %H:%M:%S')] 启动节点 $node_id ...\"" >> "$script_dir/start_group${group_num}.sh"
+        echo "docker run -d --name $container_name -v $log_file:/root/nexus.log -e NODE_ID=$node_id $IMAGE_NAME" >> "$script_dir/start_group${group_num}.sh"
+        echo "sleep 30" >> "$script_dir/start_group${group_num}.sh"
+    done
+
+    # 创建轮换脚本
+    cat > "$script_dir/rotate.sh" <<EOF
+#!/bin/bash
+set -e
+
+while true; do
+EOF
+
+    # 添加每组启动命令到轮换脚本
+    for ((group=1; group<=num_groups; group++)); do
+        # 计算当前组的节点数量
+        local start_idx=$(( (group-1) * nodes_per_round ))
+        local end_idx=$(( group * nodes_per_round ))
+        if [ $end_idx -gt $total_nodes ]; then
+            end_idx=$total_nodes
+        fi
+        local current_group_nodes=$(( end_idx - start_idx ))
+
+        cat >> "$script_dir/rotate.sh" <<EOF
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 启动第${group}组节点（${current_group_nodes}个）..."
+    bash "$script_dir/start_group${group}.sh"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 等待2小时..."
+    sleep 7200
+
+EOF
+    done
+
+    # 完成轮换脚本
+    echo "done" >> "$script_dir/rotate.sh"
+
+    # 设置脚本权限
+    chmod +x "$script_dir"/*.sh
+
+    # 使用 pm2 启动轮换脚本
+    pm2 start "$script_dir/rotate.sh" --name "nexus-rotate"
+    pm2 save
+
+    echo "节点轮换已启动！"
+    echo "总共 $total_nodes 个节点，分为 $num_groups 组"
+    echo "每组启动 $nodes_per_round 个节点（最后一组可能不足），每2小时轮换一次"
+    echo "使用 'pm2 status' 查看运行状态"
+    echo "使用 'pm2 logs nexus-rotate' 查看轮换日志"
+    echo "使用 'pm2 stop nexus-rotate' 停止轮换"
+    read -p "按任意键返回菜单"
 }
 
-# 设置日志清理任务
+# 设置定时清理日志任务（每2天清理一次，只保留最近2天的日志）
 function setup_log_cleanup_cron() {
-    (crontab -l 2>/dev/null | grep -v -F "find $LOG_DIR" ; echo "0 3 */2 * * find $LOG_DIR -type f -name 'nexus-*.log' -mtime +2 -delete") | crontab -
+    local cron_job="0 3 */2 * * find $LOG_DIR -type f -name 'nexus-*.log' -mtime +2 -delete"
+    # 检查是否已存在相同的定时任务
+    (crontab -l 2>/dev/null | grep -v -F "$cron_job"; echo "$cron_job") | crontab -
+    echo "已设置每2天自动清理，只保留最近2天日志的任务。"
 }
 
 # 主菜单
-function main_menu() {
+setup_log_cleanup_cron
+while true; do
     clear
-    echo -e "${COLOR_CYAN}脚本由哈哈哈哈编写，推特 @ferdie_jhovie，免费开源，请勿相信收费${COLOR_RESET}"
-    echo "========== Nexus 多节点管理 (修复增强版 v2) =========="
-    echo " 1. 单节点管理 - 安装并启动新节点"
-    echo " 2. 单节点管理 - 批量启动多个节点"
-    echo " 3. 多节点管理 - 批量轮换启动 (使用PM2)"
-    echo " ----------------------------------------------------"
-    echo " 4. 状态 & 日志 - 显示所有节点状态"
-    echo " 5. 状态 & 日志 - 查看指定节点日志"
-    echo " ----------------------------------------------------"
-    echo " 6. 卸载操作   - 卸载指定的节点"
-    echo " 7. 卸载操作   - 删除【全部】节点及相关文件"
-    echo " 8. 退出脚本"
-    echo "========================================================"
+    echo "脚本由哈哈哈哈编写，推特 @ferdie_jhovie，免费开源，请勿相信收费"
+    echo "如有问题，可联系推特，仅此只有一个号"
+    echo "========== Nexus 多节点管理 =========="
+    echo "1. 安装并启动新节点"
+    echo "2. 显示所有节点状态"
+    echo "3. 批量停止并卸载指定节点"
+    echo "4. 查看指定节点日志"
+    echo "5. 批量节点轮换启动"
+    echo "6. 删除全部节点"
+    echo "7. 退出"
+    echo "==================================="
 
-    read -rp "请输入选项(1-8): " choice
-    
+    read -rp "请输入选项(1-7): " choice
+
     case $choice in
-        1) 
+        1)
             check_docker
             read -rp "请输入您的 node-id: " NODE_ID
-            if [ -n "$NODE_ID" ]; then 
-                build_image
-                run_container "$NODE_ID"
-            else 
-                log_warn "node-id 不能为空"
+            if [ -z "$NODE_ID" ]; then
+                echo "node-id 不能为空，请重新选择。"
+                read -p "按任意键继续"
+                continue
             fi
-            read -n 1 -s -r -p "按任意键继续..."
+            echo "开始构建镜像并启动容器..."
+            build_image
+            run_container "$NODE_ID"
+            read -p "按任意键返回菜单"
             ;;
-        2) batch_start_nodes;;
-        3) batch_rotate_nodes;;
-        4) list_nodes;;
-        5) select_node_to_view;;
-        6) batch_uninstall_nodes ;;
-        7) uninstall_all_nodes;;
-        8) log_info "感谢使用，脚本退出。"; exit 0;;
-        *) log_warn "无效选项，请重新输入。"; sleep 1;;
+        2)
+            list_nodes
+            ;;
+        3)
+            batch_uninstall_nodes
+            ;;
+        4)
+            select_node_to_view
+            ;;
+        5)
+            check_docker
+            batch_rotate_nodes
+            ;;
+        6)
+            uninstall_all_nodes
+            ;;
+        7)
+            echo "退出脚本。"
+            exit 0
+            ;;
+        *)
+            echo "无效选项，请重新输入。"
+            read -p "按任意键继续"
+            ;;
     esac
-}
-
-# --- 脚本入口 ---
-# 1. 检测系统和权限
-detect_os_and_privileges
-# 2. 【核心修复】同步系统时间
-check_and_sync_time
-# 3. 创建基础目录
-mkdir -p "$SCRIPT_HOME" "$LOG_DIR" "$SCRIPT_DIR"
-# 4. 设置日志清理任务
-setup_log_cleanup_cron
-# 5. 进入主菜单循环
-while true; do main_menu; done
+done 
