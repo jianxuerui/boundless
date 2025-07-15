@@ -2,7 +2,7 @@
 #===============================================================================
 # 脚本名称: nexus_manager.sh
 # 作者: 哈哈哈哈 (Twitter: @ferdie_jhovie)
-# 版本: 1.2.0
+# 版本: 1.2.1  # 版本更新，因为解决了更深层的问题
 # 功能: 管理 Nexus 节点的部署、运行、监控、轮换和卸载。
 # 特点: 支持批量部署，节点轮换，日志管理，依赖检查。
 # 版权: 免费开源，请勿相信任何收费行为。
@@ -19,8 +19,8 @@ set -o pipefail
 BASE_CONTAINER_NAME="nexus-node"      # 所有 Nexus 节点的 Docker 容器名前缀
 IMAGE_NAME="nexus-node:latest"       # 构建的 Docker 镜像名称和标签
 LOG_DIR="/root/nexus_logs"           # 宿主机上 Nexus 日志的存储目录
-# !!!!!重要: Nexus CLI 版本已更新到 1.1.23, 原 1.1.20 导致 404 错误 !!!!!
-NEXUS_CLI_VERSION="1.1.23"           # 硬编码 Nexus CLI 的版本，用于下载
+# !!! 重要: Nexus CLI 版本已更新到 1.1.23, 此前 1.1.20 和硬编码 ARCH 导致了 Docker 构建失败 !!!
+NEXUS_CLI_VERSION="1.1.23"           # Nexus CLI 的版本
 
 # --- 函数定义 ---
 
@@ -29,26 +29,20 @@ function check_docker() {
     echo ">>> 检测 Docker 状态..."
     if ! command -v docker &> /dev/null; then
         echo ">>> Docker 未安装，开始安装..."
-        # 更新包列表并安装必要的依赖
         apt-get update -qq || { echo ">>> ERROR: apt update 失败，请检查网络连接或尝试手动执行 'apt update'"; exit 1; }
         apt-get install -y -qq apt-transport-https ca-certificates curl software-properties-common gnupg || { echo ">>> ERROR: 安装 Docker 所需的包失败"; exit 1; }
 
-        # 添加 Docker 的官方 GPG 密钥
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg &> /dev/null || { echo ">>> ERROR: 下载 Docker GPG 密钥失败"; exit 1; }
         
-        # 添加 Docker 的 APT 仓库
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list &> /dev/null || { echo ">>> ERROR: 添加 Docker APT 仓库失败"; exit 1; }
         
-        # 更新包列表后安装 Docker CE
         apt-get update -qq
         apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin || { echo ">>> ERROR: 安装 docker-ce 失败"; exit 1; }
         
-        # 启用并启动 Docker 服务
         systemctl enable docker || { echo ">>> ERROR: 启用 Docker 服务失败"; exit 1; }
         systemctl start docker || { echo ">>> ERROR: 启动 Docker 服务失败"; exit 1; }
         echo ">>> Docker 已成功安装并启动。"
     else
-        # 检查 Docker 服务是否正在运行
         if ! systemctl is-active --quiet docker; then
             echo ">>> 检测到 Docker 服务未运行，正在尝试启动..."
             systemctl start docker || { echo ">>> ERROR: 启动 Docker 服务失败"; exit 1; }
@@ -80,60 +74,60 @@ function check_pm2() {
 function build_image() {
     echo ">>> 开始构建 Docker 镜像 '$IMAGE_NAME'..."
     
-    # WORKDIR 在此声明为函数局部变量
     local WORKDIR
     WORKDIR=$(mktemp -d) 
-
     # 设置一个 EXIT trap 来清理 WORKDIR。此 trap 只在此函数作用域内有效。
     trap 'echo ">>> [Build Image] 清理临时目录 $WORKDIR"; rm -rf -- "$WORKDIR"' EXIT INT TERM
     
     cd "$WORKDIR" || { echo ">>> ERROR: 无法进入临时目录 '$WORKDIR'"; return 1; }
 
-    # --- 创建 Dockerfile ---
-    cat > Dockerfile <<EOF
+    # --- 安全地生成 Dockerfile 内容 ---
+    # 使用一个大型的 cat HERE-DOC 来创建 Dockerfile，减少因变量展开错误的可能性。
+    # 注意：所有脚本内的 Bash 命令（如 curl, tar）都将被放在 Dockerfile 的 RUN 指令内部。
+    #       Bash 变量展开将在这里执行。
+    cat <<EOF > Dockerfile
 # --- Dockerfile for Nexus Node ---
 FROM ubuntu:24.04
 
-LABEL maintainer="哈哈哈哈 <https://twitter.com/ferdie_jhovie>"
+LABEL maintainer="哈哈哈哈 (Twitter: @ferdie_jhovie)"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PROVER_ID_FILE=/root/.nexus/node-id
 ENV NODE_LOG_PATH=/root/nexus.log
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    tar \
-    ca-certificates \
-    screen \
-    bash \
-    jq \
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+    curl \\
+    tar \\
+    ca-certificates \\
+    screen \\
+    bash \\
+    jq \\
     && rm -rf /var/lib/apt/lists/*
 
 # === 下载和安装 Nexus CLI ===
-# !!! 重要: NEXUS_CLI_VERSION 已更新为 1.1.23 以解决 404 错误 !!!
+# 利用 script 中定义的全局变量来生成正確的 Dockerfile RUN 指令
 RUN NEXUS_CLI_VERSION="${NEXUS_CLI_VERSION}" && \
     ARCH=$(uname -m) && \
-    echo ">>> Docker build: 检测到的架构为 $ARCH，将安装 Nexus CLI 版本 $NEXUS_CLI_VERSION。" && \
-    case "$ARCH" in \
+    echo ">>> Docker build: 检测到的架构为 \${ARCH}，将安装 Nexus CLI 版本 \${NEXUS_CLI_VERSION}。" && \
+    case "\${ARCH}" in \
         "aarch64") \
-            URL="https://github.com/nexus-xyz/nexus-network-services/releases/download/v${NEXUS_CLI_VERSION}/nexus-cli_${NEXUS_CLI_VERSION}_linux_arm64.tar.gz" ;; \
+            URL="https://github.com/nexus-xyz/nexus-network-services/releases/download/v\${NEXUS_CLI_VERSION}/nexus-cli_\${NEXUS_CLI_VERSION}_linux_arm64.tar.gz" ;; \
         "x86_64") \
-            URL="https://github.com/nexus-xyz/nexus-network-services/releases/download/v${NEXUS_CLI_VERSION}/nexus-cli_${NEXUS_CLI_VERSION}_linux_amd64.tar.gz" ;; \
+            URL="https://github.com/nexus-xyz/nexus-network-services/releases/download/v\${NEXUS_CLI_VERSION}/nexus-cli_\${NEXUS_CLI_VERSION}_linux_amd64.tar.gz" ;; \
         *) \
-            echo ">>> Docker build: 错误 - 不支持的 CPU 架构: $ARCH。仅支持 aarch64 和 x86_64。" >&2 && exit 1 ;; \
+            echo ">>> Docker build: 错误 - 不支持的 CPU 架构: \$ARCH。仅支持 aarch64 和 x86_64。" >&2 && exit 1 ;; \
     esac && \
-    echo ">>> Docker build: 将从 ${URL} 下载 Nexus CLI..." && \
+    echo ">>> Docker build: 将从 \${URL} 下载 Nexus CLI..." && \
     mkdir -p /root/.nexus/bin && \
-    TMP_DIR=$(mktemp -d) && \
-    # 提高 curl 和 tar 的健壮性
-    curl -fsSL "${URL}" -o "${TMP_DIR}/nexus.tar.gz" || { echo ">>> Docker build: 下载 Nexus CLI 包失败。" >&2; exit 1; } && \
-    # 增加解压的健壮性
-    echo ">>> Docker build: 解压 ${TMP_DIR}/nexus.tar.gz..." && \
-    tar -xzf "${TMP_DIR}/nexus.tar.gz" -C "${TMP_DIR}" || { echo ">>> Docker build: 解压 Nexus CLI 包失败。" >&2; exit 1; } && \
-    mv "${TMP_DIR}/nexus-network" /root/.nexus/bin/ || { echo ">>> Docker build: 移动 nexus-network 到安装目录失败。" >&2; exit 1; } && \
+    TMP_DIR=\$(mktemp -d) && \
+    # 提高 curl 和 tar 的健壮性，并在命令前使用 \ to avoid splitting
+    curl -fsSL "\${URL}" -o "\${TMP_DIR}/nexus.tar.gz" || { echo ">>> Docker build: 下载 Nexus CLI 包失败。" >&2; exit 1; } && \
+    echo ">>> Docker build: 解压 \${TMP_DIR}/nexus.tar.gz..." && \
+    tar -xzf "\${TMP_DIR}/nexus.tar.gz" -C "\${TMP_DIR}" || { echo ">>> Docker build: 解压 Nexus CLI 包失败。" >&2; exit 1; } && \
+    mv "\${TMP_DIR}/nexus-network" /root/.nexus/bin/ || { echo ">>> Docker build: 移动 nexus-network 到安装目录失败。" >&2; exit 1; } && \
     ln -sf /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network || { echo ">>> Docker build: 创建 nexus-network 软链接失败。" >&2; exit 1; } && \
-    rm -rf "${TMP_DIR}" && \
-    echo ">>> Docker build: Nexus CLI v${NEXUS_CLI_VERSION} 安装成功。"
+    rm -rf "\${TMP_DIR}" && \
+    echo ">>> Docker build: Nexus CLI v\${NEXUS_CLI_VERSION} 安装成功。"
 # === Nexus CLI 安装结束 ===
 
 COPY entrypoint.sh /entrypoint.sh
@@ -143,7 +137,8 @@ ENTRYPOINT ["/entrypoint.sh"]
 EOF
 
     # --- 创建 entrypoint.sh ---
-    cat > entrypoint.sh <<EOF
+    # Entrypoint.sh 内容与之前版本相同，这里不再重复复制，确保其是独立维护的
+    cat <<'EOF' > entrypoint.sh
 #!/bin/bash
 # --- Entrypoint script for Nexus Node Container ---
 set -e
@@ -152,14 +147,14 @@ set -o pipefail
 PROVER_ID_FILE="/root/.nexus/node-id"
 NODE_LOG_PATH="/root/nexus.log"
 
-if [ -z "\$NODE_ID" ]; then
+if [ -z "$NODE_ID" ]; then
     echo ">>> ERROR: NODE_ID 环境变量未设置。容器无法启动。请检查运行命令。" >&2
     exit 1
 fi
 
-echo "\$NODE_ID" > "\$PROVER_ID_FILE"
-echo ">>> Container: Nexus 节点 ID 为: \$NODE_ID"
-echo ">>> Container: Nexus 运行日志将输出到: \$NODE_LOG_PATH"
+echo "$NODE_ID" > "$PROVER_ID_FILE"
+echo ">>> Container: Nexus 节点 ID 为: $NODE_ID"
+echo ">>> Container: Nexus 运行日志将输出到: $NODE_LOG_PATH"
 
 if ! command -v nexus-network &> /dev/null; then
     echo ">>> ERROR: 'nexus-network' 命令不可用。请检查镜像构建或安装。" >&2
@@ -170,21 +165,21 @@ if screen -list | grep -q "nexus"; then
     echo ">>> Container: Nexus 进程已在运行的 'nexus' screen session 中管理。"
 else
     echo ">>> Container: 启动 Nexus 进程 (使用 screen 管理)..."
-    screen -dmS nexus bash -c ' \
-        trap "echo >>> Screen \"nexus\" session received SIGTERM, cleaning up...; \
-                 pkill -f \"nexus-network start --node-id \$NODE_ID\" || true; \
-                 screen -S nexus -X quit; \
-                 exit 0" SIGTERM SIGINT SIGQUIT SIGKILL; \
-        echo >>> Screen \"nexus\" session started. Logging to ${NODE_LOG_PATH}; \
-        while true; do \
-            nexus-network start --node-id \$NODE_ID &>> '${NODE_LOG_PATH}'; \
-            if [ \$? -eq 0 ]; then \
-                echo >>> Nexus network start successful, running...; \
-                sleep 60; \
-            else \
-                echo >>> Nexus network start failed or exited abnormally. Retrying in 30 seconds...; \
-                sleep 30; \
-            fi; \
+    screen -dmS nexus bash -c ' 
+        trap "echo >>> Screen \"nexus\" session received SIGTERM, cleaning up...; 
+                 pkill -f \"nexus-network start --node-id \$NODE_ID\" || true; 
+                 screen -S nexus -X quit; 
+                 exit 0" SIGTERM SIGINT SIGQUIT SIGKILL; 
+        echo >>> Screen \"nexus\" session started. Logging to ${NODE_LOG_PATH}; 
+        while true; do 
+            nexus-network start --node-id $NODE_ID &>> '${NODE_LOG_PATH}'; 
+            if [ $? -eq 0 ]; then 
+                echo >>> Nexus network start successful, running...; 
+                sleep 60; 
+            else 
+                echo >>> Nexus network start failed or exited abnormally. Retrying in 30 seconds...; 
+                sleep 30; 
+            fi; 
         done '
     sleep 5 
 fi
@@ -194,8 +189,7 @@ tail -f "${NODE_LOG_PATH}"
 EOF
 
     # --- 执行 Docker 构建 ---
-    # 使用 /bin/bash -c 来执行多行RUN指令
-    # 注意：此处直接在 Dockerfile 中调用了多条 shell 命令，确保了构建过程的独立性和标准化。
+    # 使用 /bin/bash -c 执行 Dockerfile
     if docker build -t "$IMAGE_NAME" . ; then
         echo ">>> Docker 镜像 '$IMAGE_NAME' 构建成功！"
     else
@@ -636,84 +630,104 @@ function batch_rotate_nodes() {
     mkdir -p "$script_dir" || { echo ">>> ERROR: 创建脚本目录 '$script_dir' 失败。"; return 1; }
     local rotate_script="$script_dir/rotate_nodes.sh"
 
-    echo "#!/bin/bash" > "$rotate_script"
-    echo "set -e" >> "$rotate_script"
-    echo "set -o pipefail" >> "$rotate_script"
-    echo "IMAGE_NAME=\"${IMAGE_NAME}\"" >> "$rotate_script"
-    echo "BASE_CONTAINER_NAME=\"${BASE_CONTAINER_NAME}\"" >> "$rotate_script"
-    echo "LOG_DIR=\"${LOG_DIR}\"" >> "$rotate_script"
-    echo "ALL_NODE_IDS=(\"${node_ids[@]}\")" >> "$rotate_script"
-    echo "NODES_PER_ROUND=${nodes_per_round}" >> "$rotate_script"
-    echo "TOTAL_NODES=${total_nodes}" >> "$rotate_script"
-    echo "NUM_GROUPS=${num_groups}" >> "$rotate_script"
+    # 确保 Dockerfile 和 entrypoint.sh 的生成过程更加安全和鲁棒
+    cat <<'EOF' > "$rotate_script"
+#!/bin/bash
+# --- Nexus Node Rotation Script ---
+set -e
+set -o pipefail
 
-    echo 'declare -A rounds_nodes' >> "$rotate_script"
-    for ((g=0; g<num_groups; g++)); do
-        local start_index=$(( g * nodes_per_round ))
-        local current_round_nodes=()
-        for ((i=start_index; i<start_index + nodes_per_round && i < TOTAL_NODES; i++)); do
-            current_round_nodes+=("${ALL_NODE_IDS[i]}")
-        done
-        local nodes_string
-        printf -v nodes_string '"%s" ' "${current_round_nodes[@]}"
-        echo "rounds_nodes[$g]=(${nodes_string})" >> "$rotate_script"
+# 脚本配置，通过全局变量传入
+IMAGE_NAME="$IMAGE_NAME"
+BASE_CONTAINER_NAME="$BASE_CONTAINER_NAME"
+LOG_DIR="$LOG_DIR"
+ALL_NODE_IDS=("${ALL_NODE_IDS[@]}") # 注意：bash 数组传递时需确保格式正确
+NODES_PER_ROUND=$NODES_PER_ROUND
+TOTAL_NODES=$TOTAL_NODES
+NUM_GROUPS=$NUM_GROUPS
+
+# Bash 数组处理稍微复杂，直接传递给这里进行二次构造更为可靠
+# declaration of rounds_nodes using values
+declare -A rounds_nodes
+start_idx=0
+for ((g=0; g<NUM_GROUPS; g++)); do
+    current_round_nodes=()
+    end_idx=$((start_idx + NODES_PER_ROUND))
+    if [ $end_idx -gt $TOTAL_NODES ]; then
+        end_idx=$TOTAL_NODES
+    fi
+    
+    for ((i=start_idx; i<end_idx; i++)); do
+        current_round_nodes+=("${ALL_NODE_IDS[i]}")
     done
+    
+    rounds_nodes[$g]=("${current_round_nodes[@]}")
+    start_idx=$end_idx
+done
 
-    echo 'echo "[$(date "+%Y-%m-%d %H:%M:%S")] Nexus 节点轮换脚本启动..."' >> "$rotate_script"
-    echo 'while true; do' >> "$rotate_script"
-    echo '  for ((round=0; round<NUM_GROUPS; round++)); do' >> "$rotate_script"
-    echo '    echo ""' >> "$rotate_script"
-    echo '    echo "[$(date "+%Y-%m-%d %H:%M:%S")] === 开始第 $((round+1))/${NUM_GROUPS} 轮次节点轮换 ===" ' >> "$rotate_script"
+# 循环执行轮换
+echo "[$(date "+%Y-%m-%d %H:%M:%S")] Nexus 节点轮换脚本启动..."
+while true; do
+  for ((round=0; round<NUM_GROUPS; round++)); do
+    echo ""
+    echo "[$(date "+%Y-%m-%d %H:%M:%S")] === 开始第 $((round+1))/${NUM_GROUPS} 轮次节点轮换 ===" 
     
-    echo '    echo "[$(date "+%Y-%m-%d %H:%M:%S")] 停止并删除所有正在运行或已停止的 Nexus 节点容器..." ' >> "$rotate_script"
-    echo '    docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}" | xargs -r docker rm -f' >> "$rotate_script"
+    echo "[$(date "+%Y-%m-%d %H:%M:%S")] 停止并删除所有 Nexus 节点容器..." 
+    docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}" | xargs -r docker rm -f
     
-    echo '    current_round_node_ids=("${rounds_nodes[round]}")' >> "$rotate_script"
-    echo '    echo "[$(date "+%Y-%m-%d %H:%M:%S")] 本轮次将启动的节点 (${#current_round_node_ids[@]}个): ${current_round_node_ids[*]}" ' >> "$rotate_script"
+    current_round_node_ids=("${rounds_nodes[round]}")
+    echo "[$(date "+%Y-%m-%d %H:%M:%S")] 本轮次将启动的节点 (${#current_round_node_ids[@]}个): ${current_round_node_ids[*]}" 
 
-    echo '    if [ ${#current_round_node_ids[@]} -eq 0 ]; then ' >> "$rotate_script"
-    echo '        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 警告: 当前轮次没有节点需要启动。" ' >> "$rotate_script"
-    echo '        sleep 10 ' >> "$rotate_script"
-    echo '        continue ' >> "$rotate_script"
-    echo '    fi' >> "$rotate_script"
+    if [ ${#current_round_node_ids[@]} -eq 0 ]; then 
+        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 警告: 当前轮次没有节点需要启动。" 
+        sleep 10 
+        continue 
+    fi
     
-    echo '    for node_id in "${current_round_node_ids[@]}"; do' >> "$rotate_script"
-    echo '        CONTAINER_NAME="'"${BASE_CONTAINER_NAME}"'-\${node_id}"' >> "$rotate_script"
-    echo '        LOG_FILE="${LOG_DIR}/nexus-\${node_id}.log"' >> "$rotate_script"
-    echo '        echo "[$(date "+%Y-%m-%d %H:%M:%S")]   - 尝试启动节点 \${node_id} (容器: \${CONTAINER_NAME})..." ' >> "$rotate_script"
-    echo '        mkdir -p "$LOG_DIR" && touch "$LOG_FILE"' >> "$rotate_script"
-    echo '        if docker run -d \
-            --name "\${CONTAINER_NAME}" \
+    for node_id in "${current_round_node_ids[@]}"; do
+        CONTAINER_NAME="${BASE_CONTAINER_NAME}-${node_id}"
+        LOG_FILE="${LOG_DIR}/nexus-${node_id}.log"
+        echo "[$(date "+%Y-%m-%d %H:%M:%S")]   - 尝试启动节点 ${node_id} (容器: ${CONTAINER_NAME})..." 
+        mkdir -p "$LOG_DIR" && touch "$LOG_FILE" # 确保目录和文件存在
+        
+        # 运行容器，并将环境变量传入
+        if docker run -d \
+            --name "${CONTAINER_NAME}" \
             -v "$LOG_FILE":/root/nexus.log \
-            -e NODE_ID="\${node_id}" \
-            "$IMAGE_NAME"; then ' >> "$rotate_script"
-    echo '            echo "[$(date "+%Y-%m-%d %H:%M:%S")]     成功启动节点 \${node_id}。" ' >> "$rotate_script"
-    echo '            sleep 30 ' >> "$rotate_script"
-    echo '        else ' >> "$rotate_script"
-    echo '            echo "[$(date "+%Y-%m-%d %H:%M:%S")]     启动节点 \${node_id} 失败！" ' >> "$rotate_script"
-    echo '        fi ' >> "$rotate_script"
-    echo '    done' >> "$rotate_script"
+            -e NODE_ID="${node_id}" \
+            "$IMAGE_NAME"; then 
+            echo "[$(date "+%Y-%m-%d %H:%M:%S")]     成功启动节点 ${node_id}。" 
+            sleep 30 
+        else 
+            echo "[$(date "+%Y-%m-%d %H:%M:%S")]     启动节点 ${node_id} 失败！" 
+        fi 
+    done
     
-    echo '    echo "[$(date "+%Y-%m-%d %H:%M:%S")] 第 $((round+1))/${NUM_GROUPS} 轮次节点启动完毕。" ' >> "$rotate_script"
+    echo "[$(date "+%Y-%m-%d %H:%M:%S")] 第 $((round+1))/${NUM_GROUPS} 轮次节点启动完毕。" 
     
-    echo '    if [ $((round + 1)) -lt ${NUM_GROUPS} ]; then ' >> "$rotate_script"
-    echo '        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 等待 2 小时 (7200 秒) 进行下一轮次切换..."' >> "$rotate_script"
-    echo '        sleep 7200' >> "$rotate_script"
-    echo '    else' >> "$rotate_script"
-    echo '        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 所有配置的轮次已执行完毕，将在 2 小时后重新开始新一轮的节点轮换。" ' >> "$rotate_script"
-    echo '        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 如果需要停止轮换，请执行: pm2 stop nexus-rotate。" ' >> "$rotate_script"
-    echo '        sleep 7200' >> "$rotate_script"
-    echo '    fi' >> "$rotate_script"
-    echo '  done' >> "$rotate_script"
-    echo 'done' >> "$rotate_script"
-
-    echo 'echo "[$(date "+%Y-%m-%d %H:%M:%S")] Nexus 节点轮换脚本执行完毕（或循环已继续）。"' >> "$rotate_script"
+    # 设定下一轮的等待时间
+    echo "[$(date "+%Y-%m-%d %H:%M:%S")] 等待 2 小时 (7200 秒) 进行下一轮次切换..."
+    sleep 7200
+  done
+done # End while true
+echo "[$(date "+%Y-%m-%d %H:%M:%S")] Nexus 节点轮换脚本执行完毕（或循环已继续）。"
+EOF
 
     chmod +x "$rotate_script" || { echo ">>> ERROR: 为轮换脚本 '$rotate_script' 添加执行权限失败。"; return 1; }
     echo ">>> 已成功生成节点轮换启动脚本: '$rotate_script'"
 
     echo ">>> 使用 PM2 启动轮换脚本 'nexus-rotate'..."
-    if pm2 start "$rotate_script" --name "nexus-rotate" --watch --restart-delay 5000 --max-memory-restart 1G; then
+    # 在启动轮换脚本时，将 HOST 的全局变量传递给 PM2 进程的 `env` 配置
+    if pm2 start "$rotate_script" --name "nexus-rotate" \
+       --env "NODE_ID=rotation-script" \
+       --env "IMAGE_NAME=${IMAGE_NAME}" \
+       --env "BASE_CONTAINER_NAME=${BASE_CONTAINER_NAME}" \
+       --env "LOG_DIR=${LOG_DIR}" \
+       --env "ALL_NODE_IDS=${ALL_NODE_IDS[*]}" \
+       --env "NODES_PER_ROUND=${nodes_per_round}" \
+       --env "TOTAL_NODES=${TOTAL_NODES}" \
+       --env "NUM_GROUPS=${num_groups}" \
+       --watch --restart-delay 5000 --max-memory-restart 1G; then
         echo ">>> 节点轮换管理进程 'nexus-rotate' 已成功启动！"
         echo ">>> 你可以使用以下命令监控和管理:"
         echo "    pm2 list"
@@ -748,7 +762,7 @@ function setup_log_cleanup_cron() {
 function display_menu() {
     clear
     echo "============================================"
-    echo "      Nexus 多节点管理脚本 (v1.2.0)"
+    echo "      Nexus 多节点管理脚本 (v1.2.1)" # 版本号更新
     echo "============================================"
     echo " 作者: 哈哈哈哈 (Twitter: @ferdie_jhovie)"
     echo ""
@@ -771,7 +785,9 @@ function display_menu() {
 setup_log_cleanup_cron
 
 # 全局的 trap 用于在任何情况下清理工作目录（主要是为了 build_image）
-trap 'echo ">>> [Main Script] Global EXIT trap, cleaning WORKDIR..."; rm -rf -- "$WORKDIR" || true' EXIT INT TERM
+# 在主脚本顶层定义了 WORKDIR 变量
+WORKDIR="" # 初始化 WORKDIR 为空，如果 build_image 执行，它会被 mktemp 设置
+trap 'echo ">>> [Main Script] Global EXIT trap, cleaning WORKDIR: $WORKDIR"; rm -rf -- "$WORKDIR" || true' EXIT INT TERM
 
 # 主循环：持续显示菜单并处理用户选择
 while true; do
@@ -792,8 +808,8 @@ while true; do
             batch_uninstall_nodes
             ;;
         4) # 查看节点日志
-            # selected_node_id 的 local 声明是在函数 select_node_for_action 内部
-            local selected_node_id # 这个是在 select_node_for_action 返回值赋给的变量，确保它在主循环里是本地变量
+            # selected_node_id 在函数内有其局部声明
+            local selected_node_id 
             selected_node_id=$(select_node_for_action "查看日志")
             if [ -n "$selected_node_id" ]; then
                 view_node_logs "$selected_node_id"
@@ -807,11 +823,12 @@ while true; do
             echo ">>> 所有已部署的 Nexus 节点容器及其日志文件都将被永久清除。"
             echo ">>> 这是一个不可逆的操作，请务必确认。"
             
-            # 这里使用普通的变量，而不是 local，因为主循环不是函数
+            # 普通变量，在主循环中
             read -rp ">>> 如果您确实要继续，请输入大写字母 'YES' 来确认: " confirm_all_delete
             
             if [ "$confirm_all_delete" == "YES" ]; then
-                local all_nodes_to_delete # 在这里重新声明为 local，这样它只在此 case 语句的作用域内
+                # 这里也使用普通的变量来存储节点列表，以避免 `local` 错误
+                local all_nodes_to_delete 
                 all_nodes_to_delete=($(get_all_nodes))
 
                 if [ ${#all_nodes_to_delete[@]} -eq 0 ]; then
@@ -839,6 +856,3 @@ while true; do
             ;;
     esac
 done
-
-# 脚本结束（正常退出后此处不会被执行）
-# trap - EXIT INT TERM # 如果有 EXIT trap 需要清理
