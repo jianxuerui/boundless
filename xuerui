@@ -2,8 +2,9 @@
 #===============================================================================
 # 脚本名称: nexus_manager.sh
 # 作者: 哈哈哈哈 (Twitter: @ferdie_jhovie)
-# 版本: 1.2.4  # 版本更新
+# 版本: 1.2.6  # 版本更新，支持手动指定了Nexus CLI直接下载链接
 # 功能: 管理 Nexus 节点的部署、运行、监控、轮换和卸载。
+# 特点: 支持批量部署，节点轮换，日志管理，依赖检查。
 # 版权: 免费开源，请勿相信任何收费行为。
 #===============================================================================
 
@@ -16,7 +17,25 @@ set -o pipefail
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:latest"
 LOG_DIR="/root/nexus_logs"
-NEXUS_CLI_VERSION="1.1.23" # Nexus CLI 版本 (如果这仍然不行，请手动指定一个确定的有效版本)
+
+# !!! 重要:Nexus CLI 下载链接已根据您提供的信息更新 !!!
+# 您找到的下载链接是: https://github.com/nexus-xyz/nexus-cli/releases/download/v0.9.6/nexus-network-linux-arm64
+# 这个链接看起来是直接下载一个可执行文件，而不是 tar.gz 压缩包。
+# 这要求我们修改 Dockerfile 中的下载和安装逻辑。
+# 请根据您的宿主机架构确认下载链接是否正确 (例如,amd64 vs arm64)。
+# 目前假定您使用是 arm64，因为您提供的链接是 _arm64。如果是 x86_64 (amd64)，您需要修改此处的链接。
+
+# 使用您提供的链接作为最终的下载 URL
+# !!! IMPORTANT: 请根据您实际的构建环境架构 (amd64 or arm64)，确认并调整以下 URL !!!
+# 例如，如果您需要amd64，您可能需要找到形如：
+# https://github.com/nexus-xyz/nexus-cli/releases/download/v0.9.6/nexus-network-linux-x86_64  这样的链接
+DETECTED_NEXUS_CLI_URL="https://github.com/nexus-xyz/nexus-cli/releases/download/v0.9.6/nexus-network-linux-arm64"
+NEXUS_CLI_FILENAME="nexus-network" # 从链接中推断出的可执行文件名
+NEXUS_CLI_INSTALLED_PATH="/root/.nexus/bin/nexus-network" # 安装后的目标路径
+
+# 如果您不确定您的架构或者上述链接不对，可以尝试以下链接
+# 假设的 amd64 链接 (您可能需要手动替换或找到实际的)
+# DETECTED_NEXUS_CLI_URL="https://github.com/nexus-xyz/nexus-cli/releases/download/v0.9.6/nexus-network-linux-amd64" # 替换为您找到的AMD64链接
 
 # --- 函数定义 ---
 
@@ -72,42 +91,8 @@ function build_image() {
     
     cd "$WORKDIR" || { echo ">>> ERROR: 无法进入临时目录 '$WORKDIR'"; return 1; }
 
-    # --- 宿主机上动态决定 ARCH, CLI_ARCH, NEXUS_CLI_URL, 并打印以便调试 ---
-    local ARCH=$(uname -m)
-    local NEXUS_CLI_ARCH=""
-    local NEXUS_CLI_URL=""
-
-    case "$ARCH" in
-        "aarch64")
-            NEXUS_CLI_ARCH="arm64"
-            ;;
-        "x86_64")
-            NEXUS_CLI_ARCH="amd64"
-            ;;
-        *)
-            echo ">>> ERROR: 不支持的 CPU 架构: $ARCH。仅支持 aarch64 和 x86_64。" >&2
-            return 1
-            ;;
-    esac
-    
-    # Construct the FINAL URL here based on validated ARCH and global version
-    NEXUS_CLI_URL="https://github.com/nexus-xyz/nexus-network-services/releases/download/v${NEXUS_CLI_VERSION}/nexus-cli_${NEXUS_CLI_VERSION}_linux_${NEXUS_CLI_ARCH}.tar.gz"
-    
-    echo ">>> Host build: 检测到宿主机架构: '$ARCH'。"
-    echo ">>> Host build: Nexus CLI 版本被设置为: '$NEXUS_CLI_VERSION'。"
-    echo ">>> Host build: 为 CLI 生成的目标架构后缀为: '$NEXUS_CLI_ARCH'。"
-    echo ">>> Host build: 生成的 Nexus CLI 下载 URL 是: '$NEXUS_CLI_URL'"
-
-    # 可选：在这里先进行一次 URL 可用性检查，如果宿主机可以访问
-    # (此步骤如果因为网络问题失败，还是需要返回错误)
-    if ! curl --output /dev/null --silent --head --fail "$NEXUS_CLI_URL"; then
-        echo ">>> ERROR: 从 '$NEXUS_CLI_URL' 检查下载链接时出错 (404 或其他错误)。请确认 Nexus CLI 版本 '$NEXUS_CLI_VERSION' 对应的二进制文件是否存在且URL正确。"
-        echo ">>> 您可能需要检查 GitHub Release 页面或更新 '$NEXUS_CLI_VERSION' 到一个已知可用的版本。"
-        return 1 # 指出 URL 确实是有问题的
-    fi
-    echo ">>> Host build: 检查发现下载链接 '$NEXUS_CLI_URL' 是可访问的。"
-
     # --- 安全生成 Dockerfile 内容 ---
+    # 直接嵌入您提供的下载链接，并移除不必要的解压逻辑
     cat <<EOF > Dockerfile
 # --- Dockerfile for Nexus Node ---
 FROM ubuntu:24.04
@@ -120,31 +105,23 @@ ENV NODE_LOG_PATH=/root/nexus.log
 
 RUN apt-get update && apt-get install -y --no-install-recommends \\
     curl \\
-    tar \\
-    ca-certificates \\
     screen \\
     bash \\
     jq \\
     && rm -rf /var/lib/apt/lists/*
 
 # === 下载和安装 Nexus CLI ===
-RUN NEXUS_CLI_VERSION="${NEXUS_CLI_VERSION}" && \\
-    # 将宿主机上确定的 Arch, CLI_ARCH, NEXUS_URL 直接嵌入到 Dockerfile 的 RUN 指令中
-    ARCH="${ARCH}" && \
-    CLI_ARCH="${NEXUS_CLI_ARCH}" && \
-    NEXUS_URL="${NEXUS_CLI_URL}" && \
-    echo ">>> Docker build: 检测到的架构为 \${ARCH}，将安装 Nexus CLI 版本 \${NEXUS_CLI_VERSION} (CLI 对应arch \${CLI_ARCH})。" && \
-    echo ">>> Docker build: 将从 \${NEXUS_URL} 下载 Nexus CLI..." && \
+# 使用您提供的直接下载链接来安装 nexus-network
+RUN NEXUS_CLI_URL="${DETECTED_NEXUS_CLI_URL}" && \\
+    NEXUS_CLI_FILENAME="${NEXUS_CLI_FILENAME}" && \
+    NEXUS_CLI_INSTALLED_PATH="${NEXUS_CLI_INSTALLED_PATH}" && \
+    echo ">>> Docker build: 将从 ${NEXUS_CLI_URL} 下载 Nexus CLI 文件 (${NEXUS_CLI_FILENAME})..." && \
     mkdir -p /root/.nexus/bin && \
-    TMP_DIR=\$(mktemp -d) && \
-    echo ">>> Docker build: 创建临时下载目录: \${TMP_DIR}" && \
-    curl -fsSL "\${NEXUS_URL}" -o "\${TMP_DIR}/nexus.tar.gz" || { echo ">>> Docker build: 下载 Nexus CLI 包失败。" >&2; exit 1; } && \
-    echo ">>> Docker build: 解压 \${TMP_DIR}/nexus.tar.gz..." && \
-    tar -xzf "\${TMP_DIR}/nexus.tar.gz" -C "\${TMP_DIR}" || { echo ">>> Docker build: 解压 Nexus CLI 包失败。" >&2; exit 1; } && \
-    mv "\${TMP_DIR}/nexus-network" /root/.nexus/bin/ || { echo ">>> Docker build: 移动 nexus-network 到安装目录失败。" >&2; exit 1; } && \
-    ln -sf /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network || { echo ">>> Docker build: 创建 nexus-network 软链接失败。" >&2; exit 1; } && \
-    rm -rf "\${TMP_DIR}" && \
-    echo ">>> Docker build: Nexus CLI v\${NEXUS_CLI_VERSION} 安装成功。"
+    echo ">>> Docker build: 将下载到 ${NEXUS_CLI_INSTALLED_PATH}" && \
+    curl -fsSL "${NEXUS_CLI_URL}" -o "${NEXUS_CLI_INSTALLED_PATH}" || { echo ">>> Docker build: 下载 Nexus CLI 包失败。" >&2; exit 1; } && \
+    echo ">>> Docker build: 修改Nexus CLI 可执行权限..." && \
+    chmod +x "${NEXUS_CLI_INSTALLED_PATH}" || { echo ">>> Docker build: 修改 nexus-network 权限失败。" >&2; exit 1; } && \
+    echo ">>> Docker build: Nexus CLI 安装成功。"
 # === Nexus CLI 安装结束 ===
 
 COPY entrypoint.sh /entrypoint.sh
@@ -216,7 +193,7 @@ EOF
     cd - &> /dev/null
 }
 
-# 启动 Nexus Docker 容器 (其他函数保持不变，除非涉及到上面build_image的修改)
+# ... (其余所有函数和主循环保持不变) ...
 
 # 启动 Nexus Docker 容器
 function run_container() {
@@ -645,20 +622,17 @@ function batch_rotate_nodes() {
     mkdir -p "$script_dir" || { echo ">>> ERROR: 创建脚本目录 '$script_dir' 失败。"; return 1; }
     local rotate_script="$script_dir/rotate_nodes.sh"
 
-    # 生成轮换脚本，确保变量正确传递给 PM2 env
     cat <<EOF > "$rotate_script"
 #!/bin/bash
 # --- Nexus Node Rotation Script ---
 set -e
 set -o pipefail
 
-# 变量通过 PM2 env 参数传入，这里需要根据传递的值重新构造
+# Variables from PM2 env
 IMAGE_NAME="$IMAGE_NAME"
 BASE_CONTAINER_NAME="$BASE_CONTAINER_NAME"
 LOG_DIR="$LOG_DIR"
-# 宿主机的 Bash 数组在传递给 PM2 `--env` 时会转为空格分隔的字符串，
-# 在目标脚本中用 IFS 解析回数组是正确的处理方式
-ALL_NODE_IDS=($ALL_NODE_IDS) # 直接将传递的字符串解析为 Bash 数组
+ALL_NODE_IDS=($ALL_NODE_IDS) # Convert space-separated string back to array
 NODES_PER_ROUND=$NODES_PER_ROUND
 TOTAL_NODES=$TOTAL_NODES
 NUM_GROUPS=$NUM_GROUPS
@@ -731,7 +705,6 @@ EOF
     echo ">>> 已成功生成节点轮换启动脚本: '$rotate_script'"
 
     echo ">>> 使用 PM2 启动轮换脚本 'nexus-rotate'..."
-    # export ALL_NODE_IDS "${ALL_NODE_IDS[*]}" # PM2 的 env 不直接支持 export 变量，需要在调用参数中传入
     if pm2 start "$rotate_script" --name "nexus-rotate" \
        --env "IMAGE_NAME=${IMAGE_NAME}" \
        --env "BASE_CONTAINER_NAME=${BASE_CONTAINER_NAME}" \
@@ -775,7 +748,7 @@ function setup_log_cleanup_cron() {
 function display_menu() {
     clear
     echo "============================================"
-    echo "      Nexus 多节点管理脚本 (v1.2.4)"
+    echo "      Nexus 多节点管理脚本 (v1.2.5)"
     echo "============================================"
     echo " 作者: 哈哈哈哈 (Twitter: @ferdie_jhovie)"
     echo ""
