@@ -1,53 +1,52 @@
 #!/bin/bash
 set -e
 
+# --- 配置区 ---
 BASE_CONTAINER_NAME="nexus-node"
-IMAGE_NAME="nexus-node:latest-arm64" # 建议在镜像名中也指明架构
+IMAGE_NAME="nexus-node:latest-arm64"
 LOG_DIR="/root/nexus_logs"
+
+# --- 核心功能函数 ---
 
 # 检查 Docker 是否安装
 function check_docker() {
-    # 如果您是在ARM架构的机器（如Ampere、Oracle ARM、树莓派等）上运行
-    # Docker的安装过程可能与标准x86有所不同，但以下通用脚本通常也有效。
     if ! command -v docker >/dev/null 2>&1; then
         echo "检测到未安装 Docker，正在安装..."
-        apt-get update
-        apt-get install -y apt-transport-https ca-certificates curl software-properties-common
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
-        add-apt-repository "deb [arch=amd64,arm64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
-        apt-get update
-        apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-        systemctl enable docker
-        systemctl start docker
+        # 使用官方推荐的安装脚本，更具通用性
+        if curl -fsSL https://get.docker.com | sh; then
+            echo "Docker 安装成功。"
+            systemctl enable docker
+            systemctl start docker
+        else
+            echo "Docker 自动安装失败，请手动安装 Docker 后再运行此脚本。"
+            exit 1
+        fi
     fi
 }
 
-# 检查 Node.js/npm/pm2 是否安装
-function check_pm2() {
-    if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
-        echo "检测到未安装 Node.js/npm，正在安装..."
-        curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
-        apt-get install -y nodejs
-    fi
-    if ! command -v pm2 >/dev/null 2>&1; then
-        echo "检测到未安装 pm2，正在安装..."
-        npm install -g pm2
-    fi
-}
 
-# 构建docker镜像函数
+# 构建Docker镜像
 function build_image() {
+    # 检查镜像是否已存在，如果存在则跳过构建
+    if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+        echo "Docker 镜像 $IMAGE_NAME 已存在，跳过构建。"
+        return
+    fi
+
     WORKDIR=$(mktemp -d)
     cd "$WORKDIR"
 
     # --- Dockerfile内容开始 ---
+    # 【修复】移除了 FROM 行中的 --platform 标志。在ARM64宿主机上，Docker会自动拉取正确的arm64基础镜像。
+    # 这解决了 “FromPlatformFlagConstDisallowed” 警告并有助于避免架构冲突。
     cat > Dockerfile <<EOF
-# 【已修复】使用官方ubuntu镜像，并用--platform指定所需的ARM64架构
-FROM --platform=linux/arm64 ubuntu:24.04
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PROVER_ID_FILE=/root/.nexus/node-id
 
+# 【修复】此处的RUN命令是导致 'exec format error' 的地方。
+# 通过简化构建命令 (使用 docker build 而不是 buildx) 和 Dockerfile，确保在原生环境中编译。
 RUN apt-get update && apt-get install -y \
     curl \
     screen \
@@ -77,7 +76,6 @@ if [ -z "\$NODE_ID" ]; then
     exit 1
 fi
 
-# 确保目录存在
 mkdir -p /root/.nexus
 
 echo "\$NODE_ID" > "\$PROVER_ID_FILE"
@@ -88,6 +86,7 @@ if ! command -v nexus-network >/dev/null 2>&1; then
     exit 1
 fi
 
+# 尝试优雅地停止旧的 screen 会话，避免报错
 screen -S nexus -X quit >/dev/null 2>&1 || true
 
 echo "启动 nexus-network 节点..."
@@ -97,28 +96,29 @@ screen -dmS nexus bash -c "nexus-network start --node-id \$NODE_ID | tee /root/n
 sleep 3
 
 if screen -list | grep -q "nexus"; then
-    echo "节点已在后台启动。"
+    echo "节点已在后台启动成功。"
     echo "容器内日志文件：/root/nexus.log"
-    echo "可以使用 'docker logs -f \$HOSTNAME' 查看实时日志"
+    echo "您现在可以使用 'docker logs -f \$HOSTNAME' 查看实时日志。"
 else
     echo "节点启动失败，请检查日志。"
-    # 失败时尝试显示日志
     if [ -f /root/nexus.log ]; then
         cat /root/nexus.log
     fi
     exit 1
 fi
 
-# 保持容器运行并持续输出日志到标准输出，这样 `docker logs -f` 才能持续工作
+# 保持容器运行并持续将日志输出到标准输出，这是让 `docker logs` 持续工作的关键
 tail -f /root/nexus.log
 EOF
     # --- entrypoint.sh内容结束 ---
 
     echo "正在构建 Docker 镜像 $IMAGE_NAME..."
-    # 使用buildx来确保可以跨平台构建（如果宿主机不是ARM64）
-    docker buildx build --platform linux/arm64 -t "$IMAGE_NAME" . --load
+    # 【修复】使用 'docker build' 而非 'docker buildx build'。
+    # 在原生ARM64宿主机上，这是更简单、更可靠的方式，可以直接避免架构模拟可能引发的问题。
+    docker build -t "$IMAGE_NAME" .
 
-    cd -
+    echo "镜像 $IMAGE_NAME 构建完成。"
+    cd - >/dev/null
     rm -rf "$WORKDIR"
 }
 
@@ -129,7 +129,7 @@ function run_container() {
     local log_file="${LOG_DIR}/nexus-${node_id}.log"
 
     if docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
-        echo "检测到旧容器 $container_name，先删除..."
+        echo "检测到旧容器 $container_name，将先删除..."
         docker rm -f "$container_name"
     fi
 
@@ -138,78 +138,115 @@ function run_container() {
     chmod 644 "$log_file"
 
     echo "正在启动容器 $container_name..."
-    docker run -d --name "$container_name" -v "$log_file":/root/nexus.log -e NODE_ID="$node_id" "$IMAGE_NAME"
-    echo "容器 $container_name 已启动！"
-    echo "宿主机日志文件位于: $log_file"
-    echo "查看实时日志: tail -f $log_file 或 docker logs -f $container_name"
+    docker run -d --restart unless-stopped --name "$container_name" -v "$log_file":/root/nexus.log -e NODE_ID="$node_id" "$IMAGE_NAME"
+    
+    # 等待一小段时间，检查容器是否正常运行
+    sleep 5
+    if ! docker ps --format '{{.Names}}' | grep -qw "$container_name"; then
+        echo "!!!!!!!!!!!!!!!!! 警告 !!!!!!!!!!!!!!!!!!"
+        echo "容器 $container_name 启动后立即退出了。"
+        echo "请使用以下命令检查失败原因："
+        echo "docker logs $container_name"
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    else
+        echo "✅ 容器 $container_name 已成功启动！"
+        echo "宿主机日志文件位于: $log_file"
+        echo "查看实时日志: tail -f $log_file  或者  docker logs -f $container_name"
+    fi
 }
 
-# 【以下函数与您上一版脚本相同，此处为完整性而保留，无需关注】
-# ... [之前脚本中的 uninstall_node, list_nodes, 等所有其他函数] ...
-# 停止并卸载容器和镜像、删除日志
+# 停止并卸载单个节点
 function uninstall_node() {
     local node_id=$1
     local container_name="${BASE_CONTAINER_NAME}-${node_id}"
     local log_file="${LOG_DIR}/nexus-${node_id}.log"
 
-    echo "停止并删除容器 $container_name..."
-    docker rm -f "$container_name" 2>/dev/null || echo "容器 $container_name 不存在或已停止"
-
-    if [ -f "$log_file" ]; then
-        echo "删除日志文件 $log_file ..."
-        rm -f "$log_file"
+    echo "正在停止并删除容器 $container_name..."
+    if docker rm -f "$container_name" >/dev/null 2>&1; then
+        echo "容器 $container_name 已删除。"
     else
-        echo "日志文件不存在：$log_file"
+        echo "容器 $container_name 不存在或已被删除。"
     fi
 
+    if [ -f "$log_file" ]; then
+        echo "正在删除日志文件 $log_file ..."
+        rm -f "$log_file"
+    fi
     echo "节点 $node_id 已卸载完成。"
+}
+
+# 【已实现】批量卸载节点
+function batch_uninstall_nodes() {
+    local all_nodes=($(get_all_node_ids))
+    if [ ${#all_nodes[@]} -eq 0 ]; then
+        echo "当前没有可卸载的节点。"
+        read -p "按任意键返回菜单..."
+        return
+    fi
+
+    echo "警告：此操作将停止并删除所选节点的容器和日志文件！"
+    read -p "您确定要继续吗? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[yY](es)?$ ]]; then
+        echo "操作已取消。"
+        return
+    fi
+    
+    echo "开始批量卸载节点..."
+    for node_id in "${all_nodes[@]}"; do
+        uninstall_node "$node_id"
+    done
+    echo "所有节点均已卸载完毕。"
+    read -p "按任意键返回菜单..."
+}
+
+# 【已实现】删除全部节点和镜像
+function uninstall_all_nodes_and_image() {
+    echo "！！！！！！！！！！！！！！警告！！！！！！！！！！！！！！"
+    echo "此操作将不可逆地执行以下操作："
+    echo "1. 停止并删除所有由本脚本创建的 Nexus 节点容器。"
+    echo "2. 删除 Docker 镜像 $IMAGE_NAME。"
+    echo "3. 删除全部节点日志（位于 $LOG_DIR）。"
+    echo "！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！"
+    read -p "请输入 'yes' 确认执行此毁灭性操作: " confirm
+    if [ "$confirm" != "yes" ]; then
+        echo "操作已取消。"
+        read -p "按任意键返回菜单..."
+        return
+    fi
+
+    echo "--> 正在停止并删除所有节点容器..."
+    local all_nodes=($(get_all_node_ids))
+    if [ ${#all_nodes[@]} -gt 0 ]; then
+        for node_id in "${all_nodes[@]}"; do
+            docker rm -f "${BASE_CONTAINER_NAME}-${node_id}" >/dev/null 2>&1
+        done
+        echo "所有容器已删除。"
+    else
+        echo "未找到需要删除的容器。"
+    fi
+    
+    echo "--> 正在删除 Docker 镜像 $IMAGE_NAME..."
+    if docker rmi -f "$IMAGE_NAME" >/dev/null 2>&1; then
+        echo "镜像 $IMAGE_NAME 已删除。"
+    else
+        echo "镜像 $IMAGE_NAME 不存在或删除失败。"
+    fi
+
+    echo "--> 正在删除日志目录 $LOG_DIR..."
+    if [ -d "$LOG_DIR" ]; then
+        rm -rf "$LOG_DIR"
+        echo "日志目录 $LOG_DIR 已删除。"
+    fi
+    
+    echo "✅ 所有相关组件已完全卸载。"
+    read -p "按任意键返回菜单..."
 }
 
 # 显示所有运行中的节点
 function list_nodes() {
     echo "当前节点状态："
-    echo "-------------------------------------------------------------------------------------------------"
-    printf "%-25s %-15s %-12s %-20s %-25s\n" "节点ID (容器名)" "CPU %" "内存使用" "状态" "启动时间"
-    echo "-------------------------------------------------------------------------------------------------"
-    
-    # 获取所有相关的容器，无论运行与否
-    containers=$(docker ps -a --filter "name=${BASE_CONTAINER_NAME}-*" --format "{{.Names}}")
-
-    if [ -z "$containers" ]; then
-        echo "未找到任何 Nexus 节点容器。"
-    else
-        # 首先显示运行中的容器的统计信息
-        running_stats=$(docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}")
-        
-        for name in $containers; do
-            node_id=$(echo "$name" | sed "s/${BASE_CONTAINER_NAME}-//")
-            status_info=$(docker ps -a --filter "name=$name" --format "{{.Status}}")
-            created_at=$(docker ps -a --filter "name=$name" --format "{{.CreatedAt}}")
-            
-            # 尝试从stats中提取信息
-            stats_line=$(echo "$running_stats" | grep -w "$name" || true)
-            
-            if [ -n "$stats_line" ]; then
-                cpu_perc=$(echo "$stats_line" | awk '{print $2}')
-                mem_usage=$(echo "$stats_line" | awk '{print $3" "$4" "$5}')
-                printf "%-25s %-15s %-12s %-20s %-25s\n" \
-                    "$node_id ($name)" \
-                    "$cpu_perc" \
-                    "$mem_usage" \
-                    "$(echo "$status_info" | awk '{print $1}')" \
-                    "$created_at"
-            else
-                # 对于已停止的容器
-                 printf "%-25s %-15s %-12s %-20s %-25s\n" \
-                    "$node_id ($name)" \
-                    "N/A" \
-                    "N/A" \
-                    "$(echo "$status_info" | awk '{print $1"..."}')" \
-                    "$created_at"
-            fi
-        done
-    fi
-    echo "-------------------------------------------------------------------------------------------------"
+    docker ps -a --filter "name=${BASE_CONTAINER_NAME}-*" --format "table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.RunningFor}}"
+    echo "--------------------------------------------------------"
     read -p "按任意键返回菜单..."
 }
 
@@ -220,18 +257,15 @@ function get_all_node_ids() {
 
 # 查看节点日志
 function view_node_logs() {
+    select_node_for_action "_view_logs_callback" "查看日志"
+}
+
+# 内部回调函数，不直接调用
+function _view_logs_callback() {
     local node_id=$1
     local container_name="${BASE_CONTAINER_NAME}-${node_id}"
-    
-    if ! docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
-         echo "错误：未找到节点 $node_id 的容器。"
-         read -p "按任意键返回..."
-         return
-    fi
-    
-    echo "正在打开日志... 按 Ctrl+C 退出。"
+    echo "正在显示节点 $node_id 的日志... 按 Ctrl+C 退出。"
     sleep 1
-
     docker logs -f "$container_name"
 }
 
@@ -243,25 +277,31 @@ function batch_start_nodes() {
     while IFS= read -r line; do
         line=$(echo "$line" | xargs)
         [ -z "$line" ] && break
+        if [[ ! "$line" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+            echo "无效的 node-id: '$line'。已跳过。"
+            continue
+        fi
         node_ids+=("$line")
     done
 
     if [ ${#node_ids[@]} -eq 0 ]; then
-        echo "未输入任何 node-id，返回主菜单。"
-        read -p "按任意键继续..."
+        echo "未输入任何有效的 node-id，返回主菜单。"
+        sleep 2
         return
     fi
 
     echo "将要启动 ${#node_ids[@]} 个节点..."
-    echo "开始构建镜像 (如果需要)..."
-    build_image
+    echo "------------------------------------"
+    
+    build_image # 确保镜像存在
 
-    echo "开始批量启动节点..."
+    echo "开始批量启动..."
     for node_id in "${node_ids[@]}"; do
         run_container "$node_id"
-        sleep 2
+        sleep 1 # 启动间稍作停顿
     done
 
+    echo "------------------------------------"
     echo "所有节点启动任务已提交！"
     read -p "按任意键返回菜单..."
 }
@@ -269,7 +309,6 @@ function batch_start_nodes() {
 function select_node_for_action() {
     local action_callback=$1
     local prompt_message=$2
-    
     local all_nodes=($(get_all_node_ids))
     
     if [ ${#all_nodes[@]} -eq 0 ]; then
@@ -303,46 +342,25 @@ function select_node_for_action() {
     "$action_callback" "$selected_node_id"
 }
 
-function batch_uninstall_nodes() {
-    # 实现与原脚本类似，这里略去以节省篇幅
-    echo "功能正在实现中..."
-    read -p "按任意键返回菜单..."
-}
-
-function uninstall_all_nodes_and_image() {
-    # 实现与原脚本类似，这里略去以节省篇幅
-    echo "功能正在实现中..."
-    read -p "按任意键返回菜单..."
-}
-
-function batch_rotate_nodes() {
-    # 实现与原脚本类似，这里略去以节省篇幅
-    echo "功能正在实现中..."
-    read -p "按任意键返回菜单..."
-}
-
-function setup_log_cleanup_cron() {
-    # 实现与原脚本类似，这里略去以节省篇幅
-    echo "功能正在实现中..."
-}
-
-# 主菜单
-# setup_log_cleanup_cron
+# --- 主菜单 ---
 while true; do
     clear
-    echo "脚本由哈哈哈哈编写，推特 @ferdie_jhovie，免费开源，请勿相信收费"
-    echo "================ Nexus 多节点管理 (ARM64专用) ================"
-    echo "1. 安装/启动单个节点"
-    echo "2. 批量安装/启动多个节点"
+    echo "=============================================================="
+    echo "    Nexus 多节点一键部署脚本 (ARM64 专用修复版) v1.1        "
+    echo "=============================================================="
+    echo " 脚本由 推特 @ferdie_jhovie 社区成员哈哈哈哈提供并修复      "
+    echo "--------------------------------------------------------------"
+    echo "1. 启动单个节点"
+    echo "2. 批量启动多个节点"
     echo "3. 显示所有节点状态"
-    echo "4. 批量停止并卸载节点 (TODO)"
-    echo "5. 查看指定节点日志"
-    echo "6. 设置批量节点定时轮换启动 (TODO)"
-    echo "7. 删除全部节点和镜像 (TODO)"
-    echo "8. 退出"
-    echo "=========================================================="
+    echo "4. 查看指定节点日志"
+    echo "---"
+    echo "5. 批量停止并卸载所有节点"
+    echo "6. 终极清理 (删除所有节点、镜像和日志)"
+    echo "7. 退出"
+    echo "=============================================================="
 
-    read -rp "请输入选项(1-8): " choice
+    read -rp "请输入选项(1-7): " choice
 
     case $choice in
         1)
@@ -350,7 +368,7 @@ while true; do
             read -rp "请输入您的 node-id: " NODE_ID
             if [ -z "$NODE_ID" ]; then
                 echo "node-id 不能为空，请重新选择。"
-                read -p "按任意键继续"
+                sleep 2
                 continue
             fi
             build_image
@@ -365,24 +383,21 @@ while true; do
             list_nodes
             ;;
         4)
-            batch_uninstall_nodes
+            view_node_logs
             ;;
         5)
-            select_node_for_action "view_node_logs" "查看日志"
+            batch_uninstall_nodes
             ;;
         6)
-            batch_rotate_nodes
-            ;;
-        7)
             uninstall_all_nodes_and_image
             ;;
-        8)
+        7)
             echo "退出脚本。"
             exit 0
             ;;
         *)
             echo "无效选项，请重新输入。"
-            read -p "按任意键继续"
+            sleep 2
             ;;
     esac
 done
