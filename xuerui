@@ -2,9 +2,8 @@
 #===============================================================================
 # 脚本名称: nexus_manager.sh
 # 作者: 哈哈哈哈 (Twitter: @ferdie_jhovie)
-# 版本: 1.2.6  # 版本更新，支持手动指定了Nexus CLI直接下载链接
+# 版本: 1.2.7  # 版本更新
 # 功能: 管理 Nexus 节点的部署、运行、监控、轮换和卸载。
-# 特点: 支持批量部署，节点轮换，日志管理，依赖检查。
 # 版权: 免费开源，请勿相信任何收费行为。
 #===============================================================================
 
@@ -18,24 +17,16 @@ BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:latest"
 LOG_DIR="/root/nexus_logs"
 
-# !!! 重要:Nexus CLI 下载链接已根据您提供的信息更新 !!!
-# 您找到的下载链接是: https://github.com/nexus-xyz/nexus-cli/releases/download/v0.9.6/nexus-network-linux-arm64
-# 这个链接看起来是直接下载一个可执行文件，而不是 tar.gz 压缩包。
-# 这要求我们修改 Dockerfile 中的下载和安装逻辑。
-# 请根据您的宿主机架构确认下载链接是否正确 (例如,amd64 vs arm64)。
-# 目前假定您使用是 arm64，因为您提供的链接是 _arm64。如果是 x86_64 (amd64)，您需要修改此处的链接。
-
-# 使用您提供的链接作为最终的下载 URL
-# !!! IMPORTANT: 请根据您实际的构建环境架构 (amd64 or arm64)，确认并调整以下 URL !!!
-# 例如，如果您需要amd64，您可能需要找到形如：
-# https://github.com/nexus-xyz/nexus-cli/releases/download/v0.9.6/nexus-network-linux-x86_64  这样的链接
-DETECTED_NEXUS_CLI_URL="https://github.com/nexus-xyz/nexus-cli/releases/download/v0.9.6/nexus-network-linux-arm64"
-NEXUS_CLI_FILENAME="nexus-network" # 从链接中推断出的可执行文件名
-NEXUS_CLI_INSTALLED_PATH="/root/.nexus/bin/nexus-network" # 安装后的目标路径
-
-# 如果您不确定您的架构或者上述链接不对，可以尝试以下链接
-# 假设的 amd64 链接 (您可能需要手动替换或找到实际的)
-# DETECTED_NEXUS_CLI_URL="https://github.com/nexus-xyz/nexus-cli/releases/download/v0.9.6/nexus-network-linux-amd64" # 替换为您找到的AMD64链接
+# !!! 重要: 您找到的有效 Nexus CLI 下载链接和文件名 !!!
+# !!! 请根据您的宿主机架构 (amd64/arm64) 确认此链接的正确性 !!!
+# 您提供的链接示例是：https://github.com/nexus-xyz/nexus-cli/releases/download/v0.9.6/nexus-network-linux-arm64
+# 我已将其硬编码到 Dockerfile 生成中。
+# 如果是 AMD64 架构，您需要找到类似：https://github.com/nexus-xyz/nexus-cli/releases/download/v0.9.6/nexus-network-linux-amd64
+# Nexus CLI 的版本和文件名是分开配置的，以便调整
+NEXUS_CLI_VERSION="0.9.6"       # 您找到的可用版本号
+NEXUS_CLI_ARCH_SUFFIX="arm64"  # 根据您的宿主机架构，选择 amd64 或 arm64 (通常是 amd64 for x86_64 hosts)
+NEXUS_CLI_EXECUTABLE_NAME="nexus-network" # 从下载包中解压或直接下载得到的文件名
+NEXUS_CLI_URL="https://github.com/nexus-xyz/nexus-cli/releases/download/v${NEXUS_CLI_VERSION}/nexus-network-linux-${NEXUS_CLI_ARCH}"
 
 # --- 函数定义 ---
 
@@ -92,7 +83,26 @@ function build_image() {
     cd "$WORKDIR" || { echo ">>> ERROR: 无法进入临时目录 '$WORKDIR'"; return 1; }
 
     # --- 安全生成 Dockerfile 内容 ---
-    # 直接嵌入您提供的下载链接，并移除不必要的解压逻辑
+    # 使用您提供的确切下载链接，并且避免动态变量展开到此处，因为链接已经确认
+    # 请确保上面的全局变量 DETECTED_NEXUS_CLI_URL, NEXUS_CLI_FILENAME, NEXUS_CLI_INSTALLED_PATH 是您希望的值
+
+    # !!! 重要: 将直接使用已确认的下载链接和文件名 !!!
+    local NEXUS_CLI_URL_TO_USE="${DETECTED_NEXUS_CLI_URL}"
+    local NEXUS_CLI_NAME_IN_CONTAINER="${NEXUS_CLI_FILENAME}" # 可执行文件在容器内的名字
+    local NEXUS_CLI_TARGET_PATH="${NEXUS_CLI_INSTALLED_PATH}"  # Nexus CLI 在容器内的完整安装路径
+
+    echo ">>> Host build: 将使用的 Nexus CLI 下载 URL 是: '$NEXUS_CLI_URL_TO_USE'"
+    echo ">>> Host build: Nexus CLI 在容器内的目标安装路径是: '$NEXUS_CLI_INSTALLED_PATH'"
+    
+    # 在宿主机再次验证链接是否仍然有效（虽然上面已经有了检查，但这里再加一次以确保最终传递给 Dockerfile 的是有效的）
+    if ! curl --output /dev/null --silent --head --fail "$NEXUS_CLI_URL_TO_USE"; then
+        echo ">>> ERROR: 链接 '$NEXUS_CLI_URL_TO_USE' 在检查时仍然是不可访问的 (404 或其他错误)。"
+        echo ">>> 请务必确认您在脚本开头设置的 DETECTED_NEXUS_CLI_URL 是正确的且仍然有效！"
+        return 1
+    fi
+    echo ">>> Host build: 确认下载链接 '$NEXUS_CLI_URL_TO_USE' 是可访问的。"
+
+    # 使用 heredoc 生成 Dockerfile，直接嵌入确定的 URL
     cat <<EOF > Dockerfile
 # --- Dockerfile for Nexus Node ---
 FROM ubuntu:24.04
@@ -111,15 +121,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
     && rm -rf /var/lib/apt/lists/*
 
 # === 下载和安装 Nexus CLI ===
-# 使用您提供的直接下载链接来安装 nexus-network
-RUN NEXUS_CLI_URL="${DETECTED_NEXUS_CLI_URL}" && \\
-    NEXUS_CLI_FILENAME="${NEXUS_CLI_FILENAME}" && \
-    NEXUS_CLI_INSTALLED_PATH="${NEXUS_CLI_INSTALLED_PATH}" && \
-    echo ">>> Docker build: 将从 ${NEXUS_CLI_URL} 下载 Nexus CLI 文件 (${NEXUS_CLI_FILENAME})..." && \
+RUN NEXUS_CLI_URL="${NEXUS_CLI_URL_TO_USE}" && \
+    NEXUS_CLI_TARGET_PATH="${NEXUS_CLI_INSTALLED_PATH}" && \
+    echo ">>> Docker build: 将从 ${NEXUS_CLI_URL} 下载 Nexus CLI 文件到 ${NEXUS_CLI_INSTALLED_PATH}..." && \
     mkdir -p /root/.nexus/bin && \
-    echo ">>> Docker build: 将下载到 ${NEXUS_CLI_INSTALLED_PATH}" && \
     curl -fsSL "${NEXUS_CLI_URL}" -o "${NEXUS_CLI_INSTALLED_PATH}" || { echo ">>> Docker build: 下载 Nexus CLI 包失败。" >&2; exit 1; } && \
-    echo ">>> Docker build: 修改Nexus CLI 可执行权限..." && \
+    echo ">>> Docker build: 修改 Nexus CLI 可执行权限..." && \
     chmod +x "${NEXUS_CLI_INSTALLED_PATH}" || { echo ">>> Docker build: 修改 nexus-network 权限失败。" >&2; exit 1; } && \
     echo ">>> Docker build: Nexus CLI 安装成功。"
 # === Nexus CLI 安装结束 ===
@@ -192,8 +199,6 @@ EOF
     trap - EXIT INT TERM
     cd - &> /dev/null
 }
-
-# ... (其余所有函数和主循环保持不变) ...
 
 # 启动 Nexus Docker 容器
 function run_container() {
@@ -748,7 +753,7 @@ function setup_log_cleanup_cron() {
 function display_menu() {
     clear
     echo "============================================"
-    echo "      Nexus 多节点管理脚本 (v1.2.5)"
+    echo "      Nexus 多节点管理脚本 (v1.2.6)"
     echo "============================================"
     echo " 作者: 哈哈哈哈 (Twitter: @ferdie_jhovie)"
     echo ""
