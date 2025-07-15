@@ -25,31 +25,32 @@ NEXUS_CLI_VERSION="1.1.20"           # 硬编码 Nexus CLI 的版本，用于下
 
 # 检查 Docker 是否已安装且运行
 function check_docker() {
+    echo ">>> 检测 Docker 状态..."
     if ! command -v docker &> /dev/null; then
-        echo ">>> 检测到未安装 Docker，开始安装..."
+        echo ">>> Docker 未安装，开始安装..."
         # 更新包列表并安装必要的依赖
-        apt-get update -qq || { echo ">>> apt update 失败，请检查网络连接或尝试手动执行 'apt update'"; exit 1; }
-        apt-get install -y -qq apt-transport-https ca-certificates curl software-properties-common || { echo ">>> 安装 Docker 所需的包失败"; exit 1; }
+        apt-get update -qq || { echo ">>> ERROR: apt update 失败，请检查网络连接或尝试手动执行 'apt update'"; exit 1; }
+        apt-get install -y -qq apt-transport-https ca-certificates curl software-properties-common || { echo ">>> ERROR: 安装 Docker 所需的包失败"; exit 1; }
 
         # 添加 Docker 的官方 GPG 密钥
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add - &> /dev/null || { echo ">>> 下载 Docker GPG 密钥失败"; exit 1; }
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg &> /dev/null || { echo ">>> ERROR: 下载 Docker GPG 密钥失败"; exit 1; }
         
         # 添加 Docker 的 APT 仓库
-        add-apt-repository -y "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" || { echo ">>> 添加 Docker APT 仓库失败"; exit 1; }
+        add-apt-repository -y "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" || { echo ">>> ERROR: 添加 Docker APT 仓库失败"; exit 1; }
         
         # 更新包列表后安装 Docker CE
         apt-get update -qq
-        apt-get install -y -qq docker-ce || { echo ">>> 安装 docker-ce 失败"; exit 1; }
+        apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin || { echo ">>> ERROR: 安装 docker-ce 失败"; exit 1; }
         
         # 启用并启动 Docker 服务
-        systemctl enable docker || { echo ">>> 启用 Docker 服务失败"; exit 1; }
-        systemctl start docker || { echo ">>> 启动 Docker 服务失败"; exit 1; }
+        systemctl enable docker || { echo ">>> ERROR: 启用 Docker 服务失败"; exit 1; }
+        systemctl start docker || { echo ">>> ERROR: 启动 Docker 服务失败"; exit 1; }
         echo ">>> Docker 已成功安装并启动。"
     else
         # 检查 Docker 服务是否正在运行
         if ! systemctl is-active --quiet docker; then
             echo ">>> 检测到 Docker 服务未运行，正在尝试启动..."
-            systemctl start docker || { echo ">>> 启动 Docker 服务失败"; exit 1; }
+            systemctl start docker || { echo ">>> ERROR: 启动 Docker 服务失败"; exit 1; }
             echo ">>> Docker 服务已启动。"
         else
             echo ">>> Docker 已安装并正在运行。"
@@ -59,17 +60,18 @@ function check_docker() {
 
 # 检查 Node.js/npm/pm2 是否已安装
 function check_pm2() {
+    echo ">>> 检测 Node.js/npm/pm2 状态..."
     if ! command -v node &> /dev/null || ! command -v npm &> /dev/null; then
         echo ">>> 检测到未安装 Node.js/npm，开始安装..."
         # 使用官方 NodeSource 仓库安装 Node.js 18.x
-        curl -fsSL https://deb.nodesource.com/setup_18.x | bash - &> /dev/null || { echo ">>> 设置 Node.js 18.x 源失败"; exit 1; }
+        curl -fsSL https://deb.nodesource.com/setup_18.x | bash - &> /dev/null || { echo ">>> ERROR: 设置 Node.js 18.x 源失败"; exit 1; }
         apt-get update -qq
-        apt-get install -y -qq nodejs || { echo ">>> 安装 Node.js 失败"; exit 1; }
+        apt-get install -y -qq nodejs || { echo ">>> ERROR: 安装 Node.js 失败"; exit 1; }
         echo ">>> Node.js 和 npm 已安装。"
     fi
     if ! command -v pm2 &> /dev/null; then
         echo ">>> 检测到未安装 pm2，开始安装..."
-        npm install -g pm2 || { echo ">>> 安装 pm2 全局模块失败"; exit 1; }
+        npm install -g pm2 || { echo ">>> ERROR: 安装 pm2 全局模块失败"; exit 1; }
         echo ">>> pm2 已安装。"
     fi
 }
@@ -79,10 +81,13 @@ function build_image() {
     echo ">>> 开始构建 Docker 镜像 '$IMAGE_NAME'..."
     local WORKDIR
     # 创建一个临时目录，用于存放 Dockerfile 和 entrypoint.sh
+    # 使用 mktemp 并为其设置 trap 清理
     WORKDIR=$(mktemp -d)
-    # 设置一个 trap，确保在脚本退出时清理临时目录
-    trap 'rm -rf -- "$WORKDIR"' EXIT
-    cd "$WORKDIR" || { echo ">>> 无法进入临时目录 '$WORKDIR'"; exit 1; }
+    # 确保在脚本退出时，即使发生错误，临时目录也会被删除
+    trap 'echo ">>> [Build Image] 清理临时目录 $WORKDIR"; rm -rf -- "$WORKDIR"' EXIT
+    trap 'echo ">>> [Build Image] 清理临时目录 $WORKDIR 并 abort"; rm -rf -- "$WORKDIR"; exit 1' INT TERM # 为中断信号也设置trap
+    
+    cd "$WORKDIR" || { echo ">>> ERROR: 无法进入临时目录 '$WORKDIR'"; exit 1; }
 
     # --- 创建 Dockerfile ---
     cat > Dockerfile <<EOF
@@ -103,6 +108,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     screen \
     bash \
+    jq \
     && rm -rf /var/lib/apt/lists/*
 
 # === 下载和安装 Nexus CLI ===
@@ -154,7 +160,7 @@ NODE_LOG_PATH="/root/nexus.log"
 
 # 确保 NODE_ID 环境变量已被设置
 if [ -z "\$NODE_ID" ]; then
-    echo ">>> 错误: NODE_ID 环境变量未设置。容器无法启动。请检查运行命令。" >&2
+    echo ">>> ERROR: NODE_ID 环境变量未设置。容器无法启动。请检查运行命令。" >&2
     exit 1
 fi
 
@@ -165,7 +171,7 @@ echo ">>> Container: Nexus 运行日志将输出到: \$NODE_LOG_PATH"
 
 # 检查 Nexus network-manager 命令是否可用
 if ! command -v nexus-network &> /dev/null; then
-    echo ">>> 错误: 'nexus-network' 命令不可用。请检查镜像构建或安装。" >&2
+    echo ">>> ERROR: 'nexus-network' 命令不可用。请检查镜像构建或安装。" >&2
     exit 1
 fi
 
@@ -173,24 +179,37 @@ fi
 # screen -S nexus 会创建一个名为 'nexus' 的 session。
 # -dmS 参数表示：detached (后台运行), monitor (监听), session name (会话名)。
 # bash -c "..." 会在 screen session 中执行命令。
-# nexus-network start --node-id \$NODE_ID &>> \$NODE_LOG_PATH 
-#   --node-id: 设置节点 ID。
-#   &>>: 将 stdout 和 stderr 都重定向到日志文件。
 
 # 避免重复启动同一个 nexus screen session
-if ! screen -list | grep -q "nexus"; then
+if screen -list | grep -q "nexus"; then
+    echo ">>> Container: Nexus 进程已在运行的 'nexus' screen session 中管理。"
+else
     echo ">>> Container: 启动 Nexus 进程 (使用 screen 管理)..."
     # 使用 'exec' 替换当前 shell 进程为 screen，避免了额外的 shell 层级
-    # exec screen -S nexus -dmS bash -c "nexus-network start --node-id \$NODE_ID &>> ${NODE_LOG_PATH}"
-    
-    # 更稳定的方式是先启动screen, 再在screen里启动nexus
-    # 先确保 screen 已经启动，并作为守护进程运行
-    screen -dmS nexus bash -c 'echo ">>> Screen 'nexus' session started." && trap "echo \">>> Screen 'nexus' received SIGTERM, exiting\"; exit 0" SIGTERM; while true; do nexus-network start --node-id \$NODE_ID &>> '${NODE_LOG_PATH}'; if [ \$? -ne 0 ]; then echo ">>> Nexus network start failed or exited. Retrying in 30 seconds..."; sleep 30; else echo ">>> Nexus network start successful, staying alive."; sleep 60; fi; done'
-    
-    # 稍微等待一下，让 screen 和 nexus 进程有机会启动
+    # 但为了方便输出日志，我们不使用 exec
+    # 为了让 screen 持久运行并捕获nexus的退出，我们使用一个无限循环来管理
+    # 确保 NexusCLI 以screen session方式启动，以便可以附加和捕获其输出和退出状态。
+    screen -dmS nexus bash -c ' \
+        trap "echo >>> Screen \"nexus\" session received SIGTERM, cleaning up...; \
+                 pkill -f \"nexus-network start --node-id \$NODE_ID\" || true; \
+                 screen -S nexus -X quit; \
+                 exit 0" SIGTERM SIGINT SIGQUIT SIGKILL; \
+        echo >>> Screen \"nexus\" session started. Logging to ${NODE_LOG_PATH}; \
+        while true; do \
+            nexus-network start --node-id \$NODE_ID &>> '${NODE_LOG_PATH}'; \
+            if [ \$? -eq 0 ]; then \
+                echo >>> Nexus network start successful, running...; \
+                # 暂停一段时间确保 screen session 持久运行，但防止 Nexus 自动退出后马上又启动一个导致日志混乱。
+                # 如果Nexus需要一直活跃，此处可调整或移除睡眠，让nexus自行管理。
+                sleep 60; \
+            else \
+                echo >>> Nexus network start failed or exited abnormally. Retrying in 30 seconds...; \
+                sleep 30; \
+            fi; \
+        done '
+
+    # 稍作等待，确保 screen 和 nexus 有时间启动
     sleep 5 
-else
-    echo ">>> Container: Nexus 进程已在运行的 'nexus' screen session 中管理。"
 fi
 
 # 使用 tail -f 持续显示日志
@@ -199,23 +218,25 @@ tail -f "${NODE_LOG_PATH}"
 EOF
 
     # --- 执行 Docker 构建 ---
-    # 使用 `--build-arg` 可以更灵活地传递变量，但在这里我们直接将变量嵌入了 Dockerfile。
+    # 使用 --build-arg 可以更灵活地传递变量，但在这里我们直接将变量嵌入了 Dockerfile。
     # 如果直接在 Dockerfile 中硬编码版本号，就不需要 --build-arg。
     if docker build -t "$IMAGE_NAME" . ; then
         echo ">>> Docker 镜像 '$IMAGE_NAME' 构建成功！"
     else
-        echo ">>> 错误: Docker 镜像构建失败。请检查以上输出获取详细原因。" >&2
-        # 此处直接退出，而不是 `exit 1`，因为 `trap` 会处理清理工作。
+        echo ">>> ERROR: Docker 镜像构建失败。请检查以上输出获取详细原因。" >&2
+        # 直接退出，由 EXIT trap 清理
         return 1 
     fi
     
-    # Docker 构建成功，此时 trap 会负责清理 WORKDIR。
-    # 手动移除 trap 以免其在不期望的时候被触发。
-    trap - EXIT 
-    # cd - 之后手动返回到原工作目录
+    # Docker 构建成功，此处将 EXIT trap 置为 no-op，以免构建成功后又触发清理
+    # 实际清理会由在函数开头设置的 `trap 'rm -rf -- "$WORKDIR"' EXIT` 来执行
+    trap - EXIT # 取消当前函数的 EXIT trap
+    trap - INT TERM # 取消中断信号 trap
+
+    # 返回到脚本执行前的目录
     cd - &> /dev/null
-    # 由于使用了 trap，这里的 rm -rf $WORKDIR 是不必要的，因为 trap 会执行
-    # rm -rf -- "$WORKDIR"
+    # 由于 WORKDIR 被声明为函数内的 local 变量，且在函数开始时设置了 EXIT trap，
+    # 所以 $WORKDIR 最终会被清理。我们不需要在这里手动删除。
 }
 
 # 启动 Nexus Docker 容器
@@ -229,17 +250,17 @@ function run_container() {
     # 检查并删除可能存在的旧容器
     if docker ps -a --format '{{.Names}}' | grep -qxF "$container_name"; then
         echo ">>> 检测到旧容器 '$container_name'，正在停止并删除..."
-        docker rm -f "$container_name" &> /dev/null
+        docker rm -f "$container_name" &> /dev/null || echo ">>> 警告: 停止或删除容器 '$container_name' 时出现问题。"
         echo ">>> 旧容器 '$container_name' 已处理。"
     fi
 
     # 确保宿主机的日志目录存在
-    mkdir -p "$LOG_DIR" || { echo ">>> 错误: 创建日志目录 '$LOG_DIR' 失败。"; return 1; }
+    mkdir -p "$LOG_DIR" || { echo ">>> ERROR: 创建日志目录 '$LOG_DIR' 失败。"; return 1; }
     
     # 确保宿主机的日志文件存在且具有写权限
     if [ ! -f "$log_file" ]; then
-        touch "$log_file" || { echo ">>> 错误: 创建日志文件 '$log_file' 失败。"; return 1; }
-        chmod 644 "$log_file" || { echo ">>> 错误: 修改日志文件 '$log_file' 权限失败。"; return 1; }
+        touch "$log_file" || { echo ">>> ERROR: 创建日志文件 '$log_file' 失败。"; return 1; }
+        chmod 644 "$log_file" || { echo ">>> ERROR: 修改日志文件 '$log_file' 权限失败。"; return 1; }
         echo ">>> 已创建日志文件: '$log_file'"
     fi
 
@@ -252,7 +273,7 @@ function run_container() {
         "$IMAGE_NAME" ; then
         echo ">>> 容器 '$container_name' (Node ID: $node_id) 已成功启动。"
     else
-        echo ">>> 错误: 启动容器 '$container_name' 时发生问题。请检查 Docker 日志或手动排查。" >&2
+        echo ">>> ERROR: 启动容器 '$container_name' 时发生问题。请检查 Docker 日志或手动排查。" >&2
         return 1 # 返回失败状态
     fi
 }
@@ -267,10 +288,10 @@ function uninstall_node() {
     
     # 检查容器是否存在，然后强制删除
     if docker ps -a --format '{{.Names}}' | grep -qxF "$container_name"; then
-        docker rm -f "$container_name" &> /dev/null || echo ">>> 警告: 容器 '$container_name' 可能未找到或已停止/删除。"
+        docker rm -f "$container_name" &> /dev/null || echo ">>> 警告: 尝试删除容器 '$container_name' 时出现问题，可能已删除。"
         echo ">>> 容器 '$container_name' 已移除。"
     else
-        echo ">>> 节点 '$node_id' 对应的容器未找到，可能已被卸载。"
+        echo ">>> 节点 '$node_id' 对应的容器未找到，可能已被卸载或从未创建过。"
     fi
 
     # 删除日志文件（如果存在）
@@ -321,6 +342,7 @@ function list_nodes() {
                 if [ "$status" == "running" ]; then
                     local started_at_raw=$(echo "$container_inspect_output" | awk '{$1=""; print $0}' | xargs) # 去掉状态字段
                     # 尝试将 UTC 时间格式转换为本地可读的 ISO 8601 格式
+                    # 使用GNU date for more options
                     started_at_formatted=$(date -d "$started_at_raw" --iso-8601=seconds 2>/dev/null || echo "$started_at_raw")
                 else
                     started_at_formatted="-" # 对于已停止的容器，显示为 '-'
@@ -412,7 +434,7 @@ function view_node_logs() {
             echo ">>> 打开 '$container_name' 的清理后实时日志... (按 Ctrl+C 退出)"
             # 使用 sed 清理 ANSI escape sequences，如 \x1b[...m
             # 也清理 Windows CRLF 中的 \r，这在某些终端上可能是个问题。
-            docker logs -f "$container_name" | sed 's/\x1b\[[0-9;]*m//g; s/\r//g'
+            docker logs -f "$container_name" | sed -E 's/\x1b\[[0-9;]*m//g; s/\r//g'
             ;;
         0)
             echo ">>> 返回主菜单。"
@@ -677,7 +699,7 @@ function batch_rotate_nodes() {
 
     # 验证用户输入
     if ! [[ "$nodes_per_round" =~ ^[0-9]+$ ]] || [ "$nodes_per_round" -lt 1 ] || [ "$nodes_per_round" -gt "$total_nodes" ]; then
-        echo ">>> 错误：输入的节点数量无效。请确保输入值为 1 到 ${total_nodes} 之间的整数。"
+        echo ">>> ERROR: 输入的节点数量无效。请确保输入值为 1 到 ${total_nodes} 之间的整数。"
         read -p "按任意键返回菜单..."
         return
     fi
@@ -697,7 +719,7 @@ function batch_rotate_nodes() {
 
     # 创建用于轮换脚本的目录和主脚本文件
     local script_dir="/root/nexus_scripts"
-    mkdir -p "$script_dir" || { echo ">>> 错误: 创建脚本目录 '$script_dir' 失败。"; return 1; }
+    mkdir -p "$script_dir" || { echo ">>> ERROR: 创建脚本目录 '$script_dir' 失败。"; return 1; }
     local rotate_script="$script_dir/rotate_nodes.sh"
 
     # --- 生成轮换启动脚本 `rotate_nodes.sh` 的内容 ---
@@ -730,23 +752,24 @@ function batch_rotate_nodes() {
 
     # 生成执行轮换逻辑的主循环
     echo 'echo "[$(date "+%Y-%m-%d %H:%M:%S")] Nexus 节点轮换脚本启动..."' >> "$rotate_script"
+    echo 'while true; do' >> "$rotate_script" # 使用while true 实现无限循环
     echo 'for ((round=0; round<NUM_GROUPS; round++)); do' >> "$rotate_script"
     echo '    echo ""' >> "$rotate_script"
     echo '    echo "[$(date "+%Y-%m-%d %H:%M:%S")] === 开始第 $((round+1))/${NUM_GROUPS} 轮次节点轮换 ===" ' >> "$rotate_script"
     
-    echo '    echo "[$(date "+%Y-%m-%d %H:%M:%S")] 停止并删除所有正在运行的 Nexus 节点容器..." ' >> "$rotate_script"
+    echo '    echo "[$(date "+%Y-%m-%d %H:%M:%S")] 停止并删除所有正在运行或已停止的 Nexus 节点容器..." ' >> "$rotate_script"
     echo '    docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}" | xargs -r docker rm -f' >> "$rotate_script" # 使用 xargs -r 安全处理无匹配项的情况
     
     # 获取当前轮次的节点 ID
     echo '    current_round_node_ids=("${rounds_nodes[round]}")' >> "$rotate_script"
-    echo '    echo "[$(date "+%Y-%m-%d %H:%M:%S")] 本轮次将启动的节点 (${#current_round_node_ids[@]}个): \${current_round_node_ids[*]}" ' >> "$rotate_script"
+    echo '    echo "[$(date "+%Y-%m-%d %H:%M:%S")] 本轮次将启动的节点 (${#current_round_node_ids[@]}个): ${current_round_node_ids[*]}" ' >> "$rotate_script"
 
     # 处理可能没有节点需要启动的情况 (虽然配置时已尽量避免，但作为健壮性检查)
     echo '    if [ ${#current_round_node_ids[@]} -eq 0 ]; then ' >> "$rotate_script"
     echo '        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 警告: 当前轮次没有节点需要启动。" ' >> "$rotate_script"
-    echo '        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 如果这是最后一个轮次之后的重循环，将在下次完成所有轮次后重新开始。" ' >> "$rotate_script"
-    echo '        sleep 10 # 短暂暂停后循环开始下一轮' >> "$rotate_script"
-    echo '        continue # 继续下一轮循环 ' >> "$rotate_script"
+    echo '        # 如果是最后一轮后的下一个轮次，执行完所有轮次，继续到下一轮循环的开始' >> "$rotate_script"
+    echo '        sleep 10 # 短暂暂停，以便用户注意到消息 ' >> "$rotate_script"
+    echo '        continue # 继续下一个轮次 ' >> "$rotate_script"
     echo '    fi' >> "$rotate_script"
     
     # 逐个启动本轮次的节点
@@ -776,21 +799,21 @@ function batch_rotate_nodes() {
     echo '        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 等待 2 小时 (7200 秒) 进行下一轮次切换..."' >> "$rotate_script"
     echo '        sleep 7200' >> "$rotate_script"
     echo '    else' >> "$rotate_script" # 最后一轮结束后，脚本会自然循环到下一次启动（回到 round=0）
-    echo '        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 所有配置的轮次已执行完毕，将从头开始新一轮的节点轮换。" ' >> "$rotate_script"
+    echo '        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 所有配置的轮次已执行完毕，将在 2 小时后重新开始新一轮的节点轮换。" ' >> "$rotate_script"
     echo '        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 如果需要停止轮换，请执行: pm2 stop nexus-rotate。" ' >> "$rotate_script"
-    echo '        sleep 10 # 短暂暂停，用户可以看到此信息 ' >> "$rotate_script"
+    echo '        sleep 7200' >> "$rotate_script"
     echo '    fi' >> "$rotate_script"
-    echo 'done' >> "$rotate_script" # 结束主循环
-    echo 'echo "[$(date "+%Y-%m-%d %H:%M:%S")] Nexus 节点轮换脚本执行完毕 (或循环继续中)。"' >> "$rotate_script"
+    echo 'done' >> "$rotate_script" # 结束主循环 (当 TOTAL_NODES / NODES_PER_ROUND < 1 的情况) - 原本写成了 for, 改成 while true + for
+    echo 'echo "[$(date "+%Y-%m-%d %H:%M:%S")] Nexus 节点轮换脚本执行完毕（或循环已继续）。"' >> "$rotate_script"
 
     # 为轮换脚本添加执行权限
-    chmod +x "$rotate_script" || { echo ">>> 错误: 为轮换脚本 '$rotate_script' 添加执行权限失败。"; return 1; }
+    chmod +x "$rotate_script" || { echo ">>> ERROR: 为轮换脚本 '$rotate_script' 添加执行权限失败。"; return 1; }
     echo ">>> 已成功生成节点轮换启动脚本: '$rotate_script'"
 
     # --- 使用 PM2 启动轮换脚本 ---
     echo ">>> 使用 PM2 启动轮换脚本 'nexus-rotate'..."
     # 尝试启动脚本并命名为 'nexus-rotate'
-    if pm2 start "$rotate_script" --name "nexus-rotate"; then
+    if pm2 start "$rotate_script" --name "nexus-rotate" --watch --restart-delay 5000 --max-memory-restart 1G; then
         echo ">>> 节点轮换管理进程 'nexus-rotate' 已成功启动！"
         echo ">>> 你可以使用以下命令监控和管理:"
         echo "    pm2 list                 # 查看所有 pm2 管理的进程"
@@ -798,8 +821,9 @@ function batch_rotate_nodes() {
         echo "    pm2 show nexus-rotate    # 查看轮换脚本的详细信息"
         echo "    pm2 stop nexus-rotate    # 停止轮换进程"
         echo "    pm2 restart nexus-rotate # 重启轮换进程"
+        echo "    pm2 delete nexus-rotate  # 移除轮换进程"
     else
-        echo ">>> 错误: 使用 PM2 启动轮换脚本失败。请检查 PM2 安装及脚本执行权限。" >&2
+        echo ">>> ERROR: 使用 PM2 启动轮换脚本失败。请检查 PM2 安装及脚本执行权限。" >&2
         return 1
     fi
     pm2 save # 保存 PM2 配置，以便重启后能自动恢复
@@ -810,18 +834,20 @@ function batch_rotate_nodes() {
 
 # 设置 cronjob 来清理旧的 Nexus 日志文件 (保留最近2天的)
 function setup_log_cleanup_cron() {
-    # cron 表达式：0 3 */2 * *  表示：每天凌晨3点，每两天执行一次
+    # cron 表达式：0 3 */2 * * 表示：每天凌晨3点，每两天执行一次
     # find ${LOG_DIR} -type f -name 'nexus-*.log' -mtime +2 -delete
     #   -mtime +2 表示查找修改时间大于2天的文件 (即，第3天及更早的文件)
-    local cron_job="0 3 */2 * * find \"${LOG_DIR}\" -type f -name 'nexus-*.log' -mtime +2 -delete"
+    local log_cleanup_cron_job="0 3 */2 * * find \"${LOG_DIR}\" -type f -name 'nexus-*.log' -mtime +2 -delete"
     
     # 检查当前用户的 crontab 是否已包含此作业，避免重复添加
     # crontab -l 获取所有用户 cron 设置, grep -Fq 进行固定字符串匹配查找
-    if crontab -l 2>/dev/null | grep -Fq "$cron_job"; then
+    # 加上 || true 避免因 crontab 命令失败而导致脚本退出
+    if crontab -l 2>/dev/null | grep -Fq "$log_cleanup_cron_job"; then
         echo ">>> 日志清理定时任务已存在，无需重复设置。"
     else
         # 将新作业添加到 crontab，如果原先有内容则合并，没有则新建
-        (crontab -l 2>/dev/null; echo "$cron_job") | crontab -
+        # 使用 eval 以确保命令中的引号和变量正确展开
+        (eval "crontab -l 2>/dev/null"; echo "$log_cleanup_cron_job") | eval "crontab -"
         echo ">>> 已设置日志清理定时任务 (每两天删除超过2天的 Nexus 日志)。"
     fi
 }
@@ -833,9 +859,9 @@ function display_menu() {
     echo "      Nexus 多节点管理脚本 (v1.2.0)"
     echo "============================================"
     echo " 作者: 哈哈哈哈 (Twitter: @ferdie_jhovie)"
-    echo "--------------------------------------------"
-    echo " 重要提示：本脚本完全免费开源，请警惕任何收费行为。"
     echo ""
+    echo " 提示: 本脚本完全免费开源，请勿相信任何收费行为。"
+    echo "--------------------------------------------"
     echo "  操作选项:"
     echo "    1. 启动新节点 (输入单个或多个 Node ID)"
     echo "    2. 显示所有节点状态 (列表)"
@@ -923,6 +949,7 @@ while true; do
             read -p "按任意键继续..."
             ;;
     esac
+    
+    # 每次操作后稍微暂停，以免操作过快
+    # sleep 1 
 done
-
-# 脚本退出前会自动触发 `trap 'rm -rf -- "$WORKDIR"' EXIT` 来清理临时目录
