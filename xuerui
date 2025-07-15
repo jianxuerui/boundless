@@ -2,12 +2,14 @@
 set -e
 
 # ==============================================================================
-#                 Nexus All-in-One Point Farming Manager
+#                 Nexus All-in-One Point Farming Manager (v2.0)
 #
-#   Combines a user-friendly menu with robust Docker-based process management.
-#   - Replaces 'screen' with a stable, auto-restarting Docker container.
-#   - Automatically handles Docker installation and image building.
-#   - Provides clean management for logs, startup, and uninstallation.
+#   特性:
+#   - 智能启动检测：自动检查核心文件，并提供清晰指引。
+#   - Docker 驱动：使用稳定、自动重启的 Docker 容器替代 screen。
+#   - 全自动环境准备：自动处理 Docker 安装和权限设置。
+#   - 功能锁定：在环境就绪前，防止用户执行无效操作。
+#   - 一键式管理：提供从设置到卸载的全流程菜单。
 #
 #   Script Author: Fused and Enhanced by an AI model.
 #   Original concepts from scripts by 哈哈哈哈 (@ferdie_jhovie) and anonymous.
@@ -25,41 +27,64 @@ NC='\033[0m' # No Color
 # Docker and Container settings
 IMAGE_NAME="nexus-farmer:latest"
 CONTAINER_NAME="nexus-point-farmer"
+# 存储核心文件状态的全局变量
+CORE_FILES_READY=false
 
 # --- Prerequisite Checks and Setup ---
 
-# 脚本标题
-print_header() {
+# 脚本标题和核心文件状态检查 (*** 此处为核心修复 ***)
+print_header_and_check_files() {
     clear
     echo -e "${BLUE}================================================${NC}"
     echo -e "${BLUE}        Nexus All-in-One Point Farming Manager        ${NC}"
     echo -e "${BLUE}================================================${NC}"
     echo -e "${YELLOW}如需获取最新版本，请关注 https://x.com/lovefy520${NC}"
     echo -e "${YELLOW}此脚本使用 Docker 进行稳定、自动重启的后台运行${NC}"
+    echo -e "${BLUE}------------------------------------------------${NC}"
+    
+    # 检查核心文件并更新状态
+    echo -e "${YELLOW}核心文件状态检查:${NC}"
+    local all_files_found=true
+    if [[ -f "./nexus" ]]; then
+        echo -e "${GREEN}[✔] nexus:      已找到${NC}"
+    else
+        echo -e "${RED}[✖] nexus:      未找到!${NC}"
+        all_files_found=false
+    fi
+    if [[ -f "./rust_nexus" ]]; then
+        echo -e "${GREEN}[✔] rust_nexus: 已找到${NC}"
+    else
+        echo -e "${RED}[✖] rust_nexus: 未找到!${NC}"
+        all_files_found=false
+    fi
+
+    if $all_files_found; then
+        CORE_FILES_READY=true
+    else
+        CORE_FILES_READY=false
+        echo -e "${RED}\n[重要提示] 请将 'nexus' 和 'rust_nexus' 可执行文件放置于此脚本相同的目录下，然后重新运行脚本。${NC}"
+    fi
     echo -e "${BLUE}================================================${NC}"
 }
 
+
 # 检查 Docker 是否安装
 check_docker() {
+    echo -e "${YELLOW}正在检查 Docker 环境...${NC}"
     if ! command -v docker >/dev/null 2>&1; then
         echo -e "${YELLOW}检测到未安装 Docker，正在为您安装...${NC}"
         if command -v apt-get &> /dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common
-            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-            sudo apt-get update
-            sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+            sudo apt-get update && sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common && \
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg && \
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null && \
+            sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io
         elif command -v yum &> /dev/null; then
-            sudo yum install -y yum-utils
-            sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-            sudo yum install -y docker-ce docker-ce-cli containerd.io
+            sudo yum install -y yum-utils && sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo && sudo yum install -y docker-ce docker-ce-cli containerd.io
         else
             echo -e "${RED}无法自动安装 Docker。请根据您的操作系统手动安装后重试。${NC}"
             exit 1
         fi
-        sudo systemctl enable docker
-        sudo systemctl start docker
+        sudo systemctl enable --now docker
         echo -e "${GREEN}Docker 安装完成并已启动！${NC}"
     else
         echo -e "${GREEN}Docker 已安装。${NC}"
@@ -68,32 +93,16 @@ check_docker() {
 
 # 设置本地执行文件权限
 setup_local_permissions() {
-    echo -e "${YELLOW}正在检查并设置本地执行文件权限...${NC}"
-    local changed=false
-    for file in nexus rust_nexus; do
-        if [[ -f "./$file" ]]; then
-            if [[ ! -x "./$file" ]]; then
-                chmod +x "./$file"
-                echo -e "${GREEN}权限已设置: ./$file${NC}"
-                changed=true
-            fi
-        else
-            echo -e "${RED}错误: 核心文件 '$file' 不存在于当前目录。${NC}"
-            echo -e "${RED}请确保将 nexus 和 rust_nexus 文件与本脚本放在同一目录下。${NC}"
-            exit 1
-        fi
-    done
-    if ! $changed; then
-        echo -e "${GREEN}文件权限正常，无需更改。${NC}"
-    fi
+    echo -e "${YELLOW}正在设置本地执行文件权限...${NC}"
+    chmod +x ./nexus ./rust_nexus
+    echo -e "${GREEN}文件权限设置完成。${NC}"
 }
 
-# --- Core Logic Functions (from Script 1, adapted for Docker context) ---
+# --- Core Logic Functions ---
 
 # 设置钱包
 setup_wallet() {
-    print_header
-    echo -e "${YELLOW}--- 步骤 1: 设置钱包地址 ---${NC}"
+    echo -e "\n${YELLOW}--- 步骤 1: 设置钱包地址 ---${NC}"
     echo -e -n "${YELLOW}请输入您的钱包地址: ${NC}"
     read -r wallet_addr
 
@@ -102,27 +111,19 @@ setup_wallet() {
         return
     fi
 
-    # 创建 config.json 文件
     cat > config.json << EOF
 {
   "wallet_addr": "$wallet_addr",
   "thread_count": 5
 }
 EOF
-
     echo -e "${GREEN}钱包设置完成，config.json 已成功创建/更新。${NC}"
     echo -e "${BLUE}钱包地址: $wallet_addr${NC}"
 }
 
-# 批量创建节点 (在本地执行)
+# 批量创建节点
 create_nodes() {
-    print_header
-    echo -e "${YELLOW}--- 步骤 2: 批量创建节点 ---${NC}"
-    if [[ ! -f "./nexus" ]]; then
-        echo -e "${RED}错误: 'nexus' 文件不存在。请先将其放入当前目录。${NC}"
-        return
-    fi
-
+    echo -e "\n${YELLOW}--- 步骤 2: 批量创建节点 ---${NC}"
     echo -e -n "${YELLOW}请输入要创建的节点数量 (最多每天50个): ${NC}"
     read -r node_count
 
@@ -132,7 +133,7 @@ create_nodes() {
     fi
 
     if [[ "$node_count" -gt 50 ]]; then
-        echo -e "${RED}根据提示，节点数量不建议超过50个。${NC}"
+        echo -e "${YELLOW}提示: 根据官方建议，节点数量不建议超过50个。${NC}"
     fi
 
     echo -e "${YELLOW}开始创建 $node_count 个节点... 这可能需要一些时间。${NC}"
@@ -145,44 +146,27 @@ create_nodes() {
 
 # --- Docker Management Functions ---
 
-# 构建 Docker 镜像
 build_image() {
     echo -e "${YELLOW}--- 正在构建 Docker 镜像 ($IMAGE_NAME)... ---${NC}"
-    # 检查所有必需文件
-    for file in Dockerfile nexus rust_nexus config.json; do
-        if [[ "$file" == "Dockerfile" ]]; then continue; fi
-        if [[ ! -f "./$file" ]]; then
-            echo -e "${RED}构建镜像失败: 必需文件 '$file' 不存在。${NC}"
-            echo -e "${RED}请确保您已完成 '设置钱包' 步骤，并且 'nexus'/'rust_nexus' 文件在当前目录。${NC}"
-            return 1
-        fi
-    done
+    if [[ ! -f "./config.json" ]]; then
+        echo -e "${RED}构建镜像失败: 必需文件 'config.json' 不存在。${NC}"
+        echo -e "${RED}请先执行 '设置钱包' 步骤。${NC}"
+        return 1
+    fi
 
-    # 创建 Dockerfile
     cat > Dockerfile <<EOF
 FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
-
-# 安装基础依赖
 RUN apt-get update && apt-get install -y curl ca-certificates && rm -rf /var/lib/apt/lists/*
-
-# 设置工作目录
 WORKDIR /app
-
-# 复制所有必要文件到容器中
-# 这包括 nexus, rust_nexus, 和重要的 config.json
 COPY . /app/
-
-# 设置执行权限
 RUN chmod +x /app/nexus /app/rust_nexus
-
-# 定义容器启动时执行的命令
 CMD ["./nexus", "run"]
 EOF
 
     if sudo docker build -t "$IMAGE_NAME" .; then
         echo -e "${GREEN}Docker 镜像构建成功！${NC}"
-        rm Dockerfile # 清理临时文件
+        rm Dockerfile
         return 0
     else
         echo -e "${RED}Docker 镜像构建失败。请检查上面的错误信息。${NC}"
@@ -191,32 +175,24 @@ EOF
     fi
 }
 
-
-# 启动任务容器
 start_task() {
-    print_header
-    echo -e "${YELLOW}--- 步骤 3: 启动后台任务 ---${NC}"
-    # 检查容器是否已在运行
+    echo -e "\n${YELLOW}--- 步骤 3: 启动后台任务 ---${NC}"
     if sudo docker ps -q --filter "name=^${CONTAINER_NAME}$" | grep -q .; then
         echo -e "${YELLOW}任务容器 '${CONTAINER_NAME}' 已经在运行。${NC}"
         echo -e "您可以从主菜单的 '管理任务' 选项中查看日志或重启它。"
         return
     fi
 
-    # 如果容器存在但已停止，先删除它
     if sudo docker ps -aq --filter "name=^${CONTAINER_NAME}$" | grep -q .; then
         echo -e "${YELLOW}发现已停止的旧容器，正在移除以便重建...${NC}"
         sudo docker rm "${CONTAINER_NAME}"
     fi
 
-    # 构建或重建镜像，以确保最新的 config.json 和节点文件被包含
     if ! build_image; then
         return
     fi
     
     echo -e "${YELLOW}正在启动 Docker 容器 (${CONTAINER_NAME})...${NC}"
-    # --restart unless-stopped 确保了稳定性和自动恢复
-    # --log-opt 配置日志轮换，防止日志文件无限增长
     sudo docker run -d \
       --name "$CONTAINER_NAME" \
       --restart unless-stopped \
@@ -233,16 +209,13 @@ start_task() {
     fi
 }
 
-# 管理正在运行的任务
 manage_task() {
-    print_header
-    # 检查容器是否存在
     if ! sudo docker ps -a --format '{{.Names}}' | grep -qw "$CONTAINER_NAME"; then
         echo -e "${RED}未找到任务容器。请先启动任务。${NC}"
         return
     fi
     
-    echo -e "${YELLOW}--- 任务管理 (${CONTAINER_NAME}) ---${NC}"
+    echo -e "\n${YELLOW}--- 任务管理 (${CONTAINER_NAME}) ---${NC}"
     sudo docker ps -a --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
     echo -e "${BLUE}========================================${NC}"
     echo "1. 查看实时日志 (按 Ctrl+C 退出日志)"
@@ -253,33 +226,16 @@ manage_task() {
     read -r choice
 
     case $choice in
-        1)
-            echo -e "${YELLOW}正在显示日志...${NC}"
-            sudo docker logs -f "$CONTAINER_NAME"
-            ;;
-        2)
-            echo -e "${YELLOW}正在停止任务容器...${NC}"
-            sudo docker stop "$CONTAINER_NAME"
-            echo -e "${GREEN}容器已停止。注意：如果需要，它可以通过选项3重启。${NC}"
-            ;;
-        3)
-            echo -e "${YELLOW}正在启动/重启任务容器...${NC}"
-            sudo docker start "$CONTAINER_NAME"
-            echo -e "${GREEN}容器已启动/重启。${NC}"
-            ;;
-        4)
-            return
-            ;;
-        *)
-            echo -e "${RED}无效选择。${NC}"
-            ;;
+        1) echo -e "${YELLOW}正在显示日志...${NC}"; sudo docker logs -f "$CONTAINER_NAME";;
+        2) echo -e "${YELLOW}正在停止任务容器...${NC}"; sudo docker stop "$CONTAINER_NAME"; echo -e "${GREEN}容器已停止。${NC}";;
+        3) echo -e "${YELLOW}正在启动/重启任务容器...${NC}"; sudo docker start "$CONTAINER_NAME"; echo -e "${GREEN}容器已启动/重启。${NC}";;
+        4) return;;
+        *) echo -e "${RED}无效选择。${NC}";;
     esac
 }
 
-# 完全卸载
 uninstall_all() {
-    print_header
-    echo -e "${RED}警告：此操作将停止并删除任务容器、Docker镜像和本地配置文件。${NC}"
+    echo -e "\n${RED}警告：此操作将停止并删除任务容器、Docker镜像和本地配置文件。${NC}"
     echo -e "${RED}这是一个不可逆操作！${NC}"
     read -rp "您确定要完全卸载吗？ (输入 'yes' 确认): " confirm
 
@@ -290,22 +246,22 @@ uninstall_all() {
 
     echo -e "${YELLOW}1. 正在停止并删除任务容器 (${CONTAINER_NAME})...${NC}"
     if sudo docker ps -a --format '{{.Names}}' | grep -qw "$CONTAINER_NAME"; then
-        sudo docker rm -f "$CONTAINER_NAME"
+        sudo docker rm -f "$CONTAINER_NAME" &> /dev/null
         echo -e "${GREEN}容器已删除。${NC}"
     else
         echo -e "容器不存在，跳过。"
     fi
 
     echo -e "${YELLOW}2. 正在删除 Docker 镜像 (${IMAGE_NAME})...${NC}"
-    if sudo docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-        sudo docker rmi -f "$IMAGE_NAME"
+    if sudo docker image inspect "$IMAGE_NAME" &> /dev/null; then
+        sudo docker rmi -f "$IMAGE_NAME" &> /dev/null
         echo -e "${GREEN}镜像已删除。${NC}"
     else
         echo -e "镜像不存在，跳过。"
     fi
 
     echo -e "${YELLOW}3. 正在删除本地配置文件...${NC}"
-    read -rp "是否删除本地的 config.json, database.sqlite, database.sqlite-journal 文件？ (y/N): " del_local_files
+    read -rp "是否删除本地的 config.json, database.sqlite* 文件？ (y/N): " del_local_files
     if [[ "$del_local_files" =~ ^[Yy]$ ]]; then
         rm -f config.json database.sqlite*
         echo -e "${GREEN}本地配置文件已删除。${NC}"
@@ -313,62 +269,50 @@ uninstall_all() {
         echo -e "保留本地配置文件。"
     fi
 
-    echo -e "${GREEN}\n完全卸载完成！${NC}"
+    echo -e "\n${GREEN}完全卸载完成！${NC}"
 }
 
 
 # --- 主程序和菜单 ---
-
-# 显示主菜单
 show_menu() {
-    print_header
-    echo -e "\n${BLUE}请按顺序执行 1->2->3->4，或选择其他管理选项:${NC}"
-    echo -e "1. ${GREEN}(预备) 检查环境并设置权限${NC}"
+    print_header_and_check_files
+    echo -e "\n${BLUE}请按顺序执行菜单，或选择其他管理选项:${NC}"
+    echo -e "1. ${GREEN}(预备) 检查Docker并设置文件权限${NC}"
     echo -e "2. ${GREEN}(步骤1) 设置钱包 (创建 config.json)${NC}"
     echo -e "3. ${GREEN}(步骤2) 批量创建节点${NC}"
     echo -e "4. ${GREEN}(步骤3) 启动后台挂机任务 (使用Docker)${NC}"
     echo "------------------------------------------------"
     echo -e "5. ${YELLOW}管理任务 (查看日志 / 停止 / 重启)${NC}"
-    echo -e "6. ${RED}[危险] 完全卸载 (删除容器、镜像、配置)${NC}"
+    echo -e "6. ${RED}[危险] 完全卸载${NC}"
     echo "7. 退出脚本"
     echo -e -n "${YELLOW}\n请输入您的选择 (1-7): ${NC}"
 }
 
-# 主程序入口
 main() {
     while true; do
         show_menu
         read -r choice
-
+        
+        # 预先检查依赖文件是否就绪
+        local files_required_for_action=false
         case $choice in
-            1)
-                print_header
-                check_docker
-                setup_local_permissions
-                ;;
-            2)
-                setup_wallet
-                ;;
-            3)
-                create_nodes
-                ;;
-            4)
-                start_task
-                ;;
-            5)
-                manage_task
-                ;;
-            6)
-                uninstall_all
-                ;;
-            7)
-                echo -e "${GREEN}感谢使用，再见！${NC}"
-                exit 0
-                ;;
-            *)
-                echo -e "${RED}无效选择，请重新输入。${NC}"
-                ;;
+            [134]) files_required_for_action=true;;
         esac
+
+        if $files_required_for_action && ! $CORE_FILES_READY; then
+            echo -e "\n${RED}操作无法继续，因为核心文件缺失。请按上方提示放置文件后重试。${NC}"
+        else
+            case $choice in
+                1) check_docker; setup_local_permissions;;
+                2) setup_wallet;;
+                3) create_nodes;;
+                4) start_task;;
+                5) manage_task;;
+                6) uninstall_all;;
+                7) echo -e "${GREEN}感谢使用，再见！${NC}"; exit 0;;
+                *) echo -e "${RED}无效选择，请重新输入。${NC}";;
+            esac
+        fi
 
         echo -e -n "\n${BLUE}按 Enter 键返回主菜单...${NC}"
         read -r
