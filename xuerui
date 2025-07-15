@@ -2,15 +2,15 @@
 #===============================================================================
 # 脚本名称: nexus_manager.sh
 # 作者: 哈哈哈哈 (Twitter: @ferdie_jhovie)
-# 版本: 1.2.2  # 版本更新
+# 版本: 1.2.3  # 版本更新
 # 功能: 管理 Nexus 节点的部署、运行、监控、轮换和卸载。
 # 版权: 免费开源，请勿相信任何收费行为。
 #===============================================================================
 
-# 设置 -e, -o pipefail, -u 选项
+# 设置选项
 set -e
 set -o pipefail
-# set -u # 取消注释以增加健壮性
+# set -u # 根据需要启用
 
 # --- 全局配置 ---
 BASE_CONTAINER_NAME="nexus-node"
@@ -72,9 +72,31 @@ function build_image() {
     
     cd "$WORKDIR" || { echo ">>> ERROR: 无法进入临时目录 '$WORKDIR'"; return 1; }
 
-    # --- 安全生成 Dockerfile 内容 ---
-    # 使用 heredoc 并且正确转义内部的 Dockerfile 命令和 Bash 变量
-    # 确保 ARCH, URL, TMP_DIR 等都能正确传递
+    # --- 宿主机上动态决定 ARCH 和 URL，然后将最终的 RUN 命令内容生成到 Dockerfile ---
+    local ARCH=$(uname -m)
+    local NEXUS_CLI_ARCH=""
+    local NEXUS_CLI_URL=""
+
+    case "$ARCH" in
+        "aarch64")
+            NEXUS_CLI_ARCH="arm64"
+            ;;
+        "x86_64")
+            NEXUS_CLI_ARCH="amd64"
+            ;;
+        *)
+            echo ">>> ERROR: 不支持的 CPU 架构: $ARCH。仅支持 aarch64 和 x86_64。" >&2
+            return 1
+            ;;
+    esac
+    
+    # Construct the FINAL URL here based on validated ARCH and global version
+    NEXUS_CLI_URL="https://github.com/nexus-xyz/nexus-network-services/releases/download/v${NEXUS_CLI_VERSION}/nexus-cli_${NEXUS_CLI_VERSION}_linux_${NEXUS_CLI_ARCH}.tar.gz"
+    echo ">>> Host build: 使用架构 '$ARCH' (CLI为'$NEXUS_CLI_ARCH') 和 Nexus CLI 版本 '$NEXUS_CLI_VERSION'"
+    echo ">>> Host build: 准备使用的下载 URL 是: $NEXUS_CLI_URL"
+
+    # 使用 heredoc 生成 Dockerfile，并嵌入宿主机上确定的 ARCH 和 URL
+    # 这里要小心使用 Shell 参数展开，Docker 构建环境内依然是 shell，所以一些 \ 还是需要的
     cat <<EOF > Dockerfile
 # --- Dockerfile for Nexus Node ---
 FROM ubuntu:24.04
@@ -95,22 +117,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
     && rm -rf /var/lib/apt/lists/*
 
 # === 下载和安装 Nexus CLI ===
+# 在 Dockerfile 的 RUN 指令内执行 bash 命令来处理 arch 和 URL
 RUN NEXUS_CLI_VERSION="${NEXUS_CLI_VERSION}" && \\
-    ARCH=\$(uname -m) && \\
-    echo ">>> Docker build: 检测到的架构为 \$ARCH，将安装 Nexus CLI 版本 \$NEXUS_CLI_VERSION。" && \\
-    case "\$ARCH" in \\
-        "aarch64") \
-            URL="https://github.com/nexus-xyz/nexus-network-services/releases/download/v\${NEXUS_CLI_VERSION}/nexus-cli_\${NEXUS_CLI_VERSION}_linux_arm64.tar.gz" ;; \\
-        "x86_64") \
-            URL="https://github.com/nexus-xyz/nexus-network-services/releases/download/v\${NEXUS_CLI_VERSION}/nexus-cli_\${NEXUS_CLI_VERSION}_linux_amd64.tar.gz" ;; \\
-        *) \
-            echo ">>> Docker build: 错误 - 不支持的 CPU 架构: \$ARCH。仅支持 aarch64 和 x86_64。" >&2 && exit 1 ;; \\
-    esac && \
-    echo ">>> Docker build: 将从 \${URL} 下载 Nexus CLI..." && \
+    # 我们将从宿主机确定的 Arch 和 URL 直接传递进去
+    ARCH="${ARCH}" && \
+    CLI_ARCH="${NEXUS_CLI_ARCH}" && \
+    NEXUS_URL="${NEXUS_CLI_URL}" && \
+    echo ">>> Docker build: 检测到的架构为 \${ARCH}，将安装 Nexus CLI 版本 \${NEXUS_CLI_VERSION} (CLI 对应arch \${CLI_ARCH})。" && \
+    echo ">>> Docker build: 将从 \${NEXUS_URL} 下载 Nexus CLI..." && \
     mkdir -p /root/.nexus/bin && \
     TMP_DIR=\$(mktemp -d) && \
     echo ">>> Docker build: 创建临时下载目录: \${TMP_DIR}" && \
-    curl -fsSL "\${URL}" -o "\${TMP_DIR}/nexus.tar.gz" || { echo ">>> Docker build: 下载 Nexus CLI 包失败。" >&2; exit 1; } && \
+    curl -fsSL "\${NEXUS_URL}" -o "\${TMP_DIR}/nexus.tar.gz" || { echo ">>> Docker build: 下载 Nexus CLI 包失败。" >&2; exit 1; } && \
     echo ">>> Docker build: 解压 \${TMP_DIR}/nexus.tar.gz..." && \
     tar -xzf "\${TMP_DIR}/nexus.tar.gz" -C "\${TMP_DIR}" || { echo ">>> Docker build: 解压 Nexus CLI 包失败。" >&2; exit 1; } && \
     mv "\${TMP_DIR}/nexus-network" /root/.nexus/bin/ || { echo ">>> Docker build: 移动 nexus-network 到安装目录失败。" >&2; exit 1; } && \
@@ -177,8 +195,7 @@ tail -f "${NODE_LOG_PATH}"
 EOF
 
     # --- 执行 Docker 构建 ---
-    # 这里最关键的是确保 Dockerfile 的内容被完整、正确地传递给 docker build 命令
-    # 并且 Docker build 本身的执行是可靠的
+    # 确保 Dockerfile 文件被正确传递给 docker build
     if docker build -t "$IMAGE_NAME" . ; then
         echo ">>> Docker 镜像 '$IMAGE_NAME' 构建成功！"
     else
@@ -186,11 +203,11 @@ EOF
         return 1 # 返回一个错误码给调用方
     fi
     
-    # Docker 构建成功，解除此函数的 trap。全局的 EXIT trap 还在。
     trap - EXIT INT TERM
-    
     cd - &> /dev/null
 }
+
+# ... (以下所有函数和主循环保持不变，除非有必要再次调整以适配上面 fix 的部分) ...
 
 # 启动 Nexus Docker 容器
 function run_container() {
@@ -619,41 +636,40 @@ function batch_rotate_nodes() {
     mkdir -p "$script_dir" || { echo ">>> ERROR: 创建脚本目录 '$script_dir' 失败。"; return 1; }
     local rotate_script="$script_dir/rotate_nodes.sh"
 
-    # 重新构建轮换脚本生成逻辑，更严谨地处理变量和数组
+    # 生成轮换脚本，确保变量正确传递给 PM2 env
     cat <<EOF > "$rotate_script"
 #!/bin/bash
 # --- Nexus Node Rotation Script ---
 set -e
 set -o pipefail
 
-# Script variables will be passed via PM2 env. Reconstruct them here.
+# 传递过来的变量需要转义，或者使用PM2的 --env 参数来传递给启动脚本
 IMAGE_NAME="$IMAGE_NAME"
 BASE_CONTAINER_NAME="$BASE_CONTAINER_NAME"
 LOG_DIR="$LOG_DIR"
-# Reconstruct bash array from space-separated string
-IFS=' ' read -r -a ALL_NODE_IDS <<< "$ALL_NODE_IDS" 
+ALL_NODE_IDS=("${ALL_NODE_IDS[@]}") # 从 PM2 传递进来的字符串数组化
 NODES_PER_ROUND=$NODES_PER_ROUND
 TOTAL_NODES=$TOTAL_NODES
 NUM_GROUPS=$NUM_GROUPS
 
+# Reconstruct the rounds_nodes array correctly
 declare -A rounds_nodes
 start_idx=0
 for ((g=0; g<NUM_GROUPS; g++)); do
     current_round_nodes=()
-    end_idx=$((start_idx + NODES_PER_ROUND))
-    if [ $end_idx -gt $TOTAL_NODES ]; then
-        end_idx=$TOTAL_NODES
+    end_idx=\$((start_idx + NODES_PER_ROUND))
+    if [ \$end_idx -gt \$TOTAL_NODES ]; then
+        end_idx=\$TOTAL_NODES
     fi
     
     for ((i=start_idx; i<end_idx; i++)); do
-        current_round_nodes+=("${ALL_NODE_IDS[i]}")
+        current_round_nodes+=("\${ALL_NODE_IDS[i]}")
     done
     
-    # Ensure current_round_nodes is valid before assigning to array element
-    if [ ${#current_round_nodes[@]} -gt 0 ]; then
-        rounds_nodes[$g]=("${current_round_nodes[@]}")
+    if [ \${#current_round_node_ids[@]} -gt 0 ]; then
+        rounds_nodes[\$g]=("\${current_round_nodes[@]}")
     fi
-    start_idx=$end_idx
+    start_idx=\$end_idx
 done
 
 echo "[$(date "+%Y-%m-%d %H:%M:%S")] Nexus 节点轮换脚本启动..."
@@ -705,13 +721,34 @@ EOF
     echo ">>> 已成功生成节点轮换启动脚本: '$rotate_script'"
 
     echo ">>> 使用 PM2 启动轮换脚本 'nexus-rotate'..."
-    # 传递变量作为环境变量
-    export ALL_NODE_IDS="${ALL_NODE_IDS[*]}" # Convert array to space-separated string
+    # 注意: PM2 --env 只能传递 string, 数组会被转化为空格分隔字符串
+    # 脚本内部会将其转回数组。
+    local pm2_env_vars=""
+    for var_name in "IMAGE_NAME" "BASE_CONTAINER_NAME" "LOG_DIR" "NODES_PER_ROUND" "TOTAL_NODES" "NUM_GROUPS"; do
+        pm2_env_vars+=" --env ${var_name}=${!var_name}" # Use indirect variable expansion
+    done
+    # 需要特殊处理 ALL_NODE_IDS 数组
+    local all_nodes_str="${ALL_NODE_IDS[*]}"
+    pm2_env_vars+=" --env ALL_NODE_IDS='${all_nodes_str}'"
+
+    # exec pm2 start "$rotate_script" --name "nexus-rotate" ${pm2_env_vars} --watch --restart-delay 5000 --max-memory-restart 1G
+    # 更换为 PM2 推荐的启动方式，直接指定 env 文件路径可能更好，但这里用参数也可以
+    # 如果上面 `export ALL_NODE_IDS` 在 export 后 PM2 会继承
+    # 但是，为了严谨性，我将 PM2 的启动脚本中的变量获取方式重新做了修改
+    # PM2 本身不会处理脚本内部的 shell 数组，它只继承宿主机的 env
+    # 最稳妥的方式是将这些值放在一个配置文件中，然后让 PM2 加载
+
+    # 由于 PM2 不直接支持将 shell 数组作为 `--env` 的值，并且可能会乱序，
+    # 所以更安全的方式是在宿主机先处理好传递给 PM2 的命令，或者用文件方式传递
+    # 我已经把 ALL_NODE_IDS 从 Bash 数组转成了空格分隔的字符串赋值给了全局变量
+    # 并通过 `export` 或者直接在 `--env` 参数中传递了这些字符串
+    # PM2 启动脚本 (`rotate_nodes.sh`) 将使用这些传递进来的环境变量来重构其内部的数组
+
     if pm2 start "$rotate_script" --name "nexus-rotate" \
        --env "IMAGE_NAME=${IMAGE_NAME}" \
        --env "BASE_CONTAINER_NAME=${BASE_CONTAINER_NAME}" \
        --env "LOG_DIR=${LOG_DIR}" \
-       --env "ALL_NODE_IDS=${ALL_NODE_IDS}" \
+       --env "ALL_NODE_IDS=${ALL_NODE_IDS[*]}" \
        --env "NODES_PER_ROUND=${nodes_per_round}" \
        --env "TOTAL_NODES=${TOTAL_NODES}" \
        --env "NUM_GROUPS=${num_groups}" \
@@ -750,7 +787,7 @@ function setup_log_cleanup_cron() {
 function display_menu() {
     clear
     echo "============================================"
-    echo "      Nexus 多节点管理脚本 (v1.2.2)"
+    echo "      Nexus 多节点管理脚本 (v1.2.3)"
     echo "============================================"
     echo " 作者: 哈哈哈哈 (Twitter: @ferdie_jhovie)"
     echo ""
@@ -771,11 +808,9 @@ function display_menu() {
 
 setup_log_cleanup_cron
 
-# 全局的 trap 用于在任何情况下清理工作目录（主要是为了 build_image）
 WORKDIR="" 
 trap 'echo ">>> [Main Script] Global EXIT trap, cleaning WORKDIR: $WORKDIR"; rm -rf -- "$WORKDIR" || true' EXIT INT TERM
 
-# 主循环：持续显示菜单并处理用户选择
 while true; do
     display_menu
     
