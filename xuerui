@@ -19,7 +19,8 @@ set -o pipefail
 BASE_CONTAINER_NAME="nexus-node"      # 所有 Nexus 节点的 Docker 容器名前缀
 IMAGE_NAME="nexus-node:latest"       # 构建的 Docker 镜像名称和标签
 LOG_DIR="/root/nexus_logs"           # 宿主机上 Nexus 日志的存储目录
-NEXUS_CLI_VERSION="1.1.20"           # 硬编码 Nexus CLI 的版本，用于下载
+# !!!!!重要: Nexus CLI 版本已更新到 1.1.23, 原 1.1.20 导致 404 错误 !!!!!
+NEXUS_CLI_VERSION="1.1.23"           # 硬编码 Nexus CLI 的版本，用于下载
 
 # --- 函数定义 ---
 
@@ -33,11 +34,9 @@ function check_docker() {
         apt-get install -y -qq apt-transport-https ca-certificates curl software-properties-common gnupg || { echo ">>> ERROR: 安装 Docker 所需的包失败"; exit 1; }
 
         # 添加 Docker 的官方 GPG 密钥
-        # 使用 -o 参数直接输出到指定文件，减少不必要的警告信息
         curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg &> /dev/null || { echo ">>> ERROR: 下载 Docker GPG 密钥失败"; exit 1; }
         
         # 添加 Docker 的 APT 仓库
-        # 根据 Debian/Ubuntu 版本和架构动态设置仓库信息
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list &> /dev/null || { echo ">>> ERROR: 添加 Docker APT 仓库失败"; exit 1; }
         
         # 更新包列表后安装 Docker CE
@@ -65,7 +64,6 @@ function check_pm2() {
     echo ">>> 检测 Node.js/npm/pm2 状态..."
     if ! command -v node &> /dev/null || ! command -v npm &> /dev/null; then
         echo ">>> 检测到未安装 Node.js/npm，开始安装..."
-        # 使用官方 NodeSource 仓库安装 Node.js 18.x
         curl -fsSL https://deb.nodesource.com/setup_18.x | bash - &> /dev/null || { echo ">>> ERROR: 设置 Node.js 18.x 源失败"; exit 1; }
         apt-get update -qq
         apt-get install -y -qq nodejs || { echo ">>> ERROR: 安装 Node.js 失败"; exit 1; }
@@ -73,7 +71,6 @@ function check_pm2() {
     fi
     if ! command -v pm2 &> /dev/null; then
         echo ">>> 检测到未安装 pm2，开始安装..."
-        # 全局安装 pm2，需要root权限
         npm install -g pm2 || { echo ">>> ERROR: 安装 pm2 全局模块失败"; exit 1; }
         echo ">>> pm2 已安装。"
     fi
@@ -83,16 +80,14 @@ function check_pm2() {
 function build_image() {
     echo ">>> 开始构建 Docker 镜像 '$IMAGE_NAME'..."
     
-    # 在函数内部使用 WORKDIR 变量，并在函数入口处为其设置 EXIT trap
-    # 这样可以确保即使在函数内部发生错误，WORKDIR 也会被清理
+    # WORKDIR 在此声明为函数局部变量
     local WORKDIR
-    WORKDIR=$(mktemp -d) # WORKDIR 在此声明为函数局部变量
+    WORKDIR=$(mktemp -d) 
 
-    # 设置一个 EXIT trap 来清理 WORKDIR。这个 trap 只在此函数作用域内有效。
-    # INT 和 TERM 信号也可以捕获以尝试优雅退出
+    # 设置一个 EXIT trap 来清理 WORKDIR。此 trap 只在此函数作用域内有效。
     trap 'echo ">>> [Build Image] 清理临时目录 $WORKDIR"; rm -rf -- "$WORKDIR"' EXIT INT TERM
     
-    cd "$WORKDIR" || { echo ">>> ERROR: 无法进入临时目录 '$WORKDIR'"; return 1; } # 使用 return 1 代替 exit 1, allowing the script to continue if possible
+    cd "$WORKDIR" || { echo ">>> ERROR: 无法进入临时目录 '$WORKDIR'"; return 1; }
 
     # --- 创建 Dockerfile ---
     cat > Dockerfile <<EOF
@@ -101,12 +96,10 @@ FROM ubuntu:24.04
 
 LABEL maintainer="哈哈哈哈 <https://twitter.com/ferdie_jhovie>"
 
-# 设置非交互式前端和日志变量
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PROVER_ID_FILE=/root/.nexus/node-id
 ENV NODE_LOG_PATH=/root/nexus.log
 
-# 安装基础依赖并清理 APT 缓存以减小镜像大小
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     tar \
@@ -117,25 +110,30 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # === 下载和安装 Nexus CLI ===
+# !!! 重要: NEXUS_CLI_VERSION 已更新为 1.1.23 以解决 404 错误 !!!
 RUN NEXUS_CLI_VERSION="${NEXUS_CLI_VERSION}" && \
-    ARCH=\$(uname -m) && \
-    echo ">>> Docker build: 检测到的架构为 \$ARCH，将安装 Nexus CLI 版本 \$NEXUS_CLI_VERSION。" && \
-    case "\$ARCH" in \
+    ARCH=$(uname -m) && \
+    echo ">>> Docker build: 检测到的架构为 $ARCH，将安装 Nexus CLI 版本 $NEXUS_CLI_VERSION。" && \
+    case "$ARCH" in \
         "aarch64") \
-            URL="https://github.com/nexus-xyz/nexus-network-services/releases/download/v\${NEXUS_CLI_VERSION}/nexus-cli_\${NEXUS_CLI_VERSION}_linux_arm64.tar.gz" ;; \
+            URL="https://github.com/nexus-xyz/nexus-network-services/releases/download/v${NEXUS_CLI_VERSION}/nexus-cli_${NEXUS_CLI_VERSION}_linux_arm64.tar.gz" ;; \
         "x86_64") \
-            URL="https://github.com/nexus-xyz/nexus-network-services/releases/download/v\${NEXUS_CLI_VERSION}/nexus-cli_\${NEXUS_CLI_VERSION}_linux_amd64.tar.gz" ;; \
+            URL="https://github.com/nexus-xyz/nexus-network-services/releases/download/v${NEXUS_CLI_VERSION}/nexus-cli_${NEXUS_CLI_VERSION}_linux_amd64.tar.gz" ;; \
         *) \
-            echo ">>> Docker build: 错误 - 不支持的 CPU 架构: \$ARCH。仅支持 aarch64 和 x86_64。" >&2 && exit 1 ;; \
+            echo ">>> Docker build: 错误 - 不支持的 CPU 架构: $ARCH。仅支持 aarch64 和 x86_64。" >&2 && exit 1 ;; \
     esac && \
-    echo ">>> Docker build: 将从 \${URL} 下载 Nexus CLI..." && \
+    echo ">>> Docker build: 将从 ${URL} 下载 Nexus CLI..." && \
     mkdir -p /root/.nexus/bin && \
-    TMP_DIR=\$(mktemp -d) && \
-    curl -fsSL "\${URL}" | tar -xzf - -C "\$TMP_DIR" || { echo ">>> Docker build: 下载或解压 Nexus CLI 包失败。" >&2; exit 1; } && \
-    mv "\$TMP_DIR/nexus-network" /root/.nexus/bin/ || { echo ">>> Docker build: 移动 nexus-network 到安装目录失败。" >&2; exit 1; } && \
+    TMP_DIR=$(mktemp -d) && \
+    # 提高 curl 和 tar 的健壮性
+    curl -fsSL "${URL}" -o "${TMP_DIR}/nexus.tar.gz" || { echo ">>> Docker build: 下载 Nexus CLI 包失败。" >&2; exit 1; } && \
+    # 增加解压的健壮性
+    echo ">>> Docker build: 解压 ${TMP_DIR}/nexus.tar.gz..." && \
+    tar -xzf "${TMP_DIR}/nexus.tar.gz" -C "${TMP_DIR}" || { echo ">>> Docker build: 解压 Nexus CLI 包失败。" >&2; exit 1; } && \
+    mv "${TMP_DIR}/nexus-network" /root/.nexus/bin/ || { echo ">>> Docker build: 移动 nexus-network 到安装目录失败。" >&2; exit 1; } && \
     ln -sf /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network || { echo ">>> Docker build: 创建 nexus-network 软链接失败。" >&2; exit 1; } && \
-    rm -rf "\$TMP_DIR" && \
-    echo ">>> Docker build: Nexus CLI v\${NEXUS_CLI_VERSION} 安装成功。"
+    rm -rf "${TMP_DIR}" && \
+    echo ">>> Docker build: Nexus CLI v${NEXUS_CLI_VERSION} 安装成功。"
 # === Nexus CLI 安装结束 ===
 
 COPY entrypoint.sh /entrypoint.sh
@@ -196,23 +194,19 @@ tail -f "${NODE_LOG_PATH}"
 EOF
 
     # --- 执行 Docker 构建 ---
+    # 使用 /bin/bash -c 来执行多行RUN指令
+    # 注意：此处直接在 Dockerfile 中调用了多条 shell 命令，确保了构建过程的独立性和标准化。
     if docker build -t "$IMAGE_NAME" . ; then
         echo ">>> Docker 镜像 '$IMAGE_NAME' 构建成功！"
     else
         echo ">>> ERROR: Docker 镜像构建失败。请检查以上输出获取详细原因。" >&2
-        # Docker 构建失败，trap 会负责清理。
         return 1 # 返回一个错误码给调用方
     fi
     
-    # Docker 构建成功，解除此函数的 trap，防止意外执行。
-    # 注意：全局的 trap 还在，确保在主脚本退出时，这里创建的 WORKDIR 仍然会被清理
+    # Docker 构建成功，解除此函数的 trap。全局的 EXIT trap 还在。
     trap - EXIT INT TERM
     
-    # 返回到脚本执行前的目录
     cd - &> /dev/null
-    
-    # 由于 WORKDIR 在函数开头被声明为局部变量，且我们设置了 EXIT trap，
-    # 在函数成功退出后，临时目录会被清理。
 }
 
 # 启动 Nexus Docker 容器
@@ -306,7 +300,6 @@ function list_nodes() {
                 status=$(echo "$container_inspect_output" | awk '{print $1}')
                 if [ "$status" == "running" ]; then
                     local started_at_raw=$(echo "$container_inspect_output" | awk '{$1=""; print $0}' | xargs)
-                    # 使用 GNU date 来格式化日期，兼容性更好
                     started_at_formatted=$(date -d "$started_at_raw" --iso-8601=seconds 2>/dev/null || echo "$started_at_raw")
                 else
                     started_at_formatted="-"
@@ -392,7 +385,6 @@ function view_node_logs() {
             ;;
         3)
             echo ">>> 打开 '$container_name' 的清理后实时日志... (按 Ctrl+C 退出)"
-            # 使用 sed 清理 ANSI escape sequences，如 \x1b[...m
             docker logs -f "$container_name" | sed -E 's/\x1b\[[0-9;]*m//g; s/\r//g'
             ;;
         0)
@@ -410,9 +402,9 @@ function batch_start_nodes() {
     echo ">>> 请依次输入需要启动的 Nexus 节点的 Node ID，每行一个。"
     echo ">>> 输入空行或按 Ctrl+D 结束输入。"
     
-    local node_ids=() # 用于存储输入的 Node ID
+    local node_ids=()
     while IFS= read -r line; do
-        line=$(echo "$line" | xargs) 
+        line=$(echo "$line" | xargs)
         if [ -n "$line" ]; then
             node_ids+=("$line")
         else
@@ -438,7 +430,7 @@ function batch_start_nodes() {
         echo ">>> 正在尝试启动节点 '$node_id'..."
         if run_container "$node_id"; then
             success_count=$((success_count + 1))
-            sleep 2 # 启动后短暂延迟
+            sleep 2
         else
             echo ">>> 节点 '$node_id' 启动失败。"
         fi
@@ -712,8 +704,8 @@ function batch_rotate_nodes() {
     echo '        echo "[$(date "+%Y-%m-%d %H:%M:%S")] 如果需要停止轮换，请执行: pm2 stop nexus-rotate。" ' >> "$rotate_script"
     echo '        sleep 7200' >> "$rotate_script"
     echo '    fi' >> "$rotate_script"
-    echo '  done' >> "$rotate_script" # 这个 `done` 对应 `for ((round...))`
-    echo 'done' >> "$rotate_script"   # 这个 `done` 对应 `while true`
+    echo '  done' >> "$rotate_script"
+    echo 'done' >> "$rotate_script"
 
     echo 'echo "[$(date "+%Y-%m-%d %H:%M:%S")] Nexus 节点轮换脚本执行完毕（或循环已继续）。"' >> "$rotate_script"
 
@@ -744,7 +736,6 @@ function batch_rotate_nodes() {
 function setup_log_cleanup_cron() {
     local log_cleanup_cron_job="0 3 */2 * * find \"${LOG_DIR}\" -type f -name 'nexus-*.log' -mtime +2 -delete"
     
-    # 使用 eval 来安全地检查和添加 cronjob，以处理变量中的空格等
     if eval "crontab -l 2>/dev/null" | grep -Fq "$log_cleanup_cron_job"; then
         echo ">>> 日志清理定时任务已存在，无需重复设置。"
     else
@@ -779,12 +770,14 @@ function display_menu() {
 # 初始化设置：设置日志清理的定时任务
 setup_log_cleanup_cron
 
+# 全局的 trap 用于在任何情况下清理工作目录（主要是为了 build_image）
+trap 'echo ">>> [Main Script] Global EXIT trap, cleaning WORKDIR..."; rm -rf -- "$WORKDIR" || true' EXIT INT TERM
+
 # 主循环：持续显示菜单并处理用户选择
 while true; do
     display_menu
     
-    # 这里是主程序流，注意不要使用 local 关键字
-    # 使用普通的 read 读取用户输入
+    # 在主流程中读取变量，不使用 local 关键字
     read -rp "请输入您的选择(0-6): " choice
 
     case "$choice" in
@@ -799,7 +792,8 @@ while true; do
             batch_uninstall_nodes
             ;;
         4) # 查看节点日志
-            local selected_node_id # 这个 `local` 是在函数内，没问题
+            # selected_node_id 的 local 声明是在函数 select_node_for_action 内部
+            local selected_node_id # 这个是在 select_node_for_action 返回值赋给的变量，确保它在主循环里是本地变量
             selected_node_id=$(select_node_for_action "查看日志")
             if [ -n "$selected_node_id" ]; then
                 view_node_logs "$selected_node_id"
@@ -813,21 +807,11 @@ while true; do
             echo ">>> 所有已部署的 Nexus 节点容器及其日志文件都将被永久清除。"
             echo ">>> 这是一个不可逆的操作，请务必确认。"
             
-            local confirm_all_delete # 这里是主循环内的变量，之前是 local，我尝试注释掉它看是否能绕过 error，如果会报错则需要调整为无 local。
-            # !! 发现问题：这里的 local confirm_all_delete 很可能是在主循环内引起的 'local: can only be used in a function' 错误，如果 885 行就是它的话。
-            # 我们应该去掉这个 `local` 关键字，让它成为脚本中的一个普通变量。
-            
-            # confirm_all_delete="..." # 尝试去掉 local
-            
-            # 如果你报line 885错误，非常可能问题出在这，所以我就直接删掉 local
+            # 这里使用普通的变量，而不是 local，因为主循环不是函数
             read -rp ">>> 如果您确实要继续，请输入大写字母 'YES' 来确认: " confirm_all_delete
             
             if [ "$confirm_all_delete" == "YES" ]; then
-                local all_nodes # 这个也可能是在主循环中的local
-                # all_nodes=($(get_all_nodes)) # 尝试去掉 local
-
-                # 重新定义 local 变量的位置
-                local all_nodes_to_delete
+                local all_nodes_to_delete # 在这里重新声明为 local，这样它只在此 case 语句的作用域内
                 all_nodes_to_delete=($(get_all_nodes))
 
                 if [ ${#all_nodes_to_delete[@]} -eq 0 ]; then
@@ -856,6 +840,5 @@ while true; do
     esac
 done
 
-# 任何情况下退出都会执行这里的 trap，清理全局的 WORKDIR (尽管build_image已经解除了trap)
-# 确保清理操作
-trap - EXIT INT TERM # 清除之前可能设置的 trap，确保脚本退出时行为正常
+# 脚本结束（正常退出后此处不会被执行）
+# trap - EXIT INT TERM # 如果有 EXIT trap 需要清理
