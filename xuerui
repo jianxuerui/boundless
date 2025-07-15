@@ -2,7 +2,7 @@
 #===============================================================================
 # 脚本名称: nexus_manager.sh
 # 作者: 哈哈哈哈 (Twitter: @ferdie_jhovie)
-# 版本: 1.2.3  # 版本更新
+# 版本: 1.2.4  # 版本更新
 # 功能: 管理 Nexus 节点的部署、运行、监控、轮换和卸载。
 # 版权: 免费开源，请勿相信任何收费行为。
 #===============================================================================
@@ -16,7 +16,7 @@ set -o pipefail
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:latest"
 LOG_DIR="/root/nexus_logs"
-NEXUS_CLI_VERSION="1.1.23" # Nexus CLI 版本
+NEXUS_CLI_VERSION="1.1.23" # Nexus CLI 版本 (如果这仍然不行，请手动指定一个确定的有效版本)
 
 # --- 函数定义 ---
 
@@ -72,7 +72,7 @@ function build_image() {
     
     cd "$WORKDIR" || { echo ">>> ERROR: 无法进入临时目录 '$WORKDIR'"; return 1; }
 
-    # --- 宿主机上动态决定 ARCH 和 URL，然后将最终的 RUN 命令内容生成到 Dockerfile ---
+    # --- 宿主机上动态决定 ARCH, CLI_ARCH, NEXUS_CLI_URL, 并打印以便调试 ---
     local ARCH=$(uname -m)
     local NEXUS_CLI_ARCH=""
     local NEXUS_CLI_URL=""
@@ -92,11 +92,22 @@ function build_image() {
     
     # Construct the FINAL URL here based on validated ARCH and global version
     NEXUS_CLI_URL="https://github.com/nexus-xyz/nexus-network-services/releases/download/v${NEXUS_CLI_VERSION}/nexus-cli_${NEXUS_CLI_VERSION}_linux_${NEXUS_CLI_ARCH}.tar.gz"
-    echo ">>> Host build: 使用架构 '$ARCH' (CLI为'$NEXUS_CLI_ARCH') 和 Nexus CLI 版本 '$NEXUS_CLI_VERSION'"
-    echo ">>> Host build: 准备使用的下载 URL 是: $NEXUS_CLI_URL"
+    
+    echo ">>> Host build: 检测到宿主机架构: '$ARCH'。"
+    echo ">>> Host build: Nexus CLI 版本被设置为: '$NEXUS_CLI_VERSION'。"
+    echo ">>> Host build: 为 CLI 生成的目标架构后缀为: '$NEXUS_CLI_ARCH'。"
+    echo ">>> Host build: 生成的 Nexus CLI 下载 URL 是: '$NEXUS_CLI_URL'"
 
-    # 使用 heredoc 生成 Dockerfile，并嵌入宿主机上确定的 ARCH 和 URL
-    # 这里要小心使用 Shell 参数展开，Docker 构建环境内依然是 shell，所以一些 \ 还是需要的
+    # 可选：在这里先进行一次 URL 可用性检查，如果宿主机可以访问
+    # (此步骤如果因为网络问题失败，还是需要返回错误)
+    if ! curl --output /dev/null --silent --head --fail "$NEXUS_CLI_URL"; then
+        echo ">>> ERROR: 从 '$NEXUS_CLI_URL' 检查下载链接时出错 (404 或其他错误)。请确认 Nexus CLI 版本 '$NEXUS_CLI_VERSION' 对应的二进制文件是否存在且URL正确。"
+        echo ">>> 您可能需要检查 GitHub Release 页面或更新 '$NEXUS_CLI_VERSION' 到一个已知可用的版本。"
+        return 1 # 指出 URL 确实是有问题的
+    fi
+    echo ">>> Host build: 检查发现下载链接 '$NEXUS_CLI_URL' 是可访问的。"
+
+    # --- 安全生成 Dockerfile 内容 ---
     cat <<EOF > Dockerfile
 # --- Dockerfile for Nexus Node ---
 FROM ubuntu:24.04
@@ -117,9 +128,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
     && rm -rf /var/lib/apt/lists/*
 
 # === 下载和安装 Nexus CLI ===
-# 在 Dockerfile 的 RUN 指令内执行 bash 命令来处理 arch 和 URL
 RUN NEXUS_CLI_VERSION="${NEXUS_CLI_VERSION}" && \\
-    # 我们将从宿主机确定的 Arch 和 URL 直接传递进去
+    # 将宿主机上确定的 Arch, CLI_ARCH, NEXUS_URL 直接嵌入到 Dockerfile 的 RUN 指令中
     ARCH="${ARCH}" && \
     CLI_ARCH="${NEXUS_CLI_ARCH}" && \
     NEXUS_URL="${NEXUS_CLI_URL}" && \
@@ -195,19 +205,18 @@ tail -f "${NODE_LOG_PATH}"
 EOF
 
     # --- 执行 Docker 构建 ---
-    # 确保 Dockerfile 文件被正确传递给 docker build
     if docker build -t "$IMAGE_NAME" . ; then
         echo ">>> Docker 镜像 '$IMAGE_NAME' 构建成功！"
     else
         echo ">>> ERROR: Docker 镜像构建失败。请检查以上输出获取详细原因。" >&2
-        return 1 # 返回一个错误码给调用方
+        return 1 
     fi
     
     trap - EXIT INT TERM
     cd - &> /dev/null
 }
 
-# ... (以下所有函数和主循环保持不变，除非有必要再次调整以适配上面 fix 的部分) ...
+# 启动 Nexus Docker 容器 (其他函数保持不变，除非涉及到上面build_image的修改)
 
 # 启动 Nexus Docker 容器
 function run_container() {
@@ -643,16 +652,17 @@ function batch_rotate_nodes() {
 set -e
 set -o pipefail
 
-# 传递过来的变量需要转义，或者使用PM2的 --env 参数来传递给启动脚本
+# 变量通过 PM2 env 参数传入，这里需要根据传递的值重新构造
 IMAGE_NAME="$IMAGE_NAME"
 BASE_CONTAINER_NAME="$BASE_CONTAINER_NAME"
 LOG_DIR="$LOG_DIR"
-ALL_NODE_IDS=("${ALL_NODE_IDS[@]}") # 从 PM2 传递进来的字符串数组化
+# 宿主机的 Bash 数组在传递给 PM2 `--env` 时会转为空格分隔的字符串，
+# 在目标脚本中用 IFS 解析回数组是正确的处理方式
+ALL_NODE_IDS=($ALL_NODE_IDS) # 直接将传递的字符串解析为 Bash 数组
 NODES_PER_ROUND=$NODES_PER_ROUND
 TOTAL_NODES=$TOTAL_NODES
 NUM_GROUPS=$NUM_GROUPS
 
-# Reconstruct the rounds_nodes array correctly
 declare -A rounds_nodes
 start_idx=0
 for ((g=0; g<NUM_GROUPS; g++)); do
@@ -667,7 +677,7 @@ for ((g=0; g<NUM_GROUPS; g++)); do
     done
     
     if [ \${#current_round_node_ids[@]} -gt 0 ]; then
-        rounds_nodes[\$g]=("\${current_round_nodes[@]}")
+        rounds_nodes[\$g]=("\${current_round_node_ids[@]}")
     fi
     start_idx=\$end_idx
 done
@@ -721,29 +731,7 @@ EOF
     echo ">>> 已成功生成节点轮换启动脚本: '$rotate_script'"
 
     echo ">>> 使用 PM2 启动轮换脚本 'nexus-rotate'..."
-    # 注意: PM2 --env 只能传递 string, 数组会被转化为空格分隔字符串
-    # 脚本内部会将其转回数组。
-    local pm2_env_vars=""
-    for var_name in "IMAGE_NAME" "BASE_CONTAINER_NAME" "LOG_DIR" "NODES_PER_ROUND" "TOTAL_NODES" "NUM_GROUPS"; do
-        pm2_env_vars+=" --env ${var_name}=${!var_name}" # Use indirect variable expansion
-    done
-    # 需要特殊处理 ALL_NODE_IDS 数组
-    local all_nodes_str="${ALL_NODE_IDS[*]}"
-    pm2_env_vars+=" --env ALL_NODE_IDS='${all_nodes_str}'"
-
-    # exec pm2 start "$rotate_script" --name "nexus-rotate" ${pm2_env_vars} --watch --restart-delay 5000 --max-memory-restart 1G
-    # 更换为 PM2 推荐的启动方式，直接指定 env 文件路径可能更好，但这里用参数也可以
-    # 如果上面 `export ALL_NODE_IDS` 在 export 后 PM2 会继承
-    # 但是，为了严谨性，我将 PM2 的启动脚本中的变量获取方式重新做了修改
-    # PM2 本身不会处理脚本内部的 shell 数组，它只继承宿主机的 env
-    # 最稳妥的方式是将这些值放在一个配置文件中，然后让 PM2 加载
-
-    # 由于 PM2 不直接支持将 shell 数组作为 `--env` 的值，并且可能会乱序，
-    # 所以更安全的方式是在宿主机先处理好传递给 PM2 的命令，或者用文件方式传递
-    # 我已经把 ALL_NODE_IDS 从 Bash 数组转成了空格分隔的字符串赋值给了全局变量
-    # 并通过 `export` 或者直接在 `--env` 参数中传递了这些字符串
-    # PM2 启动脚本 (`rotate_nodes.sh`) 将使用这些传递进来的环境变量来重构其内部的数组
-
+    # export ALL_NODE_IDS "${ALL_NODE_IDS[*]}" # PM2 的 env 不直接支持 export 变量，需要在调用参数中传入
     if pm2 start "$rotate_script" --name "nexus-rotate" \
        --env "IMAGE_NAME=${IMAGE_NAME}" \
        --env "BASE_CONTAINER_NAME=${BASE_CONTAINER_NAME}" \
@@ -787,7 +775,7 @@ function setup_log_cleanup_cron() {
 function display_menu() {
     clear
     echo "============================================"
-    echo "      Nexus 多节点管理脚本 (v1.2.3)"
+    echo "      Nexus 多节点管理脚本 (v1.2.4)"
     echo "============================================"
     echo " 作者: 哈哈哈哈 (Twitter: @ferdie_jhovie)"
     echo ""
