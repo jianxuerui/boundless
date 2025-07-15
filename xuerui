@@ -59,8 +59,9 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# 自动下载安装最新版 nexus-network
-RUN curl -sSL https://cli.nexus.xyz/ | NONINTERACTIVE=1 sh \
+# ## 修复/改进点 (版本升级) ##
+# 通过设置 NEXUS_CLI_VERSION 环境变量来指定安装 0.9.6 版本
+RUN curl -sSL https://cli.nexus.xyz/ | NEXUS_CLI_VERSION=0.9.6 NONINTERACTIVE=1 sh \
     && ln -sf /root/.nexus/bin/nexus-network /usr/local/bin/nexus-network
 
 COPY entrypoint.sh /entrypoint.sh
@@ -459,7 +460,7 @@ while true; do
     clear
     echo "脚本由哈哈哈哈编写，推特 @ferdie_jhovie，免费开源，请勿相信收费"
     echo "有问题可联系推特，此脚本经过了问题修复和功能增强。"
-    echo "================ Nexus 多节点管理 (增强版) ================="
+    echo "================ Nexus 多节点管理 (v0.9.6) ================="
     echo " 1. 单个/批量安装并启动新节点"
     echo " 2. 显示所有节点状态"
     echo " 3. 查看指定节点日志"
