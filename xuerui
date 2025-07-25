@@ -1,245 +1,924 @@
 #!/bin/bash
 set -e
+==============================================================================
+Nexus 多节点管理脚本 (ARM64专用Docker版)
+作者: 哈哈哈哈 (推特 @ferdie_jhovie)
+描述: 此脚本使用 Docker 来管理多个 Nexus 节点，特别为 ARM64 架构优化。
+【V3 更新】: 修复了 "exec format error"，通过自动配置 Docker Buildx
+来确保跨平台构建环境（QEMU）的正确设置。
+【V3.1 更新】: 更新二进制文件下载地址至 v0.10.1。
+==============================================================================
+--- 配置项 ---
+BASE_CONTAINER_NAME="nexus-node"
+IMAGE_NAME="nexus-node:latest-arm64"
+LOG_DIR="/root/nexus_logs"
+BUILDER_NAME="nexus_builder" # 为我们的项目创建一个专用的 builder
+--- 核心功能函数 ---
+检查 Docker 是否安装
+function check_docker() {
+if ! command -v docker >/dev/null 2>&1; then
+echo "检测到未安装 Docker，正在为您安装..."
+apt-get update
+apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -
+add-apt-repository "deb [arch=arm64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+systemctl enable docker
+systemctl start docker
+echo "Docker 安装完成！"
+fi
+# 确保 buildx 插件可用
+if ! docker buildx version >/dev/null 2>&1; then
+echo "错误：未找到 Docker buildx 插件。请确保您的 Docker 版本包含 buildx。"
+echo "尝试安装命令: apt-get install docker-buildx-plugin"
+exit 1
+fi
+}
+【新增修复】设置 Buildx 以支持跨平台构建
+function setup_buildx() {
+# 检查专用的 builder 是否已存在并正在运行
+if docker buildx ls | grep -q "
+B
+U
+I
+L
+D
+E
+R
+N
+A
+M
+E
+.
+∗
+r
+u
+n
+n
+i
+n
+g
+"
+;
+t
+h
+e
+n
+e
+c
+h
+o
+"
+B
+u
+i
+l
+d
+x
+环
+境
+′
+BUILDER 
+N
+​
+ AME.∗running";thenecho"Buildx环境 
+′
+ 
+BUILDER_NAME' 已准备就绪。"
+docker buildx use $BUILDER_NAME
+return
+fi
+Generated code
+echo "检测到需要设置跨平台构建环境 (QEMU)..."
+echo "这可能是一次性的设置过程。"
 
-# =========================================================================================
-# Nexus 多节点管理脚本 (ARM64 Docker版) - 8核16G 极限优化版
-# 作者: 哈哈哈哈 (推特 @ferdie_jhovie)
-# 优化: AI Assistant
-# 描述: 此脚本为 8核/16G RAM 服务器运行 3个 Nexus 节点提供极致性能优化。
-#       【V5 终极优化】:
-#       1. 【一键部署】: 新增推荐方案，一键部署为 8C/16G 优化的3个节点。
-#       2. 【资源压榨】: 预设激进的CPU(2.5核)与内存(4G)限制，充分利用硬件性能。
-#       3. 【精简构建】: 使用 'docker build -f -' 技术，构建过程无需本地临时文件。
-#       4. 【增强监控】: 节点列表直接显示内存使用量和分配上限，清晰明了。
-# =========================================================================================
+# 如果存在但未运行，则尝试启动
+if docker buildx ls | grep -q "$BUILDER_NAME"; then
+    echo "正在启动已存在的 builder '$BUILDER_NAME'..."
+    docker buildx inspect $BUILDER_NAME --bootstrap
+else
+    # 创建新的 builder
+    echo "正在创建新的 buildx builder '$BUILDER_NAME'..."
+    docker buildx create --name $BUILDER_NAME --driver docker-container --use
+fi
 
-# --- 配置项 ---
-BASE_CONTAINER_NAME="nexus-node-pro"
-IMAGE_NAME="nexus-node:latest-arm64-pro-optimized"
-BUILDER_NAME="nexus_builder"
+# 确保 QEMU binfmt handlers 已安装，这是解决 "exec format error" 的关键
+# 通过在一个特权容器中运行 binfmt 安装程序来完成
+if ! docker run --rm --privileged tonistiigi/binfmt | grep -q "setting up"; then
+    echo "正在注册 QEMU 模拟器..."
+    docker run --rm --privileged tonistiigi/binfmt --install all
+    echo "QEMU 模拟器注册完成。"
+fi
 
-# --- 8核16G服务器，3节点优化配置 ---
-# CPU: (8核 - 0.5核留给系统) / 3节点 = 2.5核/节点
-CPU_LIMIT="2.5"
-# 内存: (16G - 2G留给系统) / 3节点 ≈ 4.6G/节点。我们设置为4G，留有余量。
-MEMORY_LIMIT="4g"
-# 推荐的一键部署节点ID列表
-RECOMMENDED_NODE_IDS=("nexus-jupiter" "nexus-saturn" "nexus-neptune")
-
-# --- 核心功能函数 ---
-
-# check_docker 和 setup_buildx 函数与之前版本相同，保持不变
-function check_docker() { if ! command -v docker >/dev/null 2>&1; then echo "检测到未安装 Docker，正在为您安装..." >&2; sudo apt-get update && sudo apt-get install -y ca-certificates curl && sudo install -m 0755 -d /etc/apt/keyrings && sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && sudo chmod a+r /etc/apt/keyrings/docker.asc && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null && sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin && sudo systemctl enable docker && sudo systemctl start docker && echo "Docker 安装完成！"; fi; if ! docker buildx version >/dev/null 2>&1; then echo "错误：未找到 Docker buildx 插件。请确保您的 Docker 版本包含 buildx。" >&2; exit 1; fi; }
-function setup_buildx() { if docker buildx ls | grep -q "${BUILDER_NAME}.*running"; then docker buildx use $BUILDER_NAME; return; fi; echo "检测到需要设置跨平台构建环境 (QEMU)..."; if docker buildx ls | grep -q "$BUILDER_NAME"; then docker buildx inspect $BUILDER_NAME --bootstrap; else docker buildx create --name $BUILDER_NAME --driver docker-container --use; fi; if ! docker run --rm --privileged tonistiigi/binfmt | grep -q "setting up"; then docker run --rm --privileged tonistiigi/binfmt --install all; fi; echo "Buildx 环境设置完成。"; }
-
-# 【V5 优化】构建 Docker 镜像，无需临时文件
+echo "Buildx 环境设置完成。"
+Use code with caution.
+}
+构建 Docker 镜像
 function build_image() {
-    if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-        echo "镜像 $IMAGE_NAME 已存在，跳过构建。"
-        return
-    fi
-    
-    setup_buildx
-    echo "正在准备构建环境 (无临时文件模式)..."
+# 如果镜像已存在，则跳过构建
+if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+echo "镜像 $IMAGE_NAME 已存在，跳过构建。"
+return
+fi
+Generated code
+# 每次构建前都确保 buildx 环境就绪
+setup_buildx
 
-    # 将 entrypoint.sh 的内容存储在变量中
-    local entrypoint_script
-    read -r -d '' entrypoint_script <<'EOF'
-#!/bin/sh
-set -e
-if [ -z "$NODE_ID" ]; then echo "错误：缺少 NODE_ID 环境变量！" >&2; exit 1; fi
-mkdir -p /root/.nexus && echo "$NODE_ID" > /root/.nexus/node-id
-echo "节点 [ $NODE_ID ] 配置完成，启动主进程..."
-echo "日志将由 Docker 捕获, 使用 'docker logs <容器名>' 查看。"
-exec nexus-network start --node-id "$NODE_ID"
-EOF
+echo "正在准备构建环境..."
+WORKDIR=$(mktemp -d)
+cd "$WORKDIR"
 
-    echo "正在使用 builder '$BUILDER_NAME' 构建镜像 $IMAGE_NAME..."
-    # 【优化】使用 here-document 直接将 Dockerfile 内容传给 build 命令
-    # 同时，将 entrypoint 脚本内容通过 build context 传递进去
-    docker buildx build --builder $BUILDER_NAME --platform linux/arm64 -t "$IMAGE_NAME" --load -f- . <<EOF
+# --- Dockerfile 内容开始 ---
+cat > Dockerfile <<EOF
+Use code with caution.
+【修复】使用 ARG 来动态接收平台信息，避免 buildx 警告
 ARG TARGETPLATFORM=linux/arm64
-FROM --platform=\$TARGETPLATFORM alpine:latest
-
-# 安装依赖并下载二进制文件
-RUN apk add --no-cache curl bash ca-certificates \
-    && curl -L -o /usr/local/bin/nexus-network https://github.com/nexus-xyz/nexus-cli/releases/download/v0.10.1/nexus-network-linux-arm64 \
-    && chmod +x /usr/local/bin/nexus-network
-
-# 复制 entrypoint.sh
+FROM --platform=$TARGETPLATFORM ubuntu:24.04
+设置环境变量，避免交互式提示
+ENV DEBIAN_FRONTEND=noninteractive
+更新并安装必要的工具。这一步之前会因 "exec format error" 失败
+RUN apt-get update && apt-get install -y 
+curl 
+screen 
+bash 
+&& rm -rf /var/lib/apt/lists/*
+#直接从 GitHub Releases 下载指定版本 v0.10.1 的 ARM64 二进制文件。
+RUN echo "正在下载 Nexus ARM64 二进制文件..." 
+&& curl -L -o /usr/local/bin/nexus-network https://github.com/nexus-xyz/nexus-cli/releases/download/v0.10.1/nexus-network-linux-arm64 
+&& chmod +x /usr/local/bin/nexus-network
+复制并设置入口点脚本
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
-
+设置容器启动时执行的命令
 ENTRYPOINT ["/entrypoint.sh"]
 EOF
-    echo "镜像 $IMAGE_NAME 构建完成！"
-}
-
-# run_container 函数与之前版本类似，但强调了资源配置
-function run_container() {
-    local node_id=$1
-    local container_name="${BASE_CONTAINER_NAME}-${node_id}"
-
-    if docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
-        echo "节点 $node_id (容器 $container_name) 已存在，正在删除旧容器..."
-        docker rm -f "$container_name"
-    fi
-    
-    echo "正在启动容器 $container_name..."
-    echo "  -> 分配资源: ${CPU_LIMIT} CPU 核心, ${MEMORY_LIMIT} 内存"
-    
-    docker run -d --name "$container_name" \
-        -e NODE_ID="$node_id" \
-        --cpus="$CPU_LIMIT" \
-        --memory="$MEMORY_LIMIT" \
-        --restart unless-stopped \
-        "$IMAGE_NAME"
-    
-    echo "容器 $container_name 已启动！使用 'docker logs -f $container_name' 查看。"
-}
-
-
-# 【V5 优化】一键部署推荐方案
-function deploy_recommended_setup() {
-    echo "即将为您一键部署为 8核/16G 优化的 3 节点方案..."
-    echo "将创建以下节点："
-    printf " - %s\n" "${RECOMMENDED_NODE_IDS[@]}"
-    echo "每个节点将被分配 ${CPU_LIMIT} 个CPU核心 和 ${MEMORY_LIMIT} 的内存。"
-    read -rp "是否继续？ [y/N]: " confirmation
-    if [[ "$confirmation" != "y" && "$confirmation" != "Y" ]]; then
-        echo "操作已取消。"
-        return
-    fi
-
-    # 1. 确保镜像已构建
-    build_image
-    
-    # 2. 循环启动所有推荐节点
-    echo "开始批量启动容器..."
-    for node_id in "${RECOMMENDED_NODE_IDS[@]}"; do
-        run_container "$node_id"
-        sleep 1 # 短暂间隔，避免同时请求 Docker API
-    done
-    
-    echo "=========================================="
-    echo "🚀 所有推荐节点已部署并启动！"
-    echo "=========================================="
-}
-
-
-# 【V5 优化】增强的节点列表显示
-function list_nodes() {
-    echo "------------------------------------- 当前 Nexus 节点状态 --------------------------------------"
-    printf "%-28s %-15s %-15s %-25s\n" "节点 ID (容器名)" "状态" "CPU % (主机)" "内存使用 / 上限"
-    echo "------------------------------------------------------------------------------------------------"
-    
-    containers=$(docker ps -a --filter "name=${BASE_CONTAINER_NAME}-*" --format "{{.Names}}")
-
-    if [ -z "$containers" ]; then
-        echo "未找到任何 Nexus 节点容器。"
-    else
-        # 优化显示，一次性获取所有运行中容器的stats
-        stats_output=$(docker stats --no-stream --filter "name=${BASE_CONTAINER_NAME}-*" --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemLimit}}")
-        
-        for name in $containers; do
-            status=$(docker ps -a --filter "name=$name" --format "{{.Status}}")
-            node_id=$(echo "$name" | sed "s/^${BASE_CONTAINER_NAME}-//")
-            
-            stats_line=$(echo "$stats_output" | grep -w "$name")
-            if [[ -n "$stats_line" && "$status" == Up* ]]; then
-                cpu_perc=$(echo "$stats_line" | awk '{print $2}')
-                mem_usage=$(echo "$stats_line" | awk '{print $3 " " $4 " " $5}')
-                mem_limit=$(echo "$stats_line" | awk '{print $6 " " $7}')
-                
-                printf "%-28s %-15s %-15s %-25s\n" "$node_id ($name)" "$status" "$cpu_perc" "${mem_usage} / ${mem_limit}"
-            else
-                printf "%-28s %-15s %-15s %-25s\n" "$node_id ($name)" "$status" "N/A" "N/A"
-            fi
-        done
-    fi
-    echo "------------------------------------------------------------------------------------------------"
-}
-
-# 其他辅助函数基本保持不变，这里为了简洁省略了代码，它们与V4版本相同。
-# 您可以从V4版本拷贝过来，或者使用下面的简化版
-function get_all_node_ids() { docker ps -a --filter "name=${BASE_CONTAINER_NAME}-*" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//" | sort -u; }
-function uninstall_node() { local node_id=$1; local container_name="${BASE_CONTAINER_NAME}-${node_id}"; echo "正在停止并删除容器 $container_name..."; if docker rm -f "$container_name" >/dev/null 2>&1; then echo "容器已删除。"; else echo "容器不存在。"; fi; }
-function view_node_logs() { local node_id=$1; local container_name="${BASE_CONTAINER_NAME}-${node_id}"; if ! docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then echo "错误：未找到节点 $node_id 的容器。"; return 1; fi; echo "显示节点 '$node_id' 的日志... Ctrl+C 退出。"; sleep 1; docker logs -f "$container_name"; }
-function select_node_for_action() { local action_callback=$1; local prompt_message=$2; local all_nodes=($(get_all_node_ids)); if [ ${#all_nodes[@]} -eq 0 ]; then echo "当前没有可操作的节点。"; read -p "按任意键返回..." -n1 -s; return; fi; echo "请选择要'$prompt_message'的节点:"; echo "0. 返回"; for i in "${!all_nodes[@]}"; do printf "%2d. %s\n" $((i+1)) "${all_nodes[$i]}"; done; read -rp "请输入选项: "; if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 0 ] || [ "$choice" -gt ${#all_nodes[@]} ]; then echo "无效选项。"; sleep 1; return; fi; [ "$choice" -eq 0 ] && return; local selected_node_id=${all_nodes[$((choice-1))]} ; "$action_callback" "$selected_node_id"; }
-function uninstall_all_nodes_and_image() { echo "!!!!!! 极度危险操作 !!!!!!"; echo "将删除所有节点容器和镜像 $IMAGE_NAME"; read -rp "输入 'yes' 确认: "; if [ "$confirmation" != "yes" ]; then echo "操作取消。"; return; fi; local all_nodes=($(get_all_node_ids)); if [ ${#all_nodes[@]} -gt 0 ]; then echo "正在卸载所有节点..."; for node_id in "${all_nodes[@]}"; do uninstall_node "$node_id"; done; fi; if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then echo "删除镜像..."; docker rmi -f "$IMAGE_NAME"; fi; echo "清理完成。"; }
-
-# --- 主菜单循环 (V5) ---
-function main_menu() {
-    while true; do
-        clear
-        echo "脚本由哈哈哈哈编写，推特 @ferdie_jhovie，免费开源，请勿相信收费"
-        echo "========= Nexus 管理 (8核16G 极限优化版 V5) ========="
-        echo "1. 【推荐】一键部署 3 节点方案 (专为8核/16G)"
-        echo "2. 安装/启动单个自定义节点"
-        echo "3. 查看指定节点日志"
-        echo "4. 卸载指定节点"
-        echo "5. 卸载所有节点并删除镜像 (危险!)"
-        echo "6. 退出脚本"
-        echo "-----------------------------------------------------------"
-        echo "预设资源: CPU=${CPU_LIMIT}/节点, 内存=${MEMORY_LIMIT}/节点"
-        echo "==========================================================="
-        list_nodes
-
-        read -rp "请输入选项(1-6): " choice
-
-        case $choice in
-            1)
-                deploy_recommended_setup
-                read -p "操作完成，按任意键返回菜单..."
-                ;;
-            2)
-                read -rp "请输入您的 Node ID: " NODE_ID
-                if [ -n "$NODE_ID" ]; then
-                    build_image
-                    run_container "$NODE_ID"
-                else
-                    echo "Node ID 不能为空！"
-                fi
-                read -p "操作完成，按任意键返回菜单..."
-                ;;
-            3)
-                select_node_for_action "view_node_logs" "查看日志"
-                ;;
-            4)
-                select_node_for_action "uninstall_node" "卸载"
-                read -p "操作完成，按任意键返回..."
-                ;;
-            5)
-                uninstall_all_nodes_and_image
-                read -p "操作完成，按任意键返回..."
-                ;;
-            6)
-                echo "退出脚本。"
-                exit 0
-                ;;
-            *)
-                echo "无效选项，请重新输入。"
-                sleep 1
-                ;;
-        esac
-    done
-}
-
-# --- 脚本执行入口 ---
-check_docker
-# 创建临时的 entrypoint.sh 用于 Docker build context
-cat > entrypoint.sh <<'EOF'
-#!/bin/sh
+# --- Dockerfile 内容结束 ---
+Generated code
+# --- entrypoint.sh 内容开始 (保持不变) ---
+cat > entrypoint.sh <<EOF
+Use code with caution.
+#!/bin/bash
 set -e
-if [ -z "$NODE_ID" ]; then echo "错误：缺少 NODE_ID 环境变量！" >&2; exit 1; fi
-mkdir -p /root/.nexus && echo "$NODE_ID" > /root/.nexus/node-id
-echo "节点 [ $NODE_ID ] 配置完成，启动主进程..."
-echo "日志将由 Docker 捕获, 使用 'docker logs <容器名>' 查看。"
-exec nexus-network start --node-id "$NODE_ID"
+PROVER_ID_FILE="/root/. nexus/node-id "
+if [ -z "$NODE_ID" ]; then
+echo "错误：未通过 -e NODE_ID=... 设置环境变量！"
+exit 1
+fi
+mkdir -p /root/.nexus
+echo "$NODE_ID" > "$PROVER_ID_FILE"
+echo "已将 Node ID 写入文件: $PROVER_ID_FILE"
+echo "使用的 Node ID: $NODE_ID"
+if ! command -v nexus-network >/dev/null 2>&1; then
+echo "错误：nexus-network 命令未在 /usr/local/bin 中找到或不可执行。"
+exit 1
+fi
+screen -S nexus -X quit >/dev/null 2>&1 || true
+echo "正在启动 nexus-network 节点..."
+screen -dmS nexus bash -c "nexus-network start --node-id $NODE_ID | tee /root/nexus.log"
+sleep 3
+if screen -list | grep -q "nexus"; then
+echo "节点已在后台 screen 会话中成功启动。"
+echo "容器内日志文件路径: /root/nexus.log"
+echo "您可以使用 'docker logs -f $HOSTNAME' 实时查看日志"
+else
+echo "错误：节点启动失败！请检查配置和网络。"
+if [ -f /root/nexus.log ]; then
+echo "--- 错误日志开始 ---"
+cat /root/nexus.log
+echo "--- 错误日志结束 ---"
+fi
+exit 1
+fi
+tail -f /root/nexus.log
 EOF
+# --- entrypoint.sh 内容结束 ---
+Generated code
+echo "正在使用 builder '$BUILDER_NAME' 构建 Docker 镜像 $IMAGE_NAME..."
+# 使用 buildx 进行构建，确保平台正确性，并使用 --load 将镜像加载到本地 docker
+docker buildx build --builder $BUILDER_NAME --platform linux/arm64 -t "$IMAGE_NAME" . --load
 
-# 主逻辑
+echo "清理构建目录..."
+cd - >/dev/null
+rm -rf "$WORKDIR"
+echo "镜像构建完成！"
+Use code with caution.
+}
+启动一个节点容器
+function run_container() {
+local node_id=
+1
+l
+o
+c
+a
+l
+c
+o
+n
+t
+a
+i
+n
+e
+r
+n
+a
+m
+e
+=
+"
+1localcontainer 
+n
+​
+ ame="
+{BASE_CONTAINER_NAME}-
+n
+o
+d
+e
+i
+d
+"
+l
+o
+c
+a
+l
+l
+o
+g
+f
+i
+l
+e
+=
+"
+node 
+i
+​
+ d"locallog 
+f
+​
+ ile="
+{LOG_DIR}/nexus-${node_id}.log"
+Generated code
+if docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
+    echo "检测到旧容器 $container_name，正在删除..."
+    docker rm -f "$container_name"
+fi
+
+mkdir -p "$LOG_DIR"
+touch "$log_file"
+chmod 644 "$log_file"
+
+echo "正在启动容器 $container_name..."
+docker run -d --name "$container_name" \
+    -v "$log_file":/root/nexus.log \
+    -e NODE_ID="$node_id" \
+    --restart unless-stopped \
+    "$IMAGE_NAME"
+
+echo "容器 $container_name 已启动！"
+echo "宿主机日志文件位于: $log_file"
+echo "查看实时日志命令: tail -f $log_file  或者  docker logs -f $container_name"
+Use code with caution.
+}
+--- 辅助管理函数 (与之前版本相同，保持完整性) ---
+function uninstall_node() {
+local node_id=
+1
+l
+o
+c
+a
+l
+c
+o
+n
+t
+a
+i
+n
+e
+r
+n
+a
+m
+e
+=
+"
+1localcontainer 
+n
+​
+ ame="
+{BASE_CONTAINER_NAME}-
+n
+o
+d
+e
+i
+d
+"
+l
+o
+c
+a
+l
+l
+o
+g
+f
+i
+l
+e
+=
+"
+node 
+i
+​
+ d"locallog 
+f
+​
+ ile="
+{LOG_DIR}/nexus-${node_id}.log"
+echo "正在停止并删除容器 
+c
+o
+n
+t
+a
+i
+n
+e
+r
+n
+a
+m
+e
+.
+.
+.
+"
+i
+f
+d
+o
+c
+k
+e
+r
+r
+m
+−
+f
+"
+container 
+n
+​
+ ame..."ifdockerrm−f"
+container_name" >/dev/null 2>&1; then
+echo "容器 $container_name 已删除。"
+else
+echo "容器 
+c
+o
+n
+t
+a
+i
+n
+e
+r
+n
+a
+m
+e
+不存在或已删除。
+"
+f
+i
+i
+f
+[
+−
+f
+"
+container 
+n
+​
+ ame不存在或已删除。"fiif[−f"
+log_file" ]; then
+echo "正在删除日志文件 
+l
+o
+g
+f
+i
+l
+e
+.
+.
+.
+"
+r
+m
+−
+f
+"
+log 
+f
+​
+ ile..."rm−f"
+log_file"
+fi
+echo "节点 $node_id 的相关资源已卸载。"
+}
+function list_nodes() {
+echo "--------------------------------- 当前 Nexus 节点状态 ---------------------------------"
+printf "%-28s %-12s %-20s %-20s\n" "节点 ID (容器名)" "状态" "CPU %" "内存使用"
+echo "-------------------------------------------------------------------------------------"
+Generated code
+containers=$(docker ps -a --filter "name=${BASE_CONTAINER_NAME}-*" --format "{{.Names}}")
+
+if [ -z "$containers" ]; then
+    echo "未找到任何 Nexus 节点容器。"
+else
+    # 优化显示逻辑，避免多次调用 docker stats
+    stats=$(docker stats --no-stream --filter "name=${BASE_CONTAINER_NAME}-*" --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}")
+    for name in $containers; do
+        status_info=$(docker ps -a --filter "name=$name" --format "{{.Status}}")
+        node_id=$(echo "$name" | sed "s/${BASE_CONTAINER_NAME}-//")
+        
+        stats_line=$(echo "$stats" | grep -w "$name")
+        if [ -n "$stats_line" ] && echo "$status_info" | grep -q "Up"; then
+            cpu_perc=$(echo "$stats_line" | awk '{print $2}')
+            mem_usage=$(echo "$stats_line" | awk -F '\t' '{print $3}')
+            printf "%-28s %-12s %-20s %-20s\n" "$node_id ($name)" "Running" "$cpu_perc" "$mem_usage"
+        else
+            printf "%-28s %-12s %-20s %-20s\n" "$node_id ($name)" "Stopped" "N/A" "N/A"
+        fi
+    done
+fi
+echo "-------------------------------------------------------------------------------------"
+Use code with caution.
+}
+function get_all_node_ids() {
+docker ps -a --filter "name=
+B
+A
+S
+E
+C
+O
+N
+T
+A
+I
+N
+E
+R
+N
+A
+M
+E
+−
+∗
+"
+−
+−
+f
+o
+r
+m
+a
+t
+"
+.
+N
+a
+m
+e
+s
+"
+∣
+s
+e
+d
+"
+s
+/
+BASE 
+C
+​
+ ONTAINER 
+N
+​
+ AME−∗"−−format".Names"∣sed"s/
+{BASE_CONTAINER_NAME}-//" | sort -u
+}
+function view_node_logs() {
+local node_id=
+1
+l
+o
+c
+a
+l
+c
+o
+n
+t
+a
+i
+n
+e
+r
+n
+a
+m
+e
+=
+"
+1localcontainer 
+n
+​
+ ame="
+{BASE_CONTAINER_NAME}-
+n
+o
+d
+e
+i
+d
+"
+i
+f
+!
+d
+o
+c
+k
+e
+r
+p
+s
+−
+a
+−
+−
+f
+o
+r
+m
+a
+t
+′
+.
+N
+a
+m
+e
+s
+′
+∣
+g
+r
+e
+p
+−
+q
+w
+"
+node 
+i
+​
+ d"if!dockerps−a−−format 
+′
+ .Names 
+′
+ ∣grep−qw"
+container_name"; then
+echo "错误：未找到节点 
+n
+o
+d
+e
+i
+d
+的容器。
+"
+r
+e
+t
+u
+r
+n
+1
+f
+i
+e
+c
+h
+o
+"
+正在显示节
+点
+′
+node 
+i
+​
+ d的容器。"return1fiecho"正在显示节点 
+′
+ 
+node_id' 的日志... 按 Ctrl+C 退出。"
+sleep 1
+docker logs -f "$container_name"
+}
+function batch_start_nodes() {
+echo "请输入多个 Node ID，每行一个。输入空行或按 Ctrl+D 结束："
+local node_ids=()
+while IFS= read -r line; do
+line=
+(
+e
+c
+h
+o
+"
+(echo"
+line" | xargs)
+[ -z "
+line")
+done
+if [ ${#node_ids[@]} -eq 0 ]; then
+echo "未输入任何 Node ID，操作取消。"
+return
+fi
+echo "准备启动 
+{node_ids[@]}"; do
+run_container "$node_id"
+sleep 1
+done
+echo "所有节点启动任务已提交！"
+}
+function select_node_for_action() {
+local action_callback=
+1
+l
+o
+c
+a
+l
+p
+r
+o
+m
+p
+t
+m
+e
+s
+s
+a
+g
+e
+=
+1localprompt 
+m
+​
+ essage=
+2
+local all_nodes=($(get_all_node_ids))
+if [ 
+prompt_message'的节点："
+echo "0. 返回主菜单"
+for i in "
+!
+a
+l
+l
+n
+o
+d
+e
+s
+[
+@
+]
+"
+;
+d
+o
+l
+o
+c
+a
+l
+n
+o
+d
+e
+i
+d
+=
+!all 
+n
+​
+ odes[@]";dolocalnode 
+i
+​
+ d=
+{all_nodes[
+{BASE_CONTAINER_NAME}-
+n
+o
+d
+e
+i
+d
+"
+l
+o
+c
+a
+l
+s
+t
+a
+t
+u
+s
+=
+node 
+i
+​
+ d"localstatus=
+(docker ps -a --filter "name=$container_name" --format "{{.Status}}")
+printf "%2d. 节点 %-25s [%s]\n" 
+(
+(
+i
++
+1
+)
+)
+"
+((i+1))"
+node_id" "
+s
+t
+a
+t
+u
+s
+"
+d
+o
+n
+e
+r
+e
+a
+d
+−
+r
+p
+"
+请输入选项
+(
+0
+−
+status"doneread−rp"请输入选项(0−
+{#all_nodes[@]}): " choice
+if ! [[ "
+c
+h
+o
+i
+c
+e
+"
+=
+ 
+[
+0
+−
+9
+]
++
+choice"=  
+[
+ 0−9]+
+ ]] || [ "
+c
+h
+o
+i
+c
+e
+"
+−
+l
+t
+0
+]
+∣
+∣
+[
+"
+choice"−lt0]∣∣["
+choice" -gt 
+choice" -eq 0 ] && return
+local selected_node_id=
+((choice-1))]}
+"
+a
+c
+t
+i
+o
+n
+c
+a
+l
+l
+b
+a
+c
+k
+"
+"
+action 
+c
+​
+ allback""
+selected_node_id"
+}
+function batch_uninstall_nodes() {
+echo "功能正在实现中..." && read -p "按任意键返回菜单..."
+}
+function uninstall_all_nodes_and_image() {
+echo "功能正在实现中..." && read -p "按任意键返回菜单..."
+}
+--- 主菜单循环 ---
+function main_menu() {
+while true; do
+clear
+echo "脚本由哈哈哈哈编写，推特 @ferdie_jhovie，免费开源，请勿相信收费"
+echo "================ Nexus 多节点管理 (ARM64 Docker版) ================"
+echo "1. 安装/启动单个节点"
+echo "2. 批量安装/启动多个节点"
+echo "3. 查看指定节点日志"
+echo "4. 卸载指定节点"
+echo "5. 批量卸载节点 (TODO)"
+echo "6. 卸载所有节点并删除镜像 (TODO)"
+echo "7. 退出脚本"
+echo "==================================================================="
+list_nodes
+Generated code
+read -rp "请输入选项(1-7): " choice
+
+    case $choice in
+        1)
+            read -rp "请输入您的 Node ID: " NODE_ID
+            if [ -z "$NODE_ID" ]; then
+                echo "Node ID 不能为空！"
+            else
+                build_image
+                run_container "$NODE_ID"
+            fi
+            read -p "操作完成，按任意键返回菜单..."
+            ;;
+        2)
+            batch_start_nodes
+            read -p "操作完成，按任意键返回菜单..."
+            ;;
+        3)
+            select_node_for_action "view_node_logs" "查看日志"
+            ;;
+        4)
+            select_node_for_action "uninstall_node" "卸载"
+            read -p "操作完成，按任意键返回..."
+            ;;
+        5)
+            batch_uninstall_nodes
+            ;;
+        6)
+            uninstall_all_nodes_and_image
+            ;;
+        7)
+            echo "退出脚本。"
+            exit 0
+            ;;
+        *)
+            echo "无效选项，请重新输入。"
+            sleep 1
+            ;;
+    esac
+done
+Use code with caution.
+}
+--- 脚本执行入口 ---
+check_docker
 main_menu
-
-# 脚本结束时清理临时文件
-rm -f entrypoint.sh
