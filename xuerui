@@ -2,13 +2,13 @@
 set -e
 
 # ==============================================================================
-# Nexus 多节点管理脚本 (ARM64专用Docker版) - 终极防错版 v3.6
-# 作者: 哈哈哈哈 (推特 @ferdie_jhovie)
+# Nexus 多节点管理脚本 (ARM64专用Docker版) - 终极防错·绝对完整版 v3.7
 #
-# 【V3.6 更新】:
-#   - 针对 "unexpected end of file" 错误，将大部分函数体压缩为单行，
-#     以最大限度地防止因复制粘贴或格式问题导致的语法错误。
-#   - 保持核心功能和所有修复不变。
+# 【V3.7 更新】:
+#   - 【最终修复】针对 "unexpected end of file" 的顽固问题，已完全移除所有
+#     不稳定的 `cat <<EOF` 语法。
+#   - 改用 printf 命令来生成 Dockerfile 和 entrypoint.sh，这种方法对
+#     复制粘贴错误具有极高的容忍度，从根本上解决语法问题。
 # ==============================================================================
 
 # --- 配置项 ---
@@ -19,31 +19,45 @@ BUILDER_NAME="nexus_builder"
 
 # --- 核心功能函数 ---
 check_docker_daemon() { if ! docker info >/dev/null 2>&1; then echo "!! 致命错误: Docker 服务未运行或无权访问 !!"; exit 1; fi; }
-check_docker() { if ! command -v docker >/dev/null 2>&1; then echo "正在安装 Docker..."; apt-get update >/dev/null; apt-get install -y apt-transport-https ca-certificates curl software-properties-common >/dev/null; curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -; add-apt-repository "deb [arch=arm64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"; apt-get update >/dev/null; apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin >/dev/null; systemctl enable --now docker; fi; if ! docker buildx version >/dev/null 2>&1; then echo "错误：未找到 Docker buildx 插件。"; exit 1; fi; }
+check_docker() { if ! command -v docker >/dev/null 2>&1; then echo "正在安装 Docker..."; apt-get update >/dev/null; apt-get install -y apt-transport-https ca-certificates curl software-properties-common >/dev/null; curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -; add-apt-repository -y "deb [arch=arm64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"; apt-get update >/dev/null; apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin >/dev/null; systemctl enable --now docker; fi; if ! docker buildx version >/dev/null 2>&1; then echo "错误：未找到 Docker buildx 插件。"; exit 1; fi; }
 setup_buildx() { if docker buildx ls | grep -q "^${BUILDER_NAME}.*running"; then docker buildx use $BUILDER_NAME; return; fi; echo "正在设置 Buildx 环境..."; if docker buildx ls | grep -q "$BUILDER_NAME"; then docker buildx inspect $BUILDER_NAME --bootstrap; else docker buildx create --name $BUILDER_NAME --driver docker-container --use; fi; if ! docker run --rm --privileged tonistiigi/binfmt | grep -q "setting up"; then docker run --rm --privileged tonistiigi/binfmt --install all; fi; }
-build_image() { if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then return; fi; setup_buildx; WORKDIR=$(mktemp -d); cd "$WORKDIR"; cat > Dockerfile <<'EOF';
-ARG TARGETPLATFORM=linux/arm64
-FROM --platform=$TARGETPLATFORM ubuntu:24.04
-ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y curl screen bash && rm -rf /var/lib/apt/lists/*
-RUN curl -L -o /usr/local/bin/nexus-network https://github.com/nexus-xyz/nexus-cli/releases/download/v0.10.1/nexus-network-linux-arm64 && chmod +x /usr/local/bin/nexus-network
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
-ENTRYPOINT ["/entrypoint.sh"]
-EOF
-cat > entrypoint.sh <<'EOF';
-#!/bin/bash
-set -e
-if [ -z "$NODE_ID" ]; then exit 1; fi
-mkdir -p /root/.nexus && echo "$NODE_ID" > /root/.nexus/node-id
-if ! command -v nexus-network >/dev/null 2>&1; then exit 1; fi
-screen -S nexus -X quit >/dev/null 2>&1 || true
-screen -dmS nexus bash -c "nexus-network start --node-id $NODE_ID | tee /root/nexus.log"
-sleep 3
-if ! screen -list | grep -q "nexus"; then cat /root/nexus.log; exit 1; fi
-tail -f /root/nexus.log
-EOF
-docker buildx build --builder "$BUILDER_NAME" --platform linux/arm64 -t "$IMAGE_NAME" . --load >/dev/null; cd - >/dev/null; rm -rf "$WORKDIR"; }
+
+# 【关键修复】使用 printf 彻底替换 cat <<EOF
+build_image() {
+    if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then return; fi
+    setup_buildx
+    WORKDIR=$(mktemp -d)
+    cd "$WORKDIR"
+    
+    # 使用 printf 安全地创建 Dockerfile
+    printf '%s\n' \
+      'ARG TARGETPLATFORM=linux/arm64' \
+      'FROM --platform=$TARGETPLATFORM ubuntu:24.04' \
+      'ENV DEBIAN_FRONTEND=noninteractive' \
+      'RUN apt-get update && apt-get install -y curl screen bash && rm -rf /var/lib/apt/lists/*' \
+      'RUN curl -L -o /usr/local/bin/nexus-network https://github.com/nexus-xyz/nexus-cli/releases/download/v0.10.1/nexus-network-linux-arm64 && chmod +x /usr/local/bin/nexus-network' \
+      'COPY entrypoint.sh /entrypoint.sh' \
+      'RUN chmod +x /entrypoint.sh' \
+      'ENTRYPOINT ["/entrypoint.sh"]' > Dockerfile
+
+    # 使用 printf 安全地创建 entrypoint.sh
+    printf '%s\n' \
+      '#!/bin/bash' \
+      'set -e' \
+      'if [ -z "$NODE_ID" ]; then exit 1; fi' \
+      'mkdir -p /root/.nexus && echo "$NODE_ID" > /root/.nexus/node-id' \
+      'if ! command -v nexus-network >/dev/null 2>&1; then exit 1; fi' \
+      'screen -S nexus -X quit >/dev/null 2>&1 || true' \
+      'screen -dmS nexus bash -c "nexus-network start --node-id $NODE_ID | tee /root/nexus.log"' \
+      'sleep 3' \
+      'if ! screen -list | grep -q "nexus"; then cat /root/nexus.log; exit 1; fi' \
+      'tail -f /root/nexus.log' > entrypoint.sh
+
+    docker buildx build --builder "$BUILDER_NAME" --platform linux/arm64 -t "$IMAGE_NAME" . --load >/dev/null
+    cd - >/dev/null
+    rm -rf "$WORKDIR"
+}
+
 run_container() { local node_id="$1"; if [ -z "$node_id" ]; then echo "错误: 无 Node ID"; return 1; fi; local container_name="${BASE_CONTAINER_NAME}-${node_id}"; docker rm -f "$container_name" >/dev/null 2>&1; mkdir -p "$LOG_DIR"; local log_file="${LOG_DIR}/nexus-${node_id}.log"; touch "$log_file" && chmod 644 "$log_file"; docker run -d --name "$container_name" -v "$log_file:/root/nexus.log" -e NODE_ID="$node_id" --restart unless-stopped "$IMAGE_NAME"; echo "节点 $node_id 已启动。日志: $log_file"; }
 uninstall_node() { local node_id="$1"; local container_name="${BASE_CONTAINER_NAME}-${node_id}"; docker rm -f "$container_name" >/dev/null 2>&1; rm -f "${LOG_DIR}/nexus-${node_id}.log"; echo "节点 $node_id 已卸载。"; }
 get_all_node_ids() { docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/${BASE_CONTAINER_NAME}-//" | sort -u; }
@@ -63,7 +77,7 @@ main_menu() {
     while true; do
         clear
         echo "脚本由哈哈哈哈编写，推特 @ferdie_jhovie，免费开源，请勿相信收费"
-        echo "================ Nexus 管理 (ARM64 Docker版) v3.6 ==================="
+        echo "================ Nexus 管理 (ARM64 Docker版) v3.7 ==================="
         echo "1. 安装/启动单个节点        5. 批量卸载所有节点"
         echo "2. 批量安装/启动多个节点    6. 完全卸载 (删除所有节点和镜像)"
         echo "3. 查看指定节点日志         7. 退出脚本"
@@ -71,12 +85,12 @@ main_menu() {
         list_nodes
         read -rp "请输入选项(1-7): " choice
         case $choice in
-            1) read -rp "请输入 Node ID: " NODE_ID; if [ -n "$NODE_ID" ]; then build_image; run_container "$NODE_ID"; fi; read -p "按任意键返回...";;
-            2) batch_start_nodes; read -p "按任意键返回...";;
+            1) read -rp "请输入 Node ID: " NODE_ID; if [ -n "$NODE_ID" ]; then build_image; run_container "$NODE_ID"; fi; read -p "操作完成，按任意键返回...";;
+            2) batch_start_nodes; read -p "操作完成，按任意键返回...";;
             3) select_node_for_action "view_node_logs" "查看日志";;
-            4) select_node_for_action "uninstall_node" "卸载"; read -p "按任意键返回...";;
-            5) batch_uninstall_nodes; read -p "按任意键返回...";;
-            6) uninstall_all_nodes_and_image; read -p "按任意键返回...";;
+            4) select_node_for_action "uninstall_node" "卸载"; read -p "操作完成，按任意键返回...";;
+            5) batch_uninstall_nodes; read -p "操作完成，按任意键返回...";;
+            6) uninstall_all_nodes_and_image; read -p "操作完成，按任意键返回...";;
             7) echo "退出脚本。"; exit 0;;
             *) echo "无效选项。"; sleep 1;;
         esac
