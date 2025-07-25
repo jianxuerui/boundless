@@ -1,14 +1,16 @@
 #!/bin/bash
-# 开启调试模式：-e (出错时退出), -x (打印执行的命令)
-set -ex
+# 确保脚本在发生错误时立即退出
+set -e
 
 # ==============================================================================
-# Nexus 多节点管理脚本 (ARM64专用Docker版) - 调试版 v3.3.1
+# Nexus 多节点管理脚本 (ARM64专用Docker版)
 # 作者: 哈哈哈哈 (推特 @ferdie_jhovie)
 # 描述: 此脚本使用 Docker 来管理多个 Nexus 节点，特别为 ARM64 架构优化。
 #
-# 【V3.3.1 更新】:
-#   - 开启了 set -x 调试模式，以便在出错时能看到是哪条命令失败了。
+# 【V3.4 社区修复版】:
+#   - 【关键修复】根据用户提供的调试日志，修复了 list_nodes 函数中的循环逻辑。
+#   - 将不稳定的 `for var in $multiline_string` 循环替换为标准的 `while read`
+#     循环，确保在所有环境中都能正确处理容器列表，避免脚本意外退出。
 # ==============================================================================
 
 # --- 配置项 ---
@@ -33,7 +35,6 @@ function check_docker() {
         systemctl start docker
         echo "Docker 安装完成！"
     fi
-
     if ! docker buildx version >/dev/null 2>&1; then
         echo "错误：未找到 Docker buildx 插件。请确保您的 Docker 版本包含 buildx。"
         echo "尝试安装命令: apt-get install docker-buildx-plugin"
@@ -44,40 +45,24 @@ function check_docker() {
 # 设置 Buildx 以支持跨平台构建
 function setup_buildx() {
     if docker buildx ls | grep -q "^${BUILDER_NAME}.*running"; then
-        echo "Buildx 环境 '$BUILDER_NAME' 已准备就绪。"
-        docker buildx use $BUILDER_NAME
-        return
+        echo "Buildx 环境 '$BUILDER_NAME' 已准备就绪。"; docker buildx use $BUILDER_NAME; return;
     fi
-
     echo "检测到需要设置跨平台构建环境 (QEMU)..."
-    echo "这可能是一次性的设置过程。"
-
     if docker buildx ls | grep -q "$BUILDER_NAME"; then
-        echo "正在启动已存在的 builder '$BUILDER_NAME'..."
-        docker buildx inspect $BUILDER_NAME --bootstrap
+        echo "正在启动已存在的 builder '$BUILDER_NAME'..."; docker buildx inspect $BUILDER_NAME --bootstrap;
     else
-        echo "正在创建新的 buildx builder '$BUILDER_NAME'..."
-        docker buildx create --name $BUILDER_NAME --driver docker-container --use
+        echo "正在创建新的 buildx builder '$BUILDER_NAME'..."; docker buildx create --name $BUILDER_NAME --driver docker-container --use;
     fi
-
     if ! docker run --rm --privileged tonistiigi/binfmt | grep -q "setting up"; then
-        echo "正在注册 QEMU 模拟器..."
-        docker run --rm --privileged tonistiigi/binfmt --install all
-        echo "QEMU 模拟器注册完成。"
+        echo "正在注册 QEMU 模拟器..."; docker run --rm --privileged tonistiigi/binfmt --install all; echo "QEMU 模拟器注册完成。";
     fi
     echo "Buildx 环境设置完成。"
 }
 
 # 构建 Docker 镜像
 function build_image() {
-    if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-        echo "镜像 $IMAGE_NAME 已存在，跳过构建。"
-        return
-    fi
-    setup_buildx
-    echo "正在准备构建环境..."
-    WORKDIR=$(mktemp -d)
-    cd "$WORKDIR"
+    if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then echo "镜像 $IMAGE_NAME 已存在，跳过构建。"; return; fi
+    setup_buildx; echo "正在准备构建环境..."; WORKDIR=$(mktemp -d); cd "$WORKDIR"
     cat > Dockerfile <<EOF
 ARG TARGETPLATFORM=linux/arm64
 FROM --platform=\$TARGETPLATFORM ubuntu:24.04
@@ -94,105 +79,76 @@ EOF
 #!/bin/bash
 set -e
 PROVER_ID_FILE="/root/.nexus/node-id"
-if [ -z "$NODE_ID" ]; then
-    echo "错误：未通过 -e NODE_ID=... 设置环境变量！"
-    exit 1
-fi
-mkdir -p /root/.nexus
-echo "$NODE_ID" > "$PROVER_ID_FILE"
-echo "已将 Node ID 写入文件: $PROVER_ID_FILE"
-echo "使用的 Node ID: $NODE_ID"
-if ! command -v nexus-network >/dev/null 2>&1; then
-    echo "错误：nexus-network 命令未在 /usr/local/bin 中找到或不可执行。"
-    exit 1
-fi
+if [ -z "$NODE_ID" ]; then echo "错误：未通过 -e NODE_ID=... 设置环境变量！"; exit 1; fi
+mkdir -p /root/.nexus; echo "$NODE_ID" > "$PROVER_ID_FILE"; echo "已将 Node ID 写入文件: $PROVER_ID_FILE"; echo "使用的 Node ID: $NODE_ID"
+if ! command -v nexus-network >/dev/null 2>&1; then echo "错误：nexus-network 命令未在 /usr/local/bin 中找到或不可执行。"; exit 1; fi
 screen -S nexus -X quit >/dev/null 2>&1 || true
-echo "正在启动 nexus-network 节点..."
-screen -dmS nexus bash -c "nexus-network start --node-id $NODE_ID | tee /root/nexus.log"
+echo "正在启动 nexus-network 节点..."; screen -dmS nexus bash -c "nexus-network start --node-id $NODE_ID | tee /root/nexus.log"
 sleep 3
 if screen -list | grep -q "nexus"; then
-    echo "节点已在后台 screen 会话中成功启动。"
-    echo "容器内日志文件路径: /root/nexus.log"
-    echo "您可以使用 'docker logs -f \$HOSTNAME' 实时查看日志"
+    echo "节点已在后台 screen 会话中成功启动。"; echo "容器内日志文件路径: /root/nexus.log"; echo "您可以使用 'docker logs -f \$HOSTNAME' 实时查看日志"
 else
-    echo "错误：节点启动失败！请检查配置和网络。"
-    if [ -f /root/nexus.log ]; then
-        echo "--- 错误日志开始 ---"
-        cat /root/nexus.log
-        echo "--- 错误日志结束 ---"
-    fi
-    exit 1
+    echo "错误：节点启动失败！请检查配置和网络。"; if [ -f /root/nexus.log ]; then echo "--- 错误日志开始 ---"; cat /root/nexus.log; echo "--- 错误日志结束 ---"; fi; exit 1
 fi
 tail -f /root/nexus.log
 EOF
-    echo "正在使用 builder '$BUILDER_NAME' 构建 Docker 镜像 $IMAGE_NAME..."
-    docker buildx build --builder "$BUILDER_NAME" --platform linux/arm64 -t "$IMAGE_NAME" . --load
-    echo "清理构建目录..."
-    cd - >/dev/null
-    rm -rf "$WORKDIR"
-    echo "镜像构建完成！"
+    echo "正在使用 builder '$BUILDER_NAME' 构建 Docker 镜像 $IMAGE_NAME..."; docker buildx build --builder "$BUILDER_NAME" --platform linux/arm64 -t "$IMAGE_NAME" . --load
+    echo "清理构建目录..."; cd - >/dev/null; rm -rf "$WORKDIR"; echo "镜像构建完成！"
 }
 
 # 启动一个节点容器
 function run_container() {
-    local node_id="$1"
-    if [ -z "$node_id" ]; then
-        echo "错误：调用 run_container 时未提供 Node ID。"
-        return 1
-    fi
-    local container_name="${BASE_CONTAINER_NAME}-${node_id}"
-    local log_file="${LOG_DIR}/nexus-${node_id}.log"
-    if docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
-        echo "检测到旧容器 $container_name，正在删除..."
-        docker rm -f "$container_name"
-    fi
-    mkdir -p "$LOG_DIR"
-    touch "$log_file"
-    chmod 644 "$log_file"
-    echo "正在启动容器 $container_name..."
-    docker run -d --name "$container_name" \
-        -v "$log_file:/root/nexus.log" \
-        -e NODE_ID="$node_id" \
-        --restart unless-stopped \
-        "$IMAGE_NAME"
-    echo "容器 $container_name 已启动！"
-    echo "宿主机日志文件位于: $log_file"
-    echo "查看实时日志命令: tail -f $log_file  或者  docker logs -f $container_name"
+    local node_id="$1"; if [ -z "$node_id" ]; then echo "错误：调用 run_container 时未提供 Node ID。"; return 1; fi
+    local container_name="${BASE_CONTAINER_NAME}-${node_id}"; local log_file="${LOG_DIR}/nexus-${node_id}.log"
+    if docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then echo "检测到旧容器 $container_name，正在删除..."; docker rm -f "$container_name"; fi
+    mkdir -p "$LOG_DIR"; touch "$log_file"; chmod 644 "$log_file"
+    echo "正在启动容器 $container_name..."; docker run -d --name "$container_name" -v "$log_file:/root/nexus.log" -e NODE_ID="$node_id" --restart unless-stopped "$IMAGE_NAME"
+    echo "容器 $container_name 已启动！"; echo "宿主机日志文件位于: $log_file"; echo "查看实时日志命令: tail -f $log_file  或者  docker logs -f $container_name"
 }
 
 # --- 辅助管理函数 ---
 
 function uninstall_node() {
-    local node_id="$1"
-    if [ -z "$node_id" ]; then echo "错误：调用 uninstall_node 时未提供 Node ID。"; return 1; fi
-    local container_name="${BASE_CONTAINER_NAME}-${node_id}"
-    local log_file="${LOG_DIR}/nexus-${node_id}.log"
-    echo "正在停止并删除容器 $container_name..."
-    if docker rm -f "$container_name" >/dev/null 2>&1; then echo "容器 $container_name 已删除。"; else echo "容器 $container_name 不存在或已删除。"; fi
-    if [ -f "$log_file" ]; then echo "正在删除日志文件 $log_file..."; rm -f "$log_file"; fi
-    echo "节点 $node_id 的相关资源已卸载。"
+    local node_id="$1"; if [ -z "$node_id" ]; then echo "错误：调用 uninstall_node 时未提供 Node ID。"; return 1; fi
+    local container_name="${BASE_CONTAINER_NAME}-${node_id}"; local log_file="${LOG_DIR}/nexus-${node_id}.log"
+    echo "正在停止并删除容器 $container_name..."; if docker rm -f "$container_name" >/dev/null 2>&1; then echo "容器 $container_name 已删除。"; else echo "容器 $container_name 不存在或已删除。"; fi
+    if [ -f "$log_file" ]; then echo "正在删除日志文件 $log_file..."; rm -f "$log_file"; fi; echo "节点 $node_id 的相关资源已卸载。"
 }
 
+# 【已修复】列出所有节点状态的函数
 function list_nodes() {
     echo "--------------------------------- 当前 Nexus 节点状态 ---------------------------------"
     printf "%-30s %-12s %-15s %-20s\n" "节点 ID (容器名)" "状态" "CPU %" "内存使用"
     echo "-------------------------------------------------------------------------------------"
-    local all_containers; all_containers=$(docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}")
-    if [ -z "$all_containers" ]; then
+    
+    # 步骤1：获取所有正在运行的目标容器的 stats，这步操作很高效
+    local running_containers; running_containers=$(docker ps --filter "name=${BASE_CONTAINER_NAME}-" --filter "status=running" --format "{{.Names}}")
+    local stats_output=""
+    if [ -n "$running_containers" ]; then
+        stats_output=$(docker stats --no-stream $running_containers --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}")
+    fi
+    
+    # 步骤2：检查是否存在任何节点容器
+    local all_containers_cmd="docker ps -a --filter name=${BASE_CONTAINER_NAME}- --format={{.Names}}"
+    if ! $all_containers_cmd | read -r; then
         echo "未找到任何 Nexus 节点容器。"
     else
-        local running_containers; running_containers=$(docker ps --filter "name=${BASE_CONTAINER_NAME}-" --filter "status=running" --format "{{.Names}}")
-        local stats_output="";
-        if [ -n "$running_containers" ]; then
-            stats_output=$(docker stats --no-stream $running_containers --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}")
-        fi
-        for name in $all_containers; do
+        # 步骤3：【关键修复】使用标准的 'while read' 循环来逐行处理容器列表，确保稳定性
+        $all_containers_cmd | while IFS= read -r name; do
+            # 忽略可能的空行
+            [ -z "$name" ] && continue
+            
             local node_id; node_id=$(echo "$name" | sed "s/${BASE_CONTAINER_NAME}-//")
             local stats_line; stats_line=$(echo "$stats_output" | grep -w "$name")
+
             if [ -n "$stats_line" ]; then
-                local cpu_perc mem_usage; cpu_perc=$(echo "$stats_line" | awk '{print $2}'); mem_usage=$(echo "$stats_line" | awk -F '\t' '{print $3}');
+                # 如果在 stats 输出中找到，说明容器正在运行
+                local cpu_perc mem_usage;
+                cpu_perc=$(echo "$stats_line" | awk '{print $2}')
+                mem_usage=$(echo "$stats_line" | awk -F '\t' '{print $3}')
                 printf "%-30s %-12s %-15s %-20s\n" "$node_id ($name)" "Running" "$cpu_perc" "$mem_usage"
             else
+                # 否则，容器已停止，单独获取其状态
                 local status; status=$(docker ps -a --filter "name=$name" --format "{{.Status}}")
                 printf "%-30s %-12s %-15s %-20s\n" "$node_id ($name)" "$status" "N/A" "N/A"
             fi
@@ -210,10 +166,19 @@ function uninstall_all_nodes_and_image() { echo "!!! 警告：此操作将永久
 
 # --- 主菜单循环 ---
 function main_menu() {
+    # 检查用户权限
+    if [ "$(id -u)" -ne 0 ]; then
+       echo "错误：此脚本需要 root 权限运行。" >&2
+       echo "请尝试使用 'sudo bash a.sh' 或切换到 root 用户。" >&2
+       exit 1
+    fi
+    # 检查 Docker
+    check_docker
+
     while true; do
         clear
         echo "脚本由哈哈哈哈编写，推特 @ferdie_jhovie，免费开源，请勿相信收费"
-        echo "================ Nexus 多节点管理 (ARM64 Docker版) v3.3.1 DEBUG =============="
+        echo "================ Nexus 多节点管理 (ARM64 Docker版) v3.4 ==============="
         echo "1. 安装/启动单个节点"
         echo "2. 批量安装/启动多个节点"
         echo "3. 查看指定节点日志"
@@ -238,12 +203,4 @@ function main_menu() {
 }
 
 # --- 脚本执行入口 ---
-# 检查用户权限，脚本中的很多命令需要 root 权限
-if [ "$(id -u)" -ne 0 ]; then
-   echo "错误：此脚本需要 root 权限运行。" >&2
-   echo "请尝试使用 'sudo bash a.sh' 或切换到 root 用户。" >&2
-   exit 1
-fi
-
-check_docker
 main_menu
