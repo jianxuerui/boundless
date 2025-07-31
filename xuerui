@@ -2,7 +2,10 @@
 set -e
 
 # ==============================================================================
-# Nexus 多节点管理脚本 (ARM64专用Docker版) - 终极防错·绝对完整版 v3.7
+# Nexus 多节点管理脚本 (ARM64专用Docker版) - 终极防错·绝对完整版 v3.8
+#
+# 【V3.8 更新】:
+#   - 更新 nexus-cli 二进制文件版本至 v0.10.2。
 #
 # 【V3.7 更新】:
 #   - 【最终修复】针对 "unexpected end of file" 的顽固问题，已完全移除所有
@@ -35,7 +38,7 @@ build_image() {
       'FROM --platform=$TARGETPLATFORM ubuntu:24.04' \
       'ENV DEBIAN_FRONTEND=noninteractive' \
       'RUN apt-get update && apt-get install -y curl screen bash && rm -rf /var/lib/apt/lists/*' \
-      'RUN curl -L -o /usr/local/bin/nexus-network https://github.com/nexus-xyz/nexus-cli/releases/download/v0.10.1/nexus-network-linux-arm64 && chmod +x /usr/local/bin/nexus-network' \
+      'RUN curl -L -o /usr/local/bin/nexus-network https://github.com/nexus-xyz/nexus-cli/releases/download/v0.10.2/nexus-network-linux-arm64 && chmod +x /usr/local/bin/nexus-network' \
       'COPY entrypoint.sh /entrypoint.sh' \
       'RUN chmod +x /entrypoint.sh' \
       'ENTRYPOINT ["/entrypoint.sh"]' > Dockerfile
@@ -53,9 +56,11 @@ build_image() {
       'if ! screen -list | grep -q "nexus"; then cat /root/nexus.log; exit 1; fi' \
       'tail -f /root/nexus.log' > entrypoint.sh
 
+    echo "正在构建节点镜像，此过程只需一次，请稍候..."
     docker buildx build --builder "$BUILDER_NAME" --platform linux/arm64 -t "$IMAGE_NAME" . --load >/dev/null
     cd - >/dev/null
     rm -rf "$WORKDIR"
+    echo "镜像构建完成。"
 }
 
 run_container() { local node_id="$1"; if [ -z "$node_id" ]; then echo "错误: 无 Node ID"; return 1; fi; local container_name="${BASE_CONTAINER_NAME}-${node_id}"; docker rm -f "$container_name" >/dev/null 2>&1; mkdir -p "$LOG_DIR"; local log_file="${LOG_DIR}/nexus-${node_id}.log"; touch "$log_file" && chmod 644 "$log_file"; docker run -d --name "$container_name" -v "$log_file:/root/nexus.log" -e NODE_ID="$node_id" --restart unless-stopped "$IMAGE_NAME"; echo "节点 $node_id 已启动。日志: $log_file"; }
@@ -77,7 +82,7 @@ main_menu() {
     while true; do
         clear
         echo "脚本由哈哈哈哈编写，推特 @ferdie_jhovie，免费开源，请勿相信收费"
-        echo "================ Nexus 管理 (ARM64 Docker版) v3.7 ==================="
+        echo "================ Nexus 管理 (ARM64 Docker版) v3.8 ==================="
         echo "1. 安装/启动单个节点        5. 批量卸载所有节点"
         echo "2. 批量安装/启动多个节点    6. 完全卸载 (删除所有节点和镜像)"
         echo "3. 查看指定节点日志         7. 退出脚本"
