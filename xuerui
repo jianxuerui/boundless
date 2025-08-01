@@ -2,10 +2,15 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 (ARM64 Docker) - 魔改·终极版 v4.0
+# Nexus 多节点管理脚本 (ARM64 Docker) - 魔改·终极版 v4.1
 #
 # 原作者: 哈哈哈哈 (推特 @ferdie_jhovie)
 # 魔改者: AI & 社区智慧
+#
+# 【V4.1 更新】:
+#   - 【关键修复】修复了 'unexpected EOF while looking for matching `''`' 错误。
+#   - 【代码优化】重构了所有 `read -rp` 提示符的实现方式，移除了复杂的函数嵌套，
+#     直接在字符串中使用颜色变量，彻底杜绝了由此引发的引号匹配问题。
 #
 # 【V4.0 更新】:
 #   - 【功能重构】: 菜单重新划分为 "节点管理", "批量操作", "系统维护", 结构更清晰。
@@ -13,11 +18,10 @@ set -e
 #   - 【交互升级】: 引入彩色日志输出，状态列表根据运行状态显示不同颜色，信息更直观。
 #   - 【核心增强】: 增加强大的更新机制，可一键更新 nexus-cli 版本并滚动升级所有正在运行的节点。
 #   - 【配置优化】: 所有核心配置项移至脚本顶部，修改 nexus-cli 版本等操作只需改动一个变量。
-#   - 【代码健壮】: 优化函数设计，增加 trap 自动清理机制，提升脚本稳定性。
 # ================================================================================================
 
 # --- 配置项 (可在此处自定义) ---
-SCRIPT_VERSION="v4.0 魔改版"
+SCRIPT_VERSION="v4.1 终极修复版"
 NEXUS_CLI_VERSION="v0.10.2"
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:latest-arm64"
@@ -38,7 +42,13 @@ print_success() { print_color "$1" "$COLOR_GREEN"; }
 print_error() { print_color "$1" "$COLOR_RED"; }
 print_warning() { print_color "$1" "$COLOR_YELLOW"; }
 print_info() { print_color "$1" "$COLOR_CYAN"; }
-confirm_action() { read -rp "$(print_warning "$1 (y/N): ") " confirm; [[ "$confirm" =~ ^[yY]([eE][sS])?$ ]]; }
+
+# 【关键修复】重写 confirm_action 以避免复杂的提示符构建
+confirm_action() {
+    local prompt_message="$1"
+    read -rp "${COLOR_YELLOW}${prompt_message} (y/N): ${COLOR_RESET}" confirm
+    [[ "$confirm" =~ ^[yY]([eE][sS])?$ ]]
+}
 trap 'rm -rf "$TMP_WORKDIR"' EXIT HUP INT QUIT TERM
 TMP_WORKDIR=""
 
@@ -80,7 +90,6 @@ setup_buildx() {
     else
         docker buildx create --name $BUILDER_NAME --driver docker-container --use >/dev/null
     fi
-    # 确保 binfmt 模拟器已安装
     if ! docker run --rm --privileged tonistiigi/binfmt | grep -q "setting up"; then
        docker run --rm --privileged tonistiigi/binfmt --install all >/dev/null
     fi
@@ -100,7 +109,6 @@ build_image() {
     local cli_url="https://github.com/nexus-xyz/nexus-cli/releases/download/${NEXUS_CLI_VERSION}/nexus-network-linux-arm64"
     
     print_info "正在生成 Dockerfile 及 entrypoint 脚本..."
-    # 使用 printf 安全地创建 Dockerfile
     printf '%s\n' \
       'ARG TARGETPLATFORM=linux/arm64' \
       'FROM --platform=$TARGETPLATFORM ubuntu:24.04' \
@@ -111,7 +119,6 @@ build_image() {
       'RUN chmod +x /entrypoint.sh' \
       'ENTRYPOINT ["/entrypoint.sh"]' > Dockerfile
 
-    # 使用 printf 安全地创建 entrypoint.sh
     printf '%s\n' \
       '#!/bin/bash' \
       'set -e' \
@@ -123,7 +130,7 @@ build_image() {
       'screen -dmS nexus bash -c "nexus-network start --node-id $NODE_ID | tee /root/nexus.log"' \
       'sleep 3' \
       'if ! screen -list | grep -q "nexus"; then' \
-      '  echo "!! 启动失败，请检查日志 !! "' >&2; cat /root/nexus.log; exit 1;' \
+      '  echo "!! 启动失败，请检查日志 !! " >&2; cat /root/nexus.log; exit 1;' \
       'fi' \
       'echo "节点启动成功，正在持续输出日志..."' \
       'tail -f /root/nexus.log' > entrypoint.sh
@@ -151,7 +158,6 @@ run_container() {
         --restart unless-stopped \
         "$IMAGE_NAME" >/dev/null
     
-    # 简短的延时后检查容器状态
     sleep 2
     if ! docker ps --filter "name=${container_name}" --filter "status=running" | grep -q ${container_name}; then
         print_error "节点 ${node_id} 启动失败！请使用日志功能检查原因。"
@@ -161,7 +167,6 @@ run_container() {
     fi
 }
 
-# --- 新增的节点管理函数 ---
 stop_node() {
     local node_id="$1"
     local container_name="${BASE_CONTAINER_NAME}-${node_id}"
@@ -197,7 +202,6 @@ restart_node() {
         print_error "未找到节点 $node_id。"
     fi
 }
-
 
 uninstall_node() {
     local node_id="$1"
@@ -272,8 +276,9 @@ list_nodes() {
 select_node_action() {
     local action_callback="$1"
     local prompt_message="$2"
-    local all_nodes
-    all_nodes=($(get_all_node_ids))
+    local all_nodes=()
+    while IFS= read -r line; do all_nodes+=("$line"); done < <(get_all_node_ids)
+
     if [ ${#all_nodes[@]} -eq 0 ]; then
         print_warning "当前无任何节点可操作。"
         read -n 1 -s -r -p "按任意键返回..."
@@ -292,6 +297,7 @@ select_node_action() {
     read -rp "请输入选项 (0-${#all_nodes[@]}): " choice
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 0 ] || [ "$choice" -gt ${#all_nodes[@]} ]; then
         print_error "无效输入。"
+        sleep 1
         return
     fi
     [ "$choice" -eq 0 ] && return
@@ -304,7 +310,8 @@ select_node_action() {
 select_multiple_nodes_action() {
     local action_callback="$1"
     local prompt_message="$2"
-    local all_nodes=($(get_all_node_ids))
+    local all_nodes=()
+    while IFS= read -r line; do all_nodes+=("$line"); done < <(get_all_node_ids)
     if [ ${#all_nodes[@]} -eq 0 ]; then
         print_warning "当前无任何节点可操作。"
         read -n 1 -s -r -p "按任意键返回..."
@@ -335,6 +342,7 @@ select_multiple_nodes_action() {
 
     if [ ${#selected_nodes[@]} -eq 0 ]; then
         print_warning "未选择任何有效节点。"
+        sleep 1
         return
     fi
     
@@ -400,9 +408,10 @@ menu_update() {
         
         case $choice in
             1) 
-               print_warning "将强制重新构建 '$IMAGE_NAME' 镜像。"
-               if confirm_action "确认吗?"; then
+               if confirm_action "将强制重新构建 '$IMAGE_NAME' 镜像。确认吗?"; then
                    build_image "--force"
+               else
+                   print_info "操作已取消。"
                fi
                read -n 1 -s -r -p "按任意键返回..."
                ;;
@@ -426,6 +435,8 @@ menu_update() {
                        done
                        print_success "所有正在运行的节点已更新完毕。"
                    fi
+               else
+                   print_info "操作已取消。"
                fi
                read -n 1 -s -r -p "按任意键返回..."
                ;;
@@ -446,7 +457,11 @@ menu_update() {
                                print_success "日志目录已删除。"
                            fi
                         fi
+                   else
+                       print_info "操作已取消。"
                    fi
+               else
+                   print_info "操作已取消。"
                fi
                read -n 1 -s -r -p "按任意键返回..."
                ;;
@@ -481,9 +496,10 @@ main_menu() {
 
         print_info "\n--- 系统维护 ---"
         echo " 11. 系统更新与维护"
-        echo " 0. 退出脚本"
+        echo "  0. 退出脚本"
         
-        read -rp "$(print_color '请输入选项: ' $COLOR_YELLOW)" choice
+        # 【关键修复】使用更简单、更健壮的方式来显示带颜色的提示符
+        read -rp "${COLOR_YELLOW}请输入选项: ${COLOR_RESET}" choice
         
         case $choice in
             1) menu_install_single ;;
