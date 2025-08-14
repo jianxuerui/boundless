@@ -2,22 +2,22 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 (ARM64 Docker) - v4.1.9 Buildx 强制清理版
+# Nexus 多节点管理脚本 (ARM64 Docker) - v4.1.10 兼容性增强版
 #
 # 原作者: 哈哈哈哈 (推特 @ferdie_jhovie)
-# -- 
 # 改版者: AI & 社区智慧
 #
-# 【V4.1.9 更新】:
-#   - 【终极 Buildx 修复】: 极大地强化了 setup_buildx 函数，以应对 Docker Buildx 
-#     Builder 状态不一致导致反复出现 "existing instance" 错误的问题。
-#     增加了直接强制移除 Builder 的命令，并妥善处理其潜在的错误。
+# 【V4.1.10 更新】:
+#   - 【兼容性增强】: 提升了脚本启动的健壮性，增加了 Docker 和 Buildx 相关的更详细错误检查和提示，
+#     期望解决“脚本打不开”的根本原因。
+#   - 【Docker 安装鲁棒性】: 确保 Docker 安装过程中的关键依赖（如 GPG Key）如果失败，会给出更明确的错误。
+#   - 【Builder 移除增强】: setup_buildx 中增加了 Builder 移除的确认性和更友好的失败报告。
 #
-# ... (保留之前的 V4.1.8, V4.1.7, V4.1.6, V4.1.5, V4.1.4, V4.1.3, V4.1.2, V4.1.1, V4.0 更新说明) ...
+# ... (保留之前的 V4.1.9, V4.1.8, V4.1.7, V4.1.6, V4.1.5, V4.1.4, V4.1.3, V4.1.2, V4.1.1, V4.0 更新说明) ...
 # ================================================================================================
 
 # --- 配置项 (可在此处自定义) ---
-SCRIPT_VERSION="v4.1.9 Buildx 强制清理版"
+SCRIPT_VERSION="v4.1.10 兼容性增强版"
 # --- 此处已更新 nexus-cli 版本 ---
 NEXUS_CLI_VERSION="v0.10.7"
 BASE_CONTAINER_NAME="nexus-node"
@@ -53,59 +53,118 @@ trap 'EXITCODE=$?; echo ""; print_info "执行清理操作..."; rm -rf "$TMP_WOR
 
 # --- Core Functions ---
 check_docker_daemon() {
+    # Extended check: If docker info fails, print more specific troubleshooting hints.
     if ! docker info >/dev/null 2>&1; then
         print_error "!! 致命错误: Docker 服务未运行或当前用户无权访问 !!"
-        print_error "请确保 Docker 已启动 (systemctl start docker) 并以 root 用户运行脚本 (sudo su)。"
+        # Check Docker status more explicitly
+        if ! systemctl is-active docker >/dev/null 2>&1; then
+            print_error "    Docker 服务 (${COLOR_YELLOW}docker${COLOR_RESET}) 状态: ${COLOR_RED} inactive/dead${COLOR_RESET}."
+            print_error "    请尝试启动 Docker: ${COLOR_CYAN}sudo systemctl start docker${COLOR_RESET}"
+            print_error "    并设为开机自启: ${COLOR_CYAN}sudo systemctl enable docker${COLOR_RESET}"
+        else
+            print_error "    Docker 服务 (${COLOR_YELLOW}docker${COLOR_RESET}) 正在运行，但当前用户可能没有权限访问。"
+            print_error "    请确保脚本以 root 用户运行 (${COLOR_CYAN}sudo su${COLOR_RESET} 或 ${COLOR_CYAN}sudo ./your_script.sh${COLOR_RESET})。"
+        fi
         exit 1
     fi
 }
 
 check_docker() {
+    # Ensure docker command exists
     if ! command -v docker >/dev/null 2>&1; then
-        print_warning "未检测到 Docker, 正在尝试自动安装..."
+        print_warning "未检测到 Docker 命令, 正在尝试自动安装..."
+        # Architecture check remains relevant for ARM64
         if ! dpkg --print-architecture | grep -q "arm64"; then
             print_error "!! 警告: 当前系统不是 ARM64 架构, 脚本主要为 ARM64 设计。安装可能失败或运行不兼容。!!"
         fi
 
-        apt-get update -qq || print_warning "apt update 失败, 尝试继续。"
-        apt-get install -y --no-install-recommends apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release >/dev/null || print_warning "部分依赖安装失败, 尝试继续。"
-
-        mkdir -p /etc/apt/keyrings
-        curl -fsSL --fail https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-
-        if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
-             print_error "!! Docker GPG key 下载或处理失败 !! 请手动检查。"
-             exit 1
+        # Update apt cache, handling potential failures gracefully
+        if ! apt-get update -qq; then
+            print_warning "apt update 失败，尝试继续安装。网络问题或软件源配置可能导致此错误。"
+        fi
+        
+        # Install essential packages for Docker, suppress most output
+        print_info "正在安装 Docker 所需的依赖包..."
+        if ! apt-get install -y --no-install-recommends apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release >/dev/null 2>&1; then
+            print_warning "部分依赖安装失败，尝试继续。Docker 可能无法正常安装。"
+        else
+            print_success "Docker 依赖包安装成功。"
         fi
 
+        # Add Docker's official GPG key. Critically check its existence after download/processing.
+        print_info "正在添加 Docker 的 GPG 签名密钥..."
+        mkdir -p /etc/apt/keyrings
+        if ! curl -fsSL --fail https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg; then
+             print_error "!! 致命错误: Docker GPG key 下载或处理失败 !! 这是安装 Docker 的关键步骤，无法继续。"
+             print_error "   请检查网络连接、curl 是否安装，以及 '/etc/apt/keyrings' 目录是否可写。"
+             exit 1
+        fi
+        # Explicitly check if the key file was created.
+        if [ ! -s /etc/apt/keyrings/docker.gpg ]; then # -s checks if file exists AND has size greater than zero
+             print_error "!! 致命错误: Docker GPG key 文件 '/etc/apt/keyrings/docker.gpg' 未成功创建或为空 !! 无法继续。"
+             exit 1
+        fi
+        print_success "Docker GPG 密钥已成功添加到 /etc/apt/keyrings/。"
+
+        # Add Docker repository to sources.list.d
+        print_info "正在配置 Docker 的 APT 软件源..."
         echo \
           "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
           $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+        print_success "Docker APT 源配置完成。"
 
-        apt-get update -qq || print_warning "apt update 失败, 尝试继续。"
-        apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin >/dev/null || print_warning "Docker CE 安装失败, 尝试继续。"
+        # Update apt cache again after adding new source.
+        print_info "正在更新 APT 软件包列表..."
+        if ! apt-get update -qq; then
+            print_warning "apt update 失败，可能影响 Docker CE 的安装。"
+        fi
+        
+        # Install Docker CE packages.
+        print_info "正在安装 Docker CE (Community Edition)..."
+        if ! apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin >/dev/null 2>&1; then
+            print_error "!! Docker CE 安装失败 !! 脚本将尝试继续，但 Docker 功能将不可用。"
+            # Optionally, check the exit status of apt-get more explicitly if this fails often.
+            # We don't exit here to allow for a partially working setup, but a clear warning is needed.
+        else
+            print_success "Docker CE 及相关插件安装完成。"
+        fi
 
+        # Ensure Docker service is running and enabled.
+        print_info "正在启动并启用 Docker 服务..."
         if ! systemctl is-active docker >/dev/null 2>&1; then
-            print_info "尝试启动 Docker 服务..."
-            systemctl enable --now docker
-            sleep 2 
-            if ! systemctl is-active docker >/dev/null 2>&1; then
-                print_error "!! Docker 服务启动失败 !! 请手动检查 'systemctl status docker'。"
-                exit 1
+            if ! systemctl start docker; then
+                print_error "Docker 服务启动失败！"
+                print_error "请尝试手动执行: ${COLOR_CYAN}sudo systemctl start docker${COLOR_RESET}"
+                exit 1 # If start fails, Docker is essential, so we must exit.
             fi
         fi
-        print_success "Docker 安装完成。"
+        if ! systemctl is-enabled docker >/dev/null 2>&1; then
+             if ! systemctl enable docker; then
+                print_warning "Docker 服务开机自启设置失败，下次重启可能需要手动启动。"
+             fi
+        fi
+        print_success "Docker 服务已成功启动并启用。"
     fi
+
+    # Verify docker buildx plugin existence.
     if ! docker buildx version >/dev/null 2>&1; then
-        print_error "错误：未找到 Docker buildx 插件。请检查 Docker 安装是否完整。"
+        print_error "错误：未找到 Docker buildx 插件。请检查 Docker 安装是否完整，或手动安装 'docker-buildx-plugin'。"
+        # Attempting to install it if missing.
         print_warning "尝试安装 'docker-buildx-plugin'..."
-        apt-get update -qq >/dev/null || print_warning "apt update 失败, 尝试继续。"
-        apt-get install -y --no-install-recommends docker-buildx-plugin >/dev/null || print_error "!! 插件安装失败 !! 请手动安装。"
-        if ! docker buildx version >/dev/null 2>&1; then
-             print_error "Docker buildx 插件安装后仍未找到。请手动安装。"
-             exit 1
+        if ! apt-get update -qq >/dev/null; then
+            print_warning "apt update 失败，可能影响 buildx 插件安装。"
+        fi
+        if ! apt-get install -y --no-install-recommends docker-buildx-plugin >/dev/null 2>&1; then
+             print_error "!! Docker buildx 插件安装失败 !! "
+             print_error "   请尝试手动安装: ${COLOR_CYAN}sudo apt-get install docker-buildx-plugin${COLOR_RESET}"
+             exit 1 # Buildx is critical for multi-arch, so exit if install fails.
         fi
         print_success "Docker buildx 插件已安装。"
+        # Re-check version after installation
+        if ! docker buildx version >/dev/null 2>&1; then
+            print_error "!! Docker buildx 插件安装后仍未找到。!! "
+            exit 1
+        fi
     fi
 }
 
@@ -113,37 +172,58 @@ check_docker() {
 setup_buildx() {
     print_info "正在检查和配置 Buildx builder '$BUILDER_NAME'..."
 
-    # Attempt to remove the builder FIRST, regardless of its existence or state.
-    # This is to ensure a clean slate before attempting creation.
-    # Suppress all output and use '|| true' to prevent script termination if builder doesn't exist or rm fails for other reasons.
-    print_info "尝试移除现有的 Buildx builder '$BUILDER_NAME'（如果存在）..."
-    docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
-
-    # Add a small delay to ensure Docker Daemon processes the removal.
-    sleep 1
-
-    # We still need to check if the builder ISN'T gone after rm, indicating a persistent issue.
+    local builder_exists=0
     if docker buildx ls | grep -q "^${BUILDER_NAME}\s"; then
-        print_error "!! 致命错误: 尝试移除 Buildx builder '$BUILDER_NAME' 后，它仍然存在。!!\n"
-        print_error "    这可能表示 Docker Buildx 存在严重配置问题或 Docker Daemon 状态异常。"
-        print_error "    请尝试手动执行: \n      sudo docker buildx rm ${BUILDER_NAME}\n      sudo systemctl restart docker\n    然后重新运行此脚本。"
-        exit 1 # Critical failure, cannot proceed with builder creation.
-    else
-        print_success "Buildx builder '$BUILDER_NAME' 已清理（或之前不存在）。"
+        builder_exists=1
+        print_warning "检测到 Buildx builder '$BUILDER_NAME' 已存在。"
+        
+        print_info "强制移除现有的 Buildx builder '$BUILDER_NAME'..."
+        # Attempt to remove. Use || true so that the script doesn't exit if rm fails (e.g. builder truly gone)
+        # The subsequent check will reveal if the removal was truly effective.
+        if ! docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1; then
+            print_warning "Buildx builder '$BUILDER_NAME' 移除命令执行（或可能因不存在而略过），但未返回成功代码。将继续检查后续状态。"
+        else
+            print_success "Buildx builder '$BUILDER_NAME' 移除命令已执行。"
+        fi
+        
+        # Sleep to ensure Docker Daemon processing.
+        sleep 1
+
+        # Re-check if the builder STILL exists. If so, it's a persistent problem.
+        if docker buildx ls | grep -q "^${BUILDER_NAME}\s"; then
+            print_error "!! 致命错误: 强制移除 Buildx builder '$BUILDER_NAME' 后，它仍然存在！!!"
+            print_error "    这强烈指示 Docker Buildx 存在配置问题，或 Docker Daemon 状态异常。"
+            print_error "    请尝试以下手动修复步骤："
+            print_error "      1. 停止 Docker: ${COLOR_CYAN}sudo systemctl stop docker${COLOR_RESET}"
+            print_error "      2. (可选，请备份重要数据) 清理 Docker buildx 状态缓存（如果知道位置）"
+            print_error "      3. 启动 Docker: ${COLOR_CYAN}sudo systemctl start docker${COLOR_RESET}"
+            print_error "      4. 再次尝试运行脚本。"
+            exit 1
+        else
+            print_success "Buildx builder '$BUILDER_NAME' 已被成功清理（或之前就不存在）。"
+        fi
     fi
     
-    # Now, proceed with creating a fresh builder.
+    # Proceed with creating a fresh builder.
     print_info "正在创建新的 Buildx builder '$BUILDER_NAME'..."
-    # --bootstrap ensures the builder is ready immediately. --use sets it as the default.
-    docker buildx create --name "$BUILDER_NAME" --driver docker-container --bootstrap --use >/dev/null
+    # --bootstrap and --use are crucial for immediate usability and default setting.
+    if ! docker buildx create --name "$BUILDER_NAME" --driver docker-container --bootstrap --use >/dev/null 2>&1; then
+        print_error "!! Buildx builder '$BUILDER_NAME' 创建失败！!!"
+        print_error "    请检查 Docker Daemon 日志 (${COLOR_CYAN}sudo journalctl -u docker.service${COLOR_RESET}) 以获取详细错误。"
+        exit 1 # Cannot proceed without a working builder.
+    fi
     
-    # Ensure binfmt support is available, as it's critical for multi-arch builds.
+    # Ensure binfmt support. This is a common dependency for multi-arch builds.
     if ! docker run --rm --privileged tonistiigi/binfmt:latest --install all >/dev/null 2>&1; then
        print_info "正在为多架构构建设置 binfmt 支持..."
-       docker run --rm --privileged tonistiigi/binfmt:latest --install all >/dev/null
-       sleep 2 # Allow some time for binfmt registration.
-       if ! docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null | grep -q "supported"; then
-           print_warning "Binfmt support might not be fully installed or active."
+       if ! docker run --rm --privileged tonistiigi/binfmt:latest --install all >/dev/null 2>&1; then
+           print_warning "Binfmt support installation might have encountered issues. Multi-arch builds might fail."
+       else
+           print_success "Binfmt support installation command executed. Wait for setup."
+           sleep 2 # Give it time to register.
+           if ! docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null | grep -q "supported"; then
+               print_warning "Binfmt support still not detected as active."
+           fi
        fi
     fi
     
@@ -157,9 +237,13 @@ build_image() {
         return
     fi
     
+    # Ensure buildx setup before proceeding
     setup_buildx
     
+    # Create a temporary directory for Dockerfile and entrypoint.
     TMP_WORKDIR=$(mktemp -d -t nexus_docker_build_XXXXXX)
+    # Make sure cleanup happens.
+    trap 'EXITCODE=$?; echo ""; print_info "Executing cleanup..."; rm -rf "$TMP_WORKDIR"; exit $EXITCODE' EXIT HUP INT QUIT TERM
     cd "$TMP_WORKDIR"
     
     local cli_url="https://github.com/nexus-xyz/nexus-cli/releases/download/${NEXUS_CLI_VERSION}/nexus-network-linux-arm64"
@@ -206,7 +290,12 @@ build_image() {
       'tail -f /dev/null' > entrypoint.sh
 
     print_info "正在构建节点镜像 '$IMAGE_NAME' (Nexus CLI: ${NEXUS_CLI_VERSION})，此过程可能需要几分钟..."
-    docker buildx build --builder "$BUILDER_NAME" --platform linux/arm64 -t "$IMAGE_NAME" . --load >/dev/null
+    # Use the correctly configured builder
+    if ! docker buildx build --builder "$BUILDER_NAME" --platform linux/arm64 -t "$IMAGE_NAME" . --load >/dev/null 2>&1; then
+        print_error "!! Docker buildx build 过程中出错 !! "
+        print_error "   请检查上面的 Docker Buildx/Daemon 日志。"
+        exit 1 # Build failure is critical.
+    fi
     
     print_success "镜像 '$IMAGE_NAME' 构建完成。"
 }
@@ -227,16 +316,21 @@ run_container() {
     touch "$log_file" && chmod 644 "$log_file"
     
     print_info "正在启动节点 ${node_id} (容器名: ${container_name})..."
-    docker run -d --name "$container_name" \
+    if ! docker run -d --name "$container_name" \
         -v "${log_file}:/root/nexus.log:rw" \
         -e NODE_ID="$node_id" \
         --restart unless-stopped \
-        "$IMAGE_NAME" >/dev/null
+        "$IMAGE_NAME" >/dev/null 2>&1; then
+        
+        print_error "!! Docker run 命令执行失败 !! 容器 '${container_name}' 未能启动。"
+        print_error "    请检查 Docker Daemon 日志 (${COLOR_CYAN}sudo journalctl -u docker.service${COLOR_RESET}) 和镜像 '$IMAGE_NAME' 是否有效。"
+        exit 1 # Critical failure for container start.
+    fi
     
     sleep 3 
     
     if ! docker ps -q -f name="${container_name}" | grep -q .; then
-        print_error "节点 ${node_id} (${container_name}) 启动失败！请使用日志功能检查原因。"
+        print_error "节点 ${node_id} (${container_name}) 启动后未在运行！请使用日志功能检查原因。"
         print_error "尝试查看容器内的日志文件: ${log_file}"
         if [ -f "$log_file" ]; then
             print_error "--- ${log_file} ---"
@@ -245,6 +339,7 @@ run_container() {
         else
             print_error "日志文件 '${log_file}' 不存在。"
         fi
+        # Don't exit, allow script to continue showing menu, but error is noted.
     else
         print_success "节点 $node_id ($container_name) 已成功启动。日志路径: $log_file"
     fi
@@ -271,7 +366,11 @@ start_node() {
     local container_name="${BASE_CONTAINER_NAME}-${node_id}"
     if docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
         print_info "正在启动节点 $node_id ($container_name)..."
-        docker start "$container_name" > /dev/null
+        if ! docker start "$container_name" > /dev/null 2>&1; then
+            print_error "!! Docker start 命令执行失败 !! 容器 '${container_name}' 未能启动。"
+            print_error "   请检查容器状态或 Docker Daemon 日志。"
+            return 1 # Indicate failure
+        fi
         sleep 3
         if docker ps -q -f name="${container_name}" | grep -q .; then
             print_success "节点 $node_id ($container_name) 已启动。"
@@ -288,7 +387,11 @@ restart_node() {
     local container_name="${BASE_CONTAINER_NAME}-${node_id}"
     if docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
         print_info "正在重启节点 $node_id ($container_name)..."
-        docker restart "$container_name" > /dev/null
+        if ! docker restart "$container_name" > /dev/null 2>&1; then
+            print_error "!! Docker restart 命令执行失败 !! 容器 '${container_name}' 未能重启。"
+            print_error "   请检查容器状态或 Docker Daemon 日志。"
+            return 1
+        fi
         sleep 3
         if docker ps -q -f name="${container_name}" | grep -q .; then
             print_success "节点 $node_id ($container_name) 已重启。"
@@ -357,7 +460,7 @@ list_nodes() {
         "$(print_bold "镜像")"
     print_color "--------------------------------------------------------------------------------------" "$COLOR_BLUE"
     
-    local all_node_info=() # Stores node_id:container_name pairs
+    local all_node_info=() 
     
     while IFS= read -r container_name; do
         local node_id
@@ -371,7 +474,7 @@ list_nodes() {
         local running_container_ids
         running_container_ids=$(docker ps -q -f name="${BASE_CONTAINER_NAME}-") 
 
-        declare -A stats_map # Map: container_name -> "CPUPerc\tMemUsage"
+        declare -A stats_map 
         local stats_output=""
 
         if [ -n "$running_container_ids" ]; then
@@ -769,4 +872,144 @@ menu_update() {
                ;;
             3)
                print_error "${COLOR_RED}警告！此操作将移除所有 Nexus 节点容器、相关的日志文件。"
-               print_error "${COLOR_YELLOW}您还可以选择移除 Nexus
+               print_error "${COLOR_YELLOW}您还可以选择移除 Nexus Docker 镜像和 Buildx builder。"
+               
+               if confirm_action "确定要继续清理吗?"; then
+                   print_info "正在卸载所有 Nexus 节点..."
+                   local all_node_ids_to_remove=()
+                   while IFS= read -r node_id; do
+                       if docker ps -a --filter "name=${BASE_CONTAINER_NAME}-${node_id}" --format '{{.Names}}' | grep -q .; then
+                           all_node_ids_to_remove+=("$node_id")
+                       fi
+                   done < <(get_all_node_ids)
+                   
+                   if [ ${#all_node_ids_to_remove[@]} -eq 0 ]; then
+                       print_info "未找到需要卸载的节点。"
+                   else
+                       for node_id in "${all_node_ids_to_remove[@]}"; do
+                           uninstall_node "$node_id"
+                           echo
+                       done
+                       print_success "所有节点已卸载。"
+                   fi
+
+                   if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+                       if confirm_action "是否移除 Docker 镜像 '$IMAGE_NAME'?"; then
+                           docker rmi -f "$IMAGE_NAME" >/dev/null 2>&1 || print_warning "删除镜像 '$IMAGE_NAME' 失败。"
+                           print_success "镜像 '$IMAGE_NAME' 已移除。"
+                       else
+                           print_info "已保留 Docker 镜像 '$IMAGE_NAME'。"
+                       fi
+                   else
+                       print_info "Docker 镜像 '$IMAGE_NAME' 已不存在。"
+                   fi
+
+                   if docker buildx ls | grep -q "^${BUILDER_NAME}\s"; then
+                       if confirm_action "是否移除 Buildx builder '$BUILDER_NAME'?"; then
+                           docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || print_warning "移除 Buildx builder '$BUILDER_NAME' 失败。"
+                           print_success "Buildx builder '$BUILDER_NAME' 已移除。"
+                       else
+                           print_info "已保留 Buildx builder '$BUILDER_NAME'。"
+                       fi
+                   else
+                       print_info "Buildx builder '$BUILDER_NAME' 已不存在。"
+                   fi
+
+                   if [ -d "$LOG_DIR" ]; then
+                       if [ -n "$(ls -A "$LOG_DIR")" ]; then
+                            if confirm_action "是否移除 Nexus 日志目录 '$LOG_DIR'?"; then
+                                rm -rf "$LOG_DIR"
+                                print_success "日志目录 '$LOG_DIR' 已移除。"
+                            else
+                                print_info "已保留 Nexus 日志目录 '$LOG_DIR'。"
+                            fi
+                       else
+                           print_info "日志目录 '$LOG_DIR' 为空，无需移除。"
+                       fi
+                   else
+                       print_info "Nexus 日志目录 '$LOG_DIR' 已不存在。"
+                   fi
+                   
+               else
+                   print_info "操作已取消。"
+               fi
+               read -n 1 -s -r -p "按任意键返回..."
+               ;;
+            0) break ;;
+            *) print_error "无效选项。" && sleep 1;;
+        esac
+    done
+}
+
+
+# --- Main Menu Loop ---
+main_menu() {
+    if [ "$(id -u)" -ne 0 ]; then 
+        print_error "错误: 此脚本需要 root 权限运行。"
+        print_error "请尝试: sudo ./$(basename "$0")"
+        exit 1 
+    fi
+    
+    # --- Initial Environment Checks ---
+    # This ensures core dependencies like Docker are checked early.
+    if ! check_docker_daemon; then # check_docker_daemon now exits if failure
+        : # Already handled exit in check_docker_daemon
+    fi
+    if ! check_docker; then # check_docker now exits on critical failure
+        : # Already handled exit in check_docker
+    fi
+
+    # Inform about the image if it's not built.
+    if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+        print_warning "Nexus 镜像 '$IMAGE_NAME' 未构建。请在菜单中选择更新/维护选项 (11) 进行构建。"
+    fi
+
+    while true; do
+        clear
+        print_color "================================================================================" "$COLOR_BLUE"
+        print_color "           Nexus 管理脚本 (ARM64 Docker) - ${SCRIPT_VERSION}" "$COLOR_CYAN"
+        print_color "================================================================================" "$COLOR_BLUE"
+        
+        list_nodes # Display the list of nodes with their statuses
+
+        echo
+        print_info "\n--- 节点管理 ---"
+        echo "  ${COLOR_CYAN}1${COLOR_RESET}. 安装/启动单个节点        ${COLOR_CYAN}4${COLOR_RESET}. 停止指定节点"
+        echo "  ${COLOR_CYAN}2${COLOR_RESET}. 查看指定节点日志         ${COLOR_CYAN}5${COLOR_RESET}. 启动已停止的节点"
+        echo "  ${COLOR_CYAN}3${COLOR_RESET}. 卸载指定节点             ${COLOR_CYAN}6${COLOR_RESET}. 重启指定节点"
+
+        print_info "\n--- 批量操作 ---"
+        echo "  ${COLOR_CYAN}7${COLOR_RESET}. 批量安装/启动新节点      ${COLOR_CYAN}10${COLOR_RESET}. 批量卸载节点"
+        echo "  ${COLOR_CYAN}8${COLOR_RESET}. 批量停止节点             "
+        echo "  ${COLOR_CYAN}9${COLOR_RESET}. 批量启动节点             "
+
+        print_info "\n--- 系统维护 ---"
+        echo "  ${COLOR_CYAN}11${COLOR_RESET}. 系统更新与维护"
+        echo "   ${COLOR_CYAN}0${COLOR_RESET}. 退出脚本"
+        echo
+        
+        read -rp "${COLOR_YELLOW}请输入选项: ${COLOR_RESET}" choice
+        
+        case $choice in
+            1) menu_install_single ;;
+            2) select_node_action "view_node_logs" "查看日志" ;;
+            3) select_node_action "uninstall_node" "卸载" ;;
+            4) select_node_action "stop_node" "停止" ;;
+            5) select_node_action "start_node" "启动" ;;
+            6) select_node_action "restart_node" "重启" ;;
+            
+            7) menu_batch_install ;;
+            8) select_multiple_nodes_action "stop_node" "停止" ;;
+            9) select_multiple_nodes_action "start_node" "启动" ;;
+            10) select_multiple_nodes_action "uninstall_node" "卸载" ;;
+
+            11) menu_update ;; 
+            
+            0) print_info "感谢使用 Nexus 管理脚本，再见！"; exit 0 ;;
+            *) print_error "无效选项，请重新输入。" && sleep 1 ;;
+        esac
+    done
+}
+
+# --- Script Entry Point ---
+main_menu
