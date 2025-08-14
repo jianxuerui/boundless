@@ -2,20 +2,20 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 (ARM64 Docker) - v4.1.7 Buildx 修复版
+# Nexus 多节点管理脚本 (ARM64 Docker) - v4.1.8 Buildx 强制创建版
 #
 # 原作者: 哈哈哈哈 (推特 @ferdie_jhovie)
 # 魔改者: AI & 社区智慧
 #
-# 【V4.1.7 更新】:
-#   - 【关键修复】: 修正了 Buildx Builder 创建时可能遇到的 "existing instance" 错误。
-#     在 `setup_buildx` 函数中，强制执行更彻底的 Builder 移除和重新创建流程。
+# 【V4.1.8 更新】:
+#   - 【关键修复】: 强制解决了 Buildx Builder 创建时遇到的 "existing instance but no append mode"
+#     错误。通过更强硬地移除现有 Builder，确保总是创建一个新的。
 #
-# ... (保留之前的 V4.1.6, V4.1.5, V4.1.4, V4.1.3, V4.1.2, V4.1.1, V4.0 更新说明) ...
+# ... (保留之前的 V4.1.7, V4.1.6, V4.1.5, V4.1.4, V4.1.3, V4.1.2, V4.1.1, V4.0 更新说明) ...
 # ================================================================================================
 
 # --- 配置项 (可在此处自定义) ---
-SCRIPT_VERSION="v4.1.7 Buildx 修复版"
+SCRIPT_VERSION="v4.1.8 Buildx 强制创建版"
 # --- 此处已更新 nexus-cli 版本 ---
 NEXUS_CLI_VERSION="v0.10.7"
 BASE_CONTAINER_NAME="nexus-node"
@@ -107,31 +107,58 @@ check_docker() {
     fi
 }
 
-# --- SETUP BUILDX - IMPROVED HANDING FOR EXISTING BUILDERS ---
+# --- SETUP BUILDX - IMPROVED HANDLING FOR EXISTING BUILDERS (FORCEFUL RECREATION) ---
 setup_buildx() {
-    # If the builder exists, always attempt to remove it first before creating.
-    # This avoids conflicts or inconsistent states.
+    print_info "正在检查和配置 Buildx builder '$BUILDER_NAME'..."
+
+    # Check if the builder exists at all.
+    # We use `docker buildx ls --no-duplicates` to try and get a cleaner list, though its effect might be minimal here.
     if docker buildx ls | grep -q "^${BUILDER_NAME}\s"; then
-        print_info "检测到现有的 Buildx builder '$BUILDER_NAME'，正在将其移除..."
-        # Attempt removal. Suppress errors as it might not exist or might be in a state that 'rm' struggles with.
-        docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true # Use 'true' to not halt script if rm fails, but WARN is logged below.
-        if docker buildx ls | grep -q "^${BUILDER_NAME}\s"; then # Check again if it's still there
-             print_warning "!! 警告: 移除 Buildx builder '$BUILDER_NAME' 可能未成功，请检查 Docker Buildx 状态。!!\n"
-             print_warning "    Buildx LS Output: $(docker buildx ls | grep "${BUILDER_NAME}")\n"
+        print_warning "检测到 Buildx builder '$BUILDER_NAME' 已存在。"
+        # ---- FIX FOR THE ERROR ----
+        # The error "existing instance ... but no append mode" indicates buildx is aware of the builder,
+        # but a clean creation is failing. We must FORCE removal first.
+        # We can try `docker buildx rm --all` which attempts to remove ALL builders,
+        # or specifically target our builder name. `docker buildx rm <name>` is preferred.
+        
+        print_info "强制移除现有的 Buildx builder '$BUILDER_NAME'..."
+        # Use a loop with multiple attempts or stricter checks if this command sometimes fails silently.
+        # For now, let's attempt it, suppressing direct output, but we'll check its continued existence later.
+        docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1
+        
+        # Short sleep to allow Docker daemon to process the rm command.
+        sleep 1
+
+        # Re-check if it was truly removed. If not, we have a more significant Docker issue.
+        if docker buildx ls | grep -q "^${BUILDER_NAME}\s"; then
+            print_error "!! 关键错误: 强制移除 Buildx builder '$BUILDER_NAME' 失败！!!"
+            print_error "   请手动执行 'docker buildx rm ${BUILDER_NAME}' 来清理它。"
+            # If manual cleanup fails too, you might need to investigate Docker installation or its state.
+            # Forcing create after failed remove could also lead to issues. Best to halt.
+            exit 1
         else
-             print_success "Buildx builder '$BUILDER_NAME' 已成功移除。"
+            print_success "Buildx builder '$BUILDER_NAME' 已被成功移除。"
         fi
     fi
     
+    # Now that we are sure (or have tried our best) to remove it, create a new one.
     print_info "正在创建新的 Buildx builder '$BUILDER_NAME'..."
-    # Use --bootstrap and --use for guaranteed fresh setup.
+    # --bootstrap ensures the builder is ready immediately. --use sets it as the default.
     docker buildx create --name "$BUILDER_NAME" --driver docker-container --bootstrap --use >/dev/null
     
-    # Check and install binfmt support if not already present.
-    # The check below might be redundant if '--install all' already handled it, but it's harmless.
-    if ! docker run --rm --privileged tonistiigi/binfmt:latest --install all >/dev/null 2>&1; then
+    # Check and install binfmt support if not already present. This is essential for multi-arch builds.
+    # A check before running the command itself can sometimes prevent unnecessary work or errors if already set up.
+    if ! docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null | grep -q "supported"; then
        print_info "正在为多架构构建设置 binfmt 支持..."
        docker run --rm --privileged tonistiigi/binfmt:latest --install all >/dev/null
+       # Wait a bit for the system to register binfmt changes
+       sleep 2
+       if ! docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null | grep -q "supported"; then
+           print_warning "Binfmt support might not be fully installed or active after execution."
+       fi
+    else
+        # print_info "Binfmt support is already active." # Optional verbose output
+        : # No-op if supported, simply continue.
     fi
     
     print_success "Buildx builder '$BUILDER_NAME' 已创建并设置为默认。"
@@ -144,6 +171,7 @@ build_image() {
         return
     fi
     
+    # setup_buildx will be called here, and it now has improved handling for builder issues.
     setup_buildx
     
     TMP_WORKDIR=$(mktemp -d -t nexus_docker_build_XXXXXX)
@@ -336,7 +364,6 @@ view_node_logs() {
 # --- LIST NODES FUNCTION - PARSED STATS CORRECTLY ---
 list_nodes() {
     print_color "============================== 当前 Nexus 节点状态 ===============================" "$COLOR_BLUE"
-    # Unified and compact display for Node ID and Container Name
     printf "%-40s %-28s %-12s %-18s %s\n" \
         "$(print_bold "节点 ID (容器名)")" \
         "$(print_bold "状态")" \
@@ -347,7 +374,6 @@ list_nodes() {
     
     local all_node_info=() # Stores node_id:container_name pairs
     
-    # 1. Gather all potential nodes.
     while IFS= read -r container_name; do
         local node_id
         node_id=$(echo "$container_name" | sed "s/^${BASE_CONTAINER_NAME}-//")
@@ -363,11 +389,9 @@ list_nodes() {
         declare -A stats_map # Map: container_name -> "CPUPerc\tMemUsage"
         local stats_output=""
 
-        # 2. Collect stats ONLY for RUNNING containers.
         if [ -n "$running_container_ids" ]; then
             stats_output=$(docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" "$running_container_ids")
             
-            # --- DIAGNOSTIC OUTPUT ---
             echo -e "\n${CYAN}--- Docker Stats Raw Output (for running containers) ---${RESET}" >&2
             if [ -z "$stats_output" ]; then
                 echo -e "${YELLOW}docker stats command returned no data for running containers.${RESET}" >&2
@@ -375,9 +399,7 @@ list_nodes() {
                 echo -e "$stats_output" >&2
             fi
             echo -e "${CYAN}----------------------------------------------------${RESET}\n" >&2
-            # --- END DIAGNOSTIC OUTPUT ---
 
-            # 3. Parse stats output robustly using regex and field extraction.
             echo "$stats_output" | while IFS= read -r line; do
                 line=$(echo "$line" | sed 's/^[ \t]*//;s/[ \t]*$//')
                 
@@ -416,14 +438,13 @@ list_nodes() {
             echo -e "\n${YELLOW}No running containers found to collect stats from.${RESET}\n" >&2
         fi
         
-        # 4. Iterate through all identified nodes to display information.
         for item in "${all_node_info[@]}"; do
             IFS=':' read -r node_id container_name <<< "$item"
             
             local status_raw="Unknown"
             local formatted_status
-            local cpu_perc="N/A"
-            local mem_usage="N/A"
+            local cpu_perc="N/A" 
+            local mem_usage="N/A"  
             local image_name="<none>"
             local display_node_info="$node_id ($container_name)" 
 
@@ -494,7 +515,6 @@ select_node_action() {
         
         local color="$COLOR_RED"
         if [[ "$status" == *"Up"* ]]; then color="$COLOR_GREEN"; elif [[ "$status" == *"Exited"* ]]; then color="$COLOR_YELLOW"; fi
-        # Correctly formatted display for each option, showing both Node ID and Container Name
         display_options+=("  ${COLOR_CYAN}%2d.${COLOR_RESET} %-30s [%s]") "$((i+1))" "$node_id ($container_name)" "$(print_color "$status" "$color")"
     done
 
@@ -547,7 +567,6 @@ select_multiple_nodes_action() {
 
         local color="$COLOR_RED"
         if [[ "$status" == *"Up"* ]]; then color="$COLOR_GREEN"; elif [[ "$status" == *"Exited"* ]]; then color="$COLOR_YELLOW"; fi
-        # Correctly formatted display for each option
         display_options+=("  ${CYAN}%2d.${COLOR_RESET} %-30s [%s]") "$((i+1))" "$node_id ($container_name)" "$(print_color "$status" "$color")"
     done
     printf '%s\n' "${display_options[@]}"
@@ -690,7 +709,6 @@ menu_batch_install() {
 }
 
 # --- MENU UPDATE --- Function for system maintenance sub-menu.
-# The logic here is unchanged, only its role in the main menu mapping might have been indirectly affected.
 menu_update() {
     while true; do
         clear
@@ -700,7 +718,6 @@ menu_update() {
         print_info "Nexus CLI 版本: ${NEXUS_CLI_VERSION}"
         print_info "Docker 镜像: ${IMAGE_NAME}"
         echo
-        # Consistent formatting for sub-menu options
         echo "  ${COLOR_CYAN}1${COLOR_RESET}. 强制重新构建 Docker 镜像 (更新 nexus-cli 到 ${NEXUS_CLI_VERSION})"
         echo "  ${COLOR_CYAN}2${COLOR_RESET}. 更新所有正在运行的节点 (使用最新镜像滚动更新)"
         echo "  ${COLOR_CYAN}3${COLOR_RESET}. 清理并移除所有节点容器、日志及可选的 Docker 镜像/Builder"
@@ -861,7 +878,6 @@ main_menu() {
         list_nodes # Display the list of nodes with their statuses
 
         echo
-        # Unified and compact menu layout with consistent colors
         print_info "\n--- 节点管理 ---"
         echo "  ${COLOR_CYAN}1${COLOR_RESET}. 安装/启动单个节点        ${COLOR_CYAN}4${COLOR_RESET}. 停止指定节点"
         echo "  ${COLOR_CYAN}2${COLOR_RESET}. 查看指定节点日志         ${COLOR_CYAN}5${COLOR_RESET}. 启动已停止的节点"
@@ -873,7 +889,7 @@ main_menu() {
         echo "  ${COLOR_CYAN}9${COLOR_RESET}. 批量启动节点             "
 
         print_info "\n--- 系统维护 ---"
-        # Unified and compact system maintenance options. The numbers here directly map to menu_update.
+        # System Maintenance menu direct mapping
         echo "  ${COLOR_CYAN}11${COLOR_RESET}. 系统更新与维护"
         echo "   ${COLOR_CYAN}0${COLOR_RESET}. 退出脚本"
         echo
