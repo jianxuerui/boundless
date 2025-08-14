@@ -2,20 +2,22 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 (ARM64 Docker) - v4.1.8 Buildx 强制创建版
+# Nexus 多节点管理脚本 (ARM64 Docker) - v4.1.9 Buildx 强制清理版
 #
 # 原作者: 哈哈哈哈 (推特 @ferdie_jhovie)
-# 魔改者: AI & 社区智慧
+# -- 
+# 改版者: AI & 社区智慧
 #
-# 【V4.1.8 更新】:
-#   - 【关键修复】: 强制解决了 Buildx Builder 创建时遇到的 "existing instance but no append mode"
-#     错误。通过更强硬地移除现有 Builder，确保总是创建一个新的。
+# 【V4.1.9 更新】:
+#   - 【终极 Buildx 修复】: 极大地强化了 setup_buildx 函数，以应对 Docker Buildx 
+#     Builder 状态不一致导致反复出现 "existing instance" 错误的问题。
+#     增加了直接强制移除 Builder 的命令，并妥善处理其潜在的错误。
 #
-# ... (保留之前的 V4.1.7, V4.1.6, V4.1.5, V4.1.4, V4.1.3, V4.1.2, V4.1.1, V4.0 更新说明) ...
+# ... (保留之前的 V4.1.8, V4.1.7, V4.1.6, V4.1.5, V4.1.4, V4.1.3, V4.1.2, V4.1.1, V4.0 更新说明) ...
 # ================================================================================================
 
 # --- 配置项 (可在此处自定义) ---
-SCRIPT_VERSION="v4.1.8 Buildx 强制创建版"
+SCRIPT_VERSION="v4.1.9 Buildx 强制清理版"
 # --- 此处已更新 nexus-cli 版本 ---
 NEXUS_CLI_VERSION="v0.10.7"
 BASE_CONTAINER_NAME="nexus-node"
@@ -107,58 +109,42 @@ check_docker() {
     fi
 }
 
-# --- SETUP BUILDX - IMPROVED HANDLING FOR EXISTING BUILDERS (FORCEFUL RECREATION) ---
+# --- SETUP BUILDX - ADDED EXTRA DELIBERATE REMOVAL ---
 setup_buildx() {
     print_info "正在检查和配置 Buildx builder '$BUILDER_NAME'..."
 
-    # Check if the builder exists at all.
-    # We use `docker buildx ls --no-duplicates` to try and get a cleaner list, though its effect might be minimal here.
-    if docker buildx ls | grep -q "^${BUILDER_NAME}\s"; then
-        print_warning "检测到 Buildx builder '$BUILDER_NAME' 已存在。"
-        # ---- FIX FOR THE ERROR ----
-        # The error "existing instance ... but no append mode" indicates buildx is aware of the builder,
-        # but a clean creation is failing. We must FORCE removal first.
-        # We can try `docker buildx rm --all` which attempts to remove ALL builders,
-        # or specifically target our builder name. `docker buildx rm <name>` is preferred.
-        
-        print_info "强制移除现有的 Buildx builder '$BUILDER_NAME'..."
-        # Use a loop with multiple attempts or stricter checks if this command sometimes fails silently.
-        # For now, let's attempt it, suppressing direct output, but we'll check its continued existence later.
-        docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1
-        
-        # Short sleep to allow Docker daemon to process the rm command.
-        sleep 1
+    # Attempt to remove the builder FIRST, regardless of its existence or state.
+    # This is to ensure a clean slate before attempting creation.
+    # Suppress all output and use '|| true' to prevent script termination if builder doesn't exist or rm fails for other reasons.
+    print_info "尝试移除现有的 Buildx builder '$BUILDER_NAME'（如果存在）..."
+    docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || true
 
-        # Re-check if it was truly removed. If not, we have a more significant Docker issue.
-        if docker buildx ls | grep -q "^${BUILDER_NAME}\s"; then
-            print_error "!! 关键错误: 强制移除 Buildx builder '$BUILDER_NAME' 失败！!!"
-            print_error "   请手动执行 'docker buildx rm ${BUILDER_NAME}' 来清理它。"
-            # If manual cleanup fails too, you might need to investigate Docker installation or its state.
-            # Forcing create after failed remove could also lead to issues. Best to halt.
-            exit 1
-        else
-            print_success "Buildx builder '$BUILDER_NAME' 已被成功移除。"
-        fi
+    # Add a small delay to ensure Docker Daemon processes the removal.
+    sleep 1
+
+    # We still need to check if the builder ISN'T gone after rm, indicating a persistent issue.
+    if docker buildx ls | grep -q "^${BUILDER_NAME}\s"; then
+        print_error "!! 致命错误: 尝试移除 Buildx builder '$BUILDER_NAME' 后，它仍然存在。!!\n"
+        print_error "    这可能表示 Docker Buildx 存在严重配置问题或 Docker Daemon 状态异常。"
+        print_error "    请尝试手动执行: \n      sudo docker buildx rm ${BUILDER_NAME}\n      sudo systemctl restart docker\n    然后重新运行此脚本。"
+        exit 1 # Critical failure, cannot proceed with builder creation.
+    else
+        print_success "Buildx builder '$BUILDER_NAME' 已清理（或之前不存在）。"
     fi
     
-    # Now that we are sure (or have tried our best) to remove it, create a new one.
+    # Now, proceed with creating a fresh builder.
     print_info "正在创建新的 Buildx builder '$BUILDER_NAME'..."
     # --bootstrap ensures the builder is ready immediately. --use sets it as the default.
     docker buildx create --name "$BUILDER_NAME" --driver docker-container --bootstrap --use >/dev/null
     
-    # Check and install binfmt support if not already present. This is essential for multi-arch builds.
-    # A check before running the command itself can sometimes prevent unnecessary work or errors if already set up.
-    if ! docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null | grep -q "supported"; then
+    # Ensure binfmt support is available, as it's critical for multi-arch builds.
+    if ! docker run --rm --privileged tonistiigi/binfmt:latest --install all >/dev/null 2>&1; then
        print_info "正在为多架构构建设置 binfmt 支持..."
        docker run --rm --privileged tonistiigi/binfmt:latest --install all >/dev/null
-       # Wait a bit for the system to register binfmt changes
-       sleep 2
+       sleep 2 # Allow some time for binfmt registration.
        if ! docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null | grep -q "supported"; then
-           print_warning "Binfmt support might not be fully installed or active after execution."
+           print_warning "Binfmt support might not be fully installed or active."
        fi
-    else
-        # print_info "Binfmt support is already active." # Optional verbose output
-        : # No-op if supported, simply continue.
     fi
     
     print_success "Buildx builder '$BUILDER_NAME' 已创建并设置为默认。"
@@ -171,7 +157,6 @@ build_image() {
         return
     fi
     
-    # setup_buildx will be called here, and it now has improved handling for builder issues.
     setup_buildx
     
     TMP_WORKDIR=$(mktemp -d -t nexus_docker_build_XXXXXX)
@@ -784,138 +769,4 @@ menu_update() {
                ;;
             3)
                print_error "${COLOR_RED}警告！此操作将移除所有 Nexus 节点容器、相关的日志文件。"
-               print_error "${COLOR_YELLOW}您还可以选择移除 Nexus Docker 镜像和 Buildx builder。"
-               
-               if confirm_action "确定要继续清理吗?"; then
-                   print_info "正在卸载所有 Nexus 节点..."
-                   local all_node_ids_to_remove=()
-                   while IFS= read -r node_id; do
-                       if docker ps -a --filter "name=${BASE_CONTAINER_NAME}-${node_id}" --format '{{.Names}}' | grep -q .; then
-                           all_node_ids_to_remove+=("$node_id")
-                       fi
-                   done < <(get_all_node_ids)
-                   
-                   if [ ${#all_node_ids_to_remove[@]} -eq 0 ]; then
-                       print_info "未找到需要卸载的节点。"
-                   else
-                       for node_id in "${all_node_ids_to_remove[@]}"; do
-                           uninstall_node "$node_id"
-                           echo
-                       done
-                       print_success "所有节点已卸载。"
-                   fi
-
-                   if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-                       if confirm_action "是否移除 Docker 镜像 '$IMAGE_NAME'?"; then
-                           docker rmi -f "$IMAGE_NAME" >/dev/null 2>&1 || print_warning "删除镜像 '$IMAGE_NAME' 失败。"
-                           print_success "镜像 '$IMAGE_NAME' 已移除。"
-                       else
-                           print_info "已保留 Docker 镜像 '$IMAGE_NAME'。"
-                       fi
-                   else
-                       print_info "Docker 镜像 '$IMAGE_NAME' 已不存在。"
-                   fi
-
-                   if docker buildx ls | grep -q "^${BUILDER_NAME}\s"; then
-                       if confirm_action "是否移除 Buildx builder '$BUILDER_NAME'?"; then
-                           docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || print_warning "移除 Buildx builder '$BUILDER_NAME' 失败。"
-                           print_success "Buildx builder '$BUILDER_NAME' 已移除。"
-                       else
-                           print_info "已保留 Buildx builder '$BUILDER_NAME'。"
-                       fi
-                   else
-                       print_info "Buildx builder '$BUILDER_NAME' 已不存在。"
-                   fi
-
-                   if [ -d "$LOG_DIR" ]; then
-                       if [ -n "$(ls -A "$LOG_DIR")" ]; then
-                            if confirm_action "是否移除 Nexus 日志目录 '$LOG_DIR'?"; then
-                                rm -rf "$LOG_DIR"
-                                print_success "日志目录 '$LOG_DIR' 已移除。"
-                            else
-                                print_info "已保留 Nexus 日志目录 '$LOG_DIR'。"
-                            fi
-                       else
-                           print_info "日志目录 '$LOG_DIR' 为空，无需移除。"
-                       fi
-                   else
-                       print_info "Nexus 日志目录 '$LOG_DIR' 已不存在。"
-                   fi
-                   
-               else
-                   print_info "操作已取消。"
-               fi
-               read -n 1 -s -r -p "按任意键返回..."
-               ;;
-            0) break ;;
-            *) print_error "无效选项。" && sleep 1;;
-        esac
-    done
-}
-
-
-# --- Main Menu Loop ---
-main_menu() {
-    if [ "$(id -u)" -ne 0 ]; then 
-        print_error "错误: 此脚本需要 root 权限运行。"
-        print_error "请尝试: sudo ./$(basename "$0")"
-        exit 1 
-    fi
-    
-    check_docker_daemon
-    check_docker
-
-    if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-        print_warning "Nexus 镜像 '$IMAGE_NAME' 未构建。请在菜单中选择更新/维护选项进行构建。"
-    fi
-
-    while true; do
-        clear
-        print_color "================================================================================" "$COLOR_BLUE"
-        print_color "           Nexus 管理脚本 (ARM64 Docker) - ${SCRIPT_VERSION}" "$COLOR_CYAN"
-        print_color "================================================================================" "$COLOR_BLUE"
-        
-        list_nodes # Display the list of nodes with their statuses
-
-        echo
-        print_info "\n--- 节点管理 ---"
-        echo "  ${COLOR_CYAN}1${COLOR_RESET}. 安装/启动单个节点        ${COLOR_CYAN}4${COLOR_RESET}. 停止指定节点"
-        echo "  ${COLOR_CYAN}2${COLOR_RESET}. 查看指定节点日志         ${COLOR_CYAN}5${COLOR_RESET}. 启动已停止的节点"
-        echo "  ${COLOR_CYAN}3${COLOR_RESET}. 卸载指定节点             ${COLOR_CYAN}6${COLOR_RESET}. 重启指定节点"
-
-        print_info "\n--- 批量操作 ---"
-        echo "  ${COLOR_CYAN}7${COLOR_RESET}. 批量安装/启动新节点      ${COLOR_CYAN}10${COLOR_RESET}. 批量卸载节点"
-        echo "  ${COLOR_CYAN}8${COLOR_RESET}. 批量停止节点             "
-        echo "  ${COLOR_CYAN}9${COLOR_RESET}. 批量启动节点             "
-
-        print_info "\n--- 系统维护 ---"
-        # System Maintenance menu direct mapping
-        echo "  ${COLOR_CYAN}11${COLOR_RESET}. 系统更新与维护"
-        echo "   ${COLOR_CYAN}0${COLOR_RESET}. 退出脚本"
-        echo
-        
-        read -rp "${COLOR_YELLOW}请输入选项: ${COLOR_RESET}" choice
-        
-        case $choice in
-            1) menu_install_single ;;
-            2) select_node_action "view_node_logs" "查看日志" ;;
-            3) select_node_action "uninstall_node" "卸载" ;;
-            4) select_node_action "stop_node" "停止" ;;
-            5) select_node_action "start_node" "启动" ;;
-            6) select_node_action "restart_node" "重启" ;;
-            
-            7) menu_batch_install ;;
-            8) select_multiple_nodes_action "stop_node" "停止" ;;
-            9) select_multiple_nodes_action "start_node" "启动" ;;
-            10) select_multiple_nodes_action "uninstall_node" "卸载" ;;
-
-            11) menu_update ;; # This will present the sub-menu for updates and maintenance
-            
-            0) print_info "感谢使用 Nexus 管理脚本，再见！"; exit 0 ;;
-            *) print_error "无效选项，请重新输入。" && sleep 1 ;;
-        esac
-    done
-}
-
-# --- Script Entry Point ---
-main_menu
+               print_error "${COLOR_YELLOW}您还可以选择移除 Nexus
