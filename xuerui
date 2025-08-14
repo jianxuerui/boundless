@@ -2,10 +2,15 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 (ARM64 Docker) - 魔改·终极版 v4.1.1
+# Nexus 多节点管理脚本 (ARM64 Docker) - 魔改·终极版 v4.1.2
 #
 # 原作者: 哈哈哈哈 (推特 @ferdie_jhovie)
 # 魔改者: AI & 社区智慧
+#
+# 【V4.1.2 更新】:
+#   - 【核心修复】进一步增强了 'list_nodes' 函数，优化了 'docker stats' 输出解析，
+#     增加对 Docker 版本可能变化的适应性，并确保即使 stats 信息部分缺失，
+#     列表也能完整显示。
 #
 # 【V4.1.1 更新】:
 #   - 【核心修复】优化了 'list_nodes' 函数，确保在没有运行的节点时也能正确显示容器列表，
@@ -25,7 +30,7 @@ set -e
 # ================================================================================================
 
 # --- 配置项 (可在此处自定义) ---
-SCRIPT_VERSION="v4.1.1 终极修复版"
+SCRIPT_VERSION="v4.1.2 最终健壮版"
 # --- 此处已更新 nexus-cli 版本 ---
 NEXUS_CLI_VERSION="v0.10.7"
 BASE_CONTAINER_NAME="nexus-node"
@@ -53,7 +58,6 @@ print_bold() { print_color "$1" "${COLOR_BOLD}${COLOR_CYAN}"; }
 # 【关键修复】重写 confirm_action 以避免复杂的提示符构建
 confirm_action() {
     local prompt_message="$1"
-    # 使用固定的颜色，避免被误解析
     read -rp "${COLOR_YELLOW}>>> ${prompt_message} (y/N): ${COLOR_RESET}" confirm
     [[ "$confirm" =~ ^[yY]([eE][sS])?$ ]]
 }
@@ -79,15 +83,12 @@ check_docker() {
             print_error "!! 警告: 当前系统不是 ARM64 架构, 脚本主要为 ARM64 设计。安装可能失败或运行不兼容。!!"
         fi
 
-        # 简化 apt 命令，减少 verbose 输出
         apt-get update -qq || print_warning "apt update 失败, 尝试继续。"
         apt-get install -y --no-install-recommends apt-transport-https ca-certificates curl software-properties-common gnupg lsb-release >/dev/null || print_warning "部分依赖安装失败, 尝试继续。"
 
         mkdir -p /etc/apt/keyrings
-        # 增加 --fail 确保curl下载失败时有返回码
         curl -fsSL --fail https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 
-        # 再次检查 gpg key 文件是否存在，防止 curl 失败但没有 abort 脚本
         if [ ! -f /etc/apt/keyrings/docker.gpg ]; then
              print_error "!! Docker GPG key 下载或处理失败 !! 请手动检查。"
              exit 1
@@ -98,13 +99,12 @@ check_docker() {
           $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
 
         apt-get update -qq || print_warning "apt update 失败, 尝试继续。"
-        # --no-install-recommends 减小安装体积
         apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin >/dev/null || print_warning "Docker CE 安装失败, 尝试继续。"
 
         if ! systemctl is-active docker >/dev/null 2>&1; then
             print_info "尝试启动 Docker 服务..."
             systemctl enable --now docker
-            sleep 2 # 给 Docker 启动一些时间
+            sleep 2 
             if ! systemctl is-active docker >/dev/null 2>&1; then
                 print_error "!! Docker 服务启动失败 !! 请手动检查 'systemctl status docker'。"
                 exit 1
@@ -112,10 +112,8 @@ check_docker() {
         fi
         print_success "Docker 安装完成。"
     fi
-    # 检查 buildx
     if ! docker buildx version >/dev/null 2>&1; then
         print_error "错误：未找到 Docker buildx 插件。请检查 Docker 安装是否完整。"
-        # 尝试安装 buildx 插件，有时 Docker CE 安装可能不包含它
         print_warning "尝试安装 'docker-buildx-plugin'..."
         apt-get update -qq >/dev/null || print_warning "apt update 失败, 尝试继续。"
         apt-get install -y --no-install-recommends docker-buildx-plugin >/dev/null || print_error "!! 插件安装失败 !! 请手动安装。"
@@ -128,21 +126,15 @@ check_docker() {
 }
 
 setup_buildx() {
-    # 检查是否有同名 builder 存在
     if docker buildx ls | grep -q "^${BUILDER_NAME}\s"; then
-        # 检查 builder 是否正在运行 (通常 buildx ls 的输出包含运行状态，这里用最简单的方式判断)
-        # 实际上 docker buildx ls 默认不显示 `running` 状态，直接用 use 可能会有默认 builder 的冲突
-        # 最稳妥是先 remove 再 create
         print_info "检测到现有的 Buildx builder '$BUILDER_NAME'，正在重置..."
         docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || print_warning "移除旧 builder '$BUILDER_NAME' 失败, 尝试继续。"
     fi
     
     print_info "首次运行，正在创建并配置 Buildx builder '$BUILDER_NAME'..."
-    # create --bootstrap --use
     docker buildx create --name "$BUILDER_NAME" --driver docker-container --use >/dev/null
     
-    # 检查 binfmt 支持，确保多架构构建
-    if ! docker run --rm --privileged tonistiigi/binfmt:latest --print | grep -q "supported"; then
+    if ! docker run --rm --privileged tonistiigi/binfmt:latest --install all >/dev/null 2>&1; then
        print_info "正在为多架构构建设置 binfmt 支持..."
        docker run --rm --privileged tonistiigi/binfmt:latest --install all >/dev/null
     fi
@@ -151,17 +143,15 @@ setup_buildx() {
 }
 
 build_image() {
-    local force_build=${1:-""} # 允许传入 --force
+    local force_build=${1:-""}
     if [[ -z "$force_build" ]] && docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
         print_info "镜像 '$IMAGE_NAME' 已存在，跳过构建。如需强制构建，请在主菜单中选择更新选项。"
         return
     fi
     
-    # 确保 buildx 已经 setup
     setup_buildx
     
     TMP_WORKDIR=$(mktemp -d -t nexus_docker_build_XXXXXX)
-    # print_info "构建临时目录: $TMP_WORKDIR"
     cd "$TMP_WORKDIR"
     
     local cli_url="https://github.com/nexus-xyz/nexus-cli/releases/download/${NEXUS_CLI_VERSION}/nexus-network-linux-arm64"
@@ -178,65 +168,36 @@ build_image() {
       'RUN chmod +x /entrypoint.sh' \
       'ENTRYPOINT ["/entrypoint.sh"]' \
       'VOLUME /root/.nexus' \
-      'EXPOSE 8080' > Dockerfile # 假设 nexus-network 监听8080，如果不对可修改
-
-    # Re-ensure ca-certificates is installed as it's crucial for curl's HTTPS.
-    # Added it explicitly to the RUN apt-get install command above.
-    # Also explicitly pointing curl to the certificate file.
+      'EXPOSE 8080' > Dockerfile
 
     printf '%s\n' \
       '#!/bin/bash' \
       'set -e' \
-      '# Check if NODE_ID is provided, if not, prompt for it (this scenario shouldn't happen with the script's logic, but good for robustness)' \
-      'if [ -z "$NODE_ID" ]; then' \
-      '  echo "错误: NODE_ID 环境变量未设置！" >&2' \
-      '  exit 1' \
-      'fi' \
+      'if [ -z "$NODE_ID" ]; then echo "错误: NODE_ID 环境变量未设置！" >&2; exit 1; fi' \
       'if ! command -v nexus-network >/dev/null 2>&1; then echo "错误: nexus-network 命令不存在!" >&2; exit 1; fi' \
       'echo "准备 Nexus 节点 (NODE_ID: $NODE_ID)..."' \
-      '# Store node-id in persistent volume' \
       'mkdir -p /root/.nexus && echo "$NODE_ID" > /root/.nexus/node-id' \
       'LOG_FILE="/root/nexus.log"' \
       'SCREEN_SESSION_NAME="nexus_'$NODE_ID'"' \
-      '# Check if a screen session for this node already exists and stop it if it is' \
       'if screen -list | grep -q "\. N:$SCREEN_SESSION_NAME"; then' \
       '  echo "正在停止现有的 Nexus 进程 (Screen session: $SCREEN_SESSION_NAME)..."' \
       '  screen -S "$SCREEN_SESSION_NAME" -X quit || true' \
       '  sleep 1' \
       'fi' \
       'echo "正在后台启动 Nexus 节点 (NODE_ID: $NODE_ID)..."' \
-      '# Use -D to detach, so we don't need `tail -f` in the foreground of docker container' \
-      '# And redirect output to the log file' \
       'screen -dmS "$SCREEN_SESSION_NAME" bash -c "exec nexus-network start --node-id \$NODE_ID | tee -a $LOG_FILE"' \
-      '# Give screen a moment to create the session' \
       'sleep 2' \
-      '# Check if screen session was successfully created' \
       'if ! screen -list | grep -q "\. N:$SCREEN_SESSION_NAME"; then' \
       '  echo "!! Nexus 节点启动失败 (Screen session: $SCREEN_SESSION_NAME), 请检查日志: $LOG_FILE !! " >&2' \
       '  cat $LOG_FILE >&2 || true' \
       '  exit 1' \
       'fi' \
       'echo "Nexus 节点 ${NODE_ID} 启动成功，屏幕会话 '${SCREEN_SESSION_NAME}'。"' \
-      '# To keep the container running, we can monitor the log file, or simply exit' \
-      '# As docker will keep the container running if the entrypoint exits with success' \
-      '# If we need continuous log output in docker logs, we'd need to tail here.' \
-      '# For now, we rely on screen managing the process and saving logs.' \
-      '# Optionally, you could do: tail -f $LOG_FILE' \
-      'echo "Nexus Node $NODE_ID managed by screen session '$SCREEN_SESSION_NAME'."' \
-      '# To keep container alive: tail -f $LOG_FILE' \
-      '# If using tail -f, ensure it doesn't exit if LOG_FILE is empty initially.' \
-      'tail -f /dev/null' > entrypoint.sh # Use tail -f /dev/null to keep container alive indefinitely, logs are in /root/nexus.log
+      'tail -f /dev/null' > entrypoint.sh
 
     print_info "正在构建节点镜像 '$IMAGE_NAME' (Nexus CLI: ${NEXUS_CLI_VERSION})，此过程可能需要几分钟..."
-    # --platform for multi-arch explicit setting. --load ensures it's loaded into the local docker image cache.
     docker buildx build --builder "$BUILDER_NAME" --platform linux/arm64 -t "$IMAGE_NAME" . --load >/dev/null
     
-    # Explicitly unset TMP_WORKDIR so trap doesn't try to remove it if cd'ing out fails, etc.
-    # Better to have trap handle cleanup based on exit.
-    # cd - >/dev/null 
-    # rm -rf "$TMP_WORKDIR" # Trap will handle this
-    # TMP_WORKDIR="" # No need to unset, trap is there.
-
     print_success "镜像 '$IMAGE_NAME' 构建完成。"
 }
 
@@ -245,17 +206,14 @@ run_container() {
     if [ -z "$node_id" ]; then print_error "错误: 未提供 Node ID"; return 1; fi
     local container_name="${BASE_CONTAINER_NAME}-${node_id}"
     
-    # Check if container exists
     if docker ps -a -q -f name="${container_name}" | grep -q .; then
         print_info "容器 '$container_name' 已存在。正在停止并移除旧容器..."
         docker stop "$container_name" > /dev/null 2>&1 || print_warning "停止容器 '$container_name' 失败, 尝试移除。"
         docker rm "$container_name" > /dev/null 2>&1 || print_warning "移除容器 '$container_name' 失败, 忽略。"
     fi
 
-    # Create log directory if it doesn't exist
     mkdir -p "$LOG_DIR"
     local log_file="${LOG_DIR}/nexus-${node_id}.log"
-    # Ensure log file exists and has correct permissions before container creation
     touch "$log_file" && chmod 644 "$log_file"
     
     print_info "正在启动节点 ${node_id} (容器名: ${container_name})..."
@@ -265,14 +223,11 @@ run_container() {
         --restart unless-stopped \
         "$IMAGE_NAME" >/dev/null
     
-    # Give container a moment to start and the entrypoint to execute
     sleep 3 
     
-    # Verify if the container is actually running and the process within started
     if ! docker ps -q -f name="${container_name}" | grep -q .; then
         print_error "节点 ${node_id} (${container_name}) 启动失败！请使用日志功能检查原因。"
         print_error "尝试查看容器内的日志文件: ${log_file}"
-        # Attempt to cat the log file here for immediate feedback
         if [ -f "$log_file" ]; then
             print_error "--- ${log_file} ---"
             cat "$log_file" >&2
@@ -290,7 +245,6 @@ stop_node() {
     local container_name="${BASE_CONTAINER_NAME}-${node_id}"
     if docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
         print_info "正在停止节点 $node_id ($container_name)..."
-        # Stop command should be quick if the process is running cleanly
         docker stop "$container_name" > /dev/null
         if docker ps -q -f name="${container_name}" | grep -q .; then
              print_error "!! 节点 $node_id ($container_name) 停止失败 !! 可能需要手动干预。"
@@ -305,11 +259,9 @@ stop_node() {
 start_node() {
     local node_id="$1"
     local container_name="${BASE_CONTAINER_NAME}-${node_id}"
-    # Check if container exists in docker ps -a (even if stopped)
     if docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
         print_info "正在启动节点 $node_id ($container_name)..."
         docker start "$container_name" > /dev/null
-        # Give a moment for the container to initialize and the process to start
         sleep 3
         if docker ps -q -f name="${container_name}" | grep -q .; then
             print_success "节点 $node_id ($container_name) 已启动。"
@@ -317,7 +269,6 @@ start_node() {
             print_error "节点 $node_id ($container_name) 启动后状态异常，请检查日志。"
         fi
     else
-        # If the container doesn't exist at all, prompt for installation instead of start
         print_error "未找到容器 '$container_name'。请先使用安装功能。"
     fi
 }
@@ -344,12 +295,9 @@ uninstall_node() {
     local container_name="${BASE_CONTAINER_NAME}-${node_id}"
     print_info "正在卸载节点 $node_id (容器名: ${container_name})..."
     
-    # Stop if running, ignore errors if already stopped or non-existent
     docker stop "$container_name" > /dev/null 2>&1 || true
-    # Remove container
     docker rm "$container_name" > /dev/null 2>&1 || true
     
-    # Remove associated log file
     local log_file="${LOG_DIR}/nexus-${node_id}.log"
     if [ -f "$log_file" ]; then
         rm -f "$log_file"
@@ -359,7 +307,6 @@ uninstall_node() {
 }
 
 get_all_node_ids() {
-    # Ensure we list containers even if they are stopped
     docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//" | sort -u
 }
 
@@ -374,13 +321,10 @@ view_node_logs() {
     
     print_info "正在查看节点 ${node_id} ($container_name) 的日志。按 Ctrl+C 退出。"
     
-    # Check if the container is running
     if docker ps -q -f name="${container_name}" | grep -q .; then
-        # If running, stream its logs
         print_color "--- streaming logs from running container '$container_name' ---" "$COLOR_BLUE"
         docker logs -f "$container_name"
     else
-        # If stopped, display the static log file content
         local log_file="${LOG_DIR}/nexus-${node_id}.log"
         if [ -f "$log_file" ]; then
             print_color "--- showing logs from file '$log_file' (container is stopped) ---" "$COLOR_YELLOW"
@@ -392,10 +336,9 @@ view_node_logs() {
     fi
 }
 
-# --- LIST NODES FUNCTION - CRITICAL FIX AREA ---
+# --- LIST NODES FUNCTION - ENHANCED ROBUSTNESS ---
 list_nodes() {
     print_color "============================== 当前 Nexus 节点状态 ===============================" "$COLOR_BLUE"
-    # Enhanced header for clarity
     printf "%-30s %-28s %-12s %-18s %s\n" \
         "$(print_bold "节点 ID (容器名)")" \
         "$(print_bold "状态")" \
@@ -404,88 +347,91 @@ list_nodes() {
         "$(print_bold "镜像")"
     print_color "--------------------------------------------------------------------------------------" "$COLOR_BLUE"
     
-    # Get all potential nodes by checking container names, regardless of running status
-    local all_node_data=()
+    local all_node_info=() # Store combined node_id and container_name
+    
+    # 1. Get all existing container names that match our pattern.
     while IFS= read -r container_name; do
         local node_id
         node_id=$(echo "$container_name" | sed "s/^${BASE_CONTAINER_NAME}-//")
-        all_node_data+=("$node_id:$container_name")
+        all_node_info+=("$node_id:$container_name")
     done < <(docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}")
 
-    if [ ${#all_node_data[@]} -eq 0 ]; then
+    if [ ${#all_node_info[@]} -eq 0 ]; then
         print_warning "未找到任何 Nexus 节点容器。"
     else
-        # Prepare a map for container stats (key: container_name, value: "CPUPerc\tMemUsage")
-        declare -A container_stats_map
-
-        # Get stats only for RUNNING containers
-        local running_containers=()
+        # 2. Prepare to collect stats ONLY for RUNNING containers.
+        local running_container_names=()
         local running_container_ids
         running_container_ids=$(docker ps -q -f name="${BASE_CONTAINER_NAME}-") # Get IDs of running containers
 
+        declare -A stats_map # Map: container_name -> "CPUPerc\tMemUsage"
+
         if [ -n "$running_container_ids" ]; then
+            # 3. Fetch stats. Use `--no-stream` for a single snapshot.
             local stats_output
-            # Use 'docker stats --no-stream' for a snapshot. Format includes name, cpu, memory.
             stats_output=$(docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" "$running_container_ids")
             
-            # Parse stats into the map
-            # Exclude header row if it exists (usually not with '--no-stream' if there are args)
+            # 4. Parse stats into the map. Be more forgiving with parsing.
+            # Ensure we don't process empty lines or headers from Docker stats itself if any.
             echo "$stats_output" | while IFS=$'\t' read -r name cpu_perc mem_usage; do
-                # Clean up potential ANSI color codes if docker stats outputs them by default
-                cpu_perc=$(echo "$cpu_perc" | sed 's/\x1b\[[0-9;]*m//g')
-                mem_usage=$(echo "$mem_usage" | sed 's/\x1b\[[0-9;]*m//g')
-                container_stats_map["$name"]="$cpu_perc"$'\t'"$mem_usage"
+                # Basic validation to ensure we got something resembling our container name
+                if [[ "$name" == "${BASE_CONTAINER_NAME}-"* ]]; then
+                    # Remove potential ANSI escape codes from output just in case
+                    cpu_perc=$(echo "$cpu_perc" | sed 's/\x1b\[[0-9;]*m//g' | xargs)
+                    mem_usage=$(echo "$mem_usage" | sed 's/\x1b\[[0-9;]*m//g' | xargs)
+                    
+                    # Set to N/A if the value is empty or clearly invalid after stripping.
+                    [ -z "$cpu_perc" ] && cpu_perc="N/A"
+                    [ -z "$mem_usage" ] && mem_usage="N/A"
+
+                    stats_map["$name"]="$cpu_perc"$'\t'"$mem_usage"
+                fi
             done
         fi
 
-        # Iterate through all potential nodes to display their info
-        for item in "${all_node_data[@]}"; do
+        # 5. Iterate through all identified nodes to display their information.
+        for item in "${all_node_info[@]}"; do
             IFS=':' read -r node_id container_name <<< "$item"
             
-            local status_raw
+            local status_raw="Unknown"
             local formatted_status
             local cpu_perc="N/A"
             local mem_usage="N/A"
             local image_name="<none>"
+            local display_node_id="$node_id"
 
-            # Get status and image info
-            # We query the info for each container separately to avoid complex parsing of `docker ps -a` output
-            # Check if container exists in 'docker ps' to determine running status accurately
-            local container_info
-            container_info=$(docker ps -a --filter "name=${container_name}" --format "{{.Status}}\t{{.Image}}")
+            # Get detailed status and image for each container
+            local container_details
+            container_details=$(docker ps -a --filter "name=${container_name}" --format "{{.Status}}\t{{.Image}}")
 
-            if [ -n "$container_info" ]; then
-                status_raw=$(echo "$container_info" | cut -f1)
-                image_name=$(echo "$container_info" | cut -f2)
-
-                # Format status string with color
+            if [ -n "$container_details" ]; then
+                status_raw=$(echo "$container_details" | cut -f1)
+                image_name=$(echo "$container_details" | cut -f2)
+                
+                # Determine color based on status
                 if [[ "$status_raw" == *"Up"* ]]; then
                     formatted_status=$(print_color "$status_raw" "$COLOR_GREEN")
-                    # Fetch stats from our map if container is running
-                    if [[ -v container_stats_map["$container_name"] ]]; then
-                        IFS=$'\t' read -r cpu_perc mem_usage <<< "${container_stats_map["$container_name"]}"
-                    else
-                        # This case should ideally not happen if logic is correct, but for safety:
-                        cpu_perc="?"
-                        mem_usage="?"
+                    # Retrieve stats if available
+                    if [[ -v stats_map["$container_name"] ]]; then
+                        IFS=$'\t' read -r cpu_perc mem_usage <<< "${stats_map["$container_name"]}"
                     fi
                 elif [[ "$status_raw" == *"Exited"* ]]; then
                     formatted_status=$(print_color "$status_raw" "$COLOR_YELLOW")
-                else # e.g., Created, Restarting, etc.
+                else # Created, Restarting etc.
                     formatted_status=$(print_color "$status_raw" "$COLOR_RED")
                 fi
             else
-                # Container listed by name pattern but not found by 'docker ps -a' for some reason
+                # Container was listed but couldn't be found by `docker ps -a` again (rare edge case)
                 formatted_status="$(print_color "Not Found" "$COLOR_RED")"
                 image_name="-"
-                node_id="$node_id (Stale)"
+                display_node_id="$node_id (Stale)"
             fi
             
-            # Ensure image_name is not too long, trim if necessary
+            # Trim image name if too long
             if [ ${#image_name} -gt 25 ]; then image_name="${image_name:0:22}..."; fi
 
-            # Print the row
-            printf "%-30s %-28s %-12s %-18s %s\n" "$node_id ($container_name)" "$formatted_status" "$cpu_perc" "$mem_usage" "$image_name"
+            # Print the row. If CPU/MEM are still N/A, they'll be printed as N/A.
+            printf "%-30s %-28s %-12s %-18s %s\n" "$display_node_id ($container_name)" "$formatted_status" "$cpu_perc" "$mem_usage" "$image_name"
         done
     fi
     print_color "======================================================================================" "$COLOR_BLUE"
@@ -498,12 +444,12 @@ select_node_action() {
     local prompt_message="$2"
     
     local available_nodes=()
+    # Filter get_all_node_ids to only include those with actual container entries
     while IFS= read -r node_id; do
-        # Only list nodes that actually have corresponding container entries
         if docker ps -a --filter "name=${BASE_CONTAINER_NAME}-${node_id}" --format '{{.Names}}' | grep -q .; then
             available_nodes+=("$node_id")
         fi
-    done < <(get_all_node_ids) # get_all_node_ids lists names, ensure we filter actual container existence
+    done < <(get_all_node_ids)
 
     if [ ${#available_nodes[@]} -eq 0 ]; then
         print_warning "当前无任何节点可操作。"
@@ -513,29 +459,25 @@ select_node_action() {
     
     echo "请选择要'${prompt_message}'的节点:"
     
-    # Generate a list of available nodes with their status
     local display_options=()
-    for node_id in "${available_nodes[@]}"; do
+    for i in "${!available_nodes[@]}"; do
+        local node_id="${available_nodes[$i]}"
         local container_name="${BASE_CONTAINER_NAME}-${node_id}"
         local status="Not Found"
         local container_info
         container_info=$(docker ps -a --filter "name=${container_name}" --format "{{.Status}}")
-        if [ -n "$container_info" ]; then
-            status="$container_info"
-        fi
+        if [ -n "$container_info" ]; then status="$container_info"; fi
         
         local color="$COLOR_RED"
         if [[ "$status" == *"Up"* ]]; then color="$COLOR_GREEN"; elif [[ "$status" == *"Exited"* ]]; then color="$COLOR_YELLOW"; fi
-        display_options+=("  ${COLOR_CYAN}%2d.${COLOR_RESET} 节点 ${COLOR_GREEN}%-25s${COLOR_RESET} [%s]") "${((i+=1))}" "$node_id" "$(print_color "$status" "$color")"
+        display_options+=("  ${COLOR_CYAN}%2d.${COLOR_RESET} 节点 ${COLOR_GREEN}%-25s${COLOR_RESET} [%s]") "$((i+1))" "$node_id" "$(print_color "$status" "$color")"
     done
 
-    # Print numbered options
     printf '%s\n' "${display_options[@]}"
     echo "   0. 返回主菜单"
     
     read -rp "${COLOR_YELLOW}请输入选项 (0-${#available_nodes[@]}): ${COLOR_RESET}" choice
     
-    # Input validation
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 0 ] || [ "$choice" -gt ${#available_nodes[@]} ]; then
         print_error "无效输入。"
         sleep 1
@@ -544,7 +486,6 @@ select_node_action() {
     
     [ "$choice" -eq 0 ] && return
     
-    # Execute callback for the selected node
     local selected_node_id="${available_nodes[$((choice-1))]}"
     "$action_callback" "$selected_node_id"
     
@@ -581,7 +522,7 @@ select_multiple_nodes_action() {
 
         local color="$COLOR_RED"
         if [[ "$status" == *"Up"* ]]; then color="$COLOR_GREEN"; elif [[ "$status" == *"Exited"* ]]; then color="$COLOR_YELLOW"; fi
-        display_options+=("  ${COLOR_CYAN}%2d.${COLOR_RESET} 节点 ${COLOR_GREEN}%-25s${COLOR_RESET} [%s]") "$((i+1))" "$node_id" "$(print_color "$status" "$color")"
+        display_options+=("  ${CYAN}%2d.${COLOR_RESET} 节点 ${COLOR_GREEN}%-25s${COLOR_RESET} [%s]") "$((i+1))" "$node_id" "$(print_color "$status" "$color")"
     done
     printf '%s\n' "${display_options[@]}"
     echo "   0. 返回主菜单"
@@ -593,12 +534,10 @@ select_multiple_nodes_action() {
     if [[ "$choices_str" == "all" ]]; then
         selected_nodes=("${available_nodes[@]}")
     else
-        # Process comma or space separated choices
         local cleaned_choices=$(echo "$choices_str" | tr ',' ' ' | xargs)
         local choices_array=($cleaned_choices)
         
         for choice in "${choices_array[@]}"; do
-            # Validate numeric choices
             if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#available_nodes[@]} ]; then
                 selected_nodes+=("${available_nodes[$((choice-1))]}")
             else
@@ -621,7 +560,7 @@ select_multiple_nodes_action() {
             print_info "--- 执行 '${prompt_message}' 节点: $node_id ---"
             "$action_callback" "$node_id"
             echo
-            sleep 0.5 # Small delay between operations
+            sleep 0.5 
         done
         print_success "批量操作执行完毕。"
     else
@@ -633,7 +572,7 @@ select_multiple_nodes_action() {
 menu_install_single() {
     read -rp "${COLOR_YELLOW}请输入要安装的 Node ID (唯一标识符, 建议使用数字): ${COLOR_RESET}" node_id
     if [ -n "$node_id" ]; then
-        node_id=$(echo "$node_id" | xargs | sed 's/[^a-zA-Z0-9_-]//g') # Sanitize Node ID for container names
+        node_id=$(echo "$node_id" | xargs | sed 's/[^a-zA-Z0-9_-]//g')
         if [ -z "$node_id" ]; then
             print_error "Node ID 不能为空且只能包含字母、数字、下划线和短横线。"
             read -n 1 -s -r -p "按任意键返回..."
@@ -655,7 +594,6 @@ menu_install_single() {
                 fi
             fi
         else
-            # Check if image is built before installation
             if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
                 print_warning "Nexus 镜像 '$IMAGE_NAME' 未构建。正在尝试构建..."
                 build_image "--force"
@@ -673,7 +611,6 @@ menu_install_single() {
 }
 
 menu_batch_install() {
-    # Ensure image is built or available before proceeding
     if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
         print_warning "Nexus 镜像 '$IMAGE_NAME' 未构建。正在尝试构建..."
         build_image "--force"
@@ -690,19 +627,16 @@ menu_batch_install() {
     local line_num=0
     while IFS= read -r line; do
         line_num=$((line_num+1))
-        line=$(echo "$line" | xargs | sed 's/[^a-zA-Z0-9_-]//g') # Sanitize input
+        line=$(echo "$line" | xargs | sed 's/[^a-zA-Z0-9_-]//g') 
         if [ -z "$line" ]; then 
-            # Allow empty lines after the first to be ignored, but the first empty line terminates input.
-            # If line_num is 1 and line is empty, means no input.
             if [ "$line_num" -eq 1 ]; then 
                 print_warning "未输入任何 Node ID，操作取消。"
                 return
             fi
-            continue # ignore subsequent empty lines if input was already provided
+            continue 
         fi
         
         local container_name="${BASE_CONTAINER_NAME}-${line}"
-        # Avoid adding duplicate or already existing nodes
         if docker ps -a --filter "name=${container_name}" --format '{{.Names}}' | grep -q .; then
             print_warning "节点 '$line' (容器: ${container_name}) 已存在, 已忽略。"
         else
@@ -719,7 +653,7 @@ menu_batch_install() {
                 print_info "--- 安装节点: $node_id ---"
                 run_container "$node_id"
                 echo
-                sleep 1 # Give some breathing room
+                sleep 1 
             done
             print_success "批量安装任务完成。"
         else
@@ -738,7 +672,7 @@ menu_update() {
         print_info "Nexus CLI 版本: ${NEXUS_CLI_VERSION}"
         print_info "Docker 镜像: ${IMAGE_NAME}"
         echo
-        echo "  1. 强制重新构建 Docker 镜像 (若nexus-cli版本有更新或镜像损坏)"
+        echo "  1. 强制重新构建 Docker 镜像 (更新 nexus-cli 到 ${NEXUS_CLI_VERSION})"
         echo "  2. 更新所有正在运行的节点 (使用最新镜像滚动更新)"
         echo "  3. 清理并移除所有节点容器、日志及可选的 Docker 镜像/Builder"
         echo "  0. 返回主菜单"
@@ -762,22 +696,19 @@ menu_update() {
                print_warning "然后使用最新构建的镜像重新启动它们。Node ID 将保持不变。"
                if confirm_action "确认更新所有正在运行的节点吗?"; then
                    print_info "开始构建最新镜像（这会确保 nexus-cli 是最新版本）..."
-                   build_image "--force" # Ensure we have the latest image
+                   build_image "--force" 
                    
                    print_info "正在查找所有正在运行的 Nexus 节点..."
                    local running_nodes_to_update=()
-                   # Fetch all running container IDs prefixed with BASE_CONTAINER_NAME
                    local running_container_ids
                    running_container_ids=$(docker ps -q -f name="${BASE_CONTAINER_NAME}-")
 
                    if [ -z "$running_container_ids" ]; then
                        print_warning "没有正在运行的节点需要更新。"
                    else
-                       # Iterate over running container IDs to extract Node IDs
                        while IFS= read -r container_id; do
                            local container_name
                            container_name=$(docker ps -f id="$container_id" --format '{{.Names}}')
-                           # Extract Node ID from container name
                            local node_id
                            node_id=$(echo "$container_name" | sed "s/^${BASE_CONTAINER_NAME}-//")
                            running_nodes_to_update+=("$node_id")
@@ -792,11 +723,10 @@ menu_update() {
                            print_info "正在开始滚动更新 ${#running_nodes_to_update[@]} 个节点..."
                            for node_id in "${running_nodes_to_update[@]}"; do
                                print_info "--- 更新节点: $node_id ---"
-                               # Stop, remove, and then run the container with the new image
-                               uninstall_node "$node_id" # This stops and removes
-                               run_container "$node_id"  # This starts with the new image
+                               uninstall_node "$node_id" 
+                               run_container "$node_id"  
                                echo
-                               sleep 2 # Add a small delay between updates
+                               sleep 2 
                            done
                            print_success "所有需要更新的运行中节点已完成更新。"
                        fi
@@ -813,7 +743,6 @@ menu_update() {
                if confirm_action "确定要继续清理吗?"; then
                    print_info "正在卸载所有 Nexus 节点..."
                    local all_node_ids_to_remove=()
-                   # Get all node IDs that exist (even if stopped)
                    while IFS= read -r node_id; do
                        if docker ps -a --filter "name=${BASE_CONTAINER_NAME}-${node_id}" --format '{{.Names}}' | grep -q .; then
                            all_node_ids_to_remove+=("$node_id")
@@ -830,7 +759,6 @@ menu_update() {
                        print_success "所有节点已卸载。"
                    fi
 
-                   # Option to remove the image
                    if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
                        if confirm_action "是否移除 Docker 镜像 '$IMAGE_NAME'?"; then
                            docker rmi -f "$IMAGE_NAME" >/dev/null 2>&1 || print_warning "删除镜像 '$IMAGE_NAME' 失败。"
@@ -842,7 +770,6 @@ menu_update() {
                        print_info "Docker 镜像 '$IMAGE_NAME' 已不存在。"
                    fi
 
-                   # Option to remove the Buildx builder
                    if docker buildx ls | grep -q "^${BUILDER_NAME}\s"; then
                        if confirm_action "是否移除 Buildx builder '$BUILDER_NAME'?"; then
                            docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || print_warning "移除 Buildx builder '$BUILDER_NAME' 失败。"
@@ -854,9 +781,7 @@ menu_update() {
                        print_info "Buildx builder '$BUILDER_NAME' 已不存在。"
                    fi
 
-                   # Option to remove log directory
                    if [ -d "$LOG_DIR" ]; then
-                       # Check if directory is empty or not before asking to remove it
                        if [ -n "$(ls -A "$LOG_DIR")" ]; then
                             if confirm_action "是否移除 Nexus 日志目录 '$LOG_DIR'?"; then
                                 rm -rf "$LOG_DIR"
@@ -866,7 +791,6 @@ menu_update() {
                             fi
                        else
                            print_info "日志目录 '$LOG_DIR' 为空，无需移除。"
-                           # Optionally remove empty dir: rm -rf "$LOG_DIR"
                        fi
                    else
                        print_info "Nexus 日志目录 '$LOG_DIR' 已不存在。"
@@ -886,32 +810,26 @@ menu_update() {
 
 # --- Main Menu Loop ---
 main_menu() {
-    # Ensure running as root (important for Docker access)
     if [ "$(id -u)" -ne 0 ]; then 
         print_error "错误: 此脚本需要 root 权限运行。"
         print_error "请尝试: sudo ./$(basename "$0")"
         exit 1 
     fi
     
-    # Initial checks
     check_docker_daemon
     check_docker
 
-    # Build image immediately on first run if not found, or let user choose
-    # Let's not force build on first run, but inform if not built.
     if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
         print_warning "Nexus 镜像 '$IMAGE_NAME' 未构建。请在菜单中选择更新/维护选项进行构建。"
     fi
 
-    # Main menu loop
     while true; do
         clear
         print_color "================================================================================" "$COLOR_BLUE"
         print_color "           Nexus 管理脚本 (ARM64 Docker) - ${SCRIPT_VERSION}" "$COLOR_CYAN"
         print_color "================================================================================" "$COLOR_BLUE"
         
-        # Call list_nodes to display current status
-        list_nodes
+        list_nodes # Display the list of nodes with their statuses
 
         echo
         print_info "\n--- 节点管理 ---"
@@ -925,8 +843,8 @@ main_menu() {
         echo "  ${COLOR_CYAN}9${COLOR_RESET}. 批量启动节点             "
 
         print_info "\n--- 系统维护 ---"
-        echo "  ${COLOR_CYAN}11${COLOR_RESET}. 系统更新与维护"
-        echo "   ${COLOR_CYAN}0${COLOR_RESET}. 退出脚本"
+        echo "  ${CYAN}11${COLOR_RESET}. 系统更新与维护"
+        echo "   ${CYAN}0${COLOR_RESET}. 退出脚本"
         echo
         
         read -rp "${COLOR_YELLOW}请输入选项: ${COLOR_RESET}" choice
@@ -952,6 +870,4 @@ main_menu() {
 }
 
 # --- Script Entry Point ---
-# Clean up TMP_WORKDIR even if script is killed unexpectedly.
-# The trap handler ensures this.
 main_menu
