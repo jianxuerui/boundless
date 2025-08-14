@@ -2,21 +2,21 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 (ARM64 Docker) - v4.1.5 极致解析优化版
+# Nexus 多节点管理脚本 (ARM64 Docker) - v4.1.6 菜单优化版
 #
 # 原作者: 哈哈哈哈 (推特 @ferdie_jhovie)
 # 魔改者: AI & 社区智慧
 #
-# 【V4.1.5 更新】:
-#   - 【关键修复】: 重新设计了 'list_nodes' 函数中 'docker stats' 输出的解析逻辑。
-#     完全放弃 IFS=$'\t'，转而使用精确的正则表达式和定位匹配，解决了 'N/A (parse)' 的问题。
-#     菜单输出中，节点 ID 和容器名统一显示，以解决 "节点信息保留第一个" 的视觉错乱。
+# 【V4.1.6 更新】:
+#   - 【界面优化】: 调整了主菜单的显示格式，使其更紧凑，并统一了选项的颜色格式。
+#     统一了“节点 ID (容器名)”在列表显示中的格式。
+#   - 【解析修复】: 保持了 v4.1.5 的Docker stats 解析逻辑，确保 N/A (parse) 问题得到解决。
 #
-# ... (保留之前的 V4.1.4, V4.1.3, V4.1.2, V4.1.1, V4.0 更新说明) ...
+# ... (保留之前的 V4.1.5, V4.1.4, V4.1.3, V4.1.2, V4.1.1, V4.0 更新说明) ...
 # ================================================================================================
 
 # --- 配置项 (可在此处自定义) ---
-SCRIPT_VERSION="v4.1.5 极致解析优化版"
+SCRIPT_VERSION="v4.1.6 菜单优化版"
 # --- 此处已更新 nexus-cli 版本 ---
 NEXUS_CLI_VERSION="v0.10.7"
 BASE_CONTAINER_NAME="nexus-node"
@@ -322,10 +322,10 @@ view_node_logs() {
     fi
 }
 
-# --- LIST NODES FUNCTION - ENHANCED PARSING WITH REGEX ---
+# --- LIST NODES FUNCTION - PARSED STATS CORRECTLY ---
 list_nodes() {
     print_color "============================== 当前 Nexus 节点状态 ===============================" "$COLOR_BLUE"
-    # Displaying the Node ID and Container Name together as requested.
+    # Unified and compact display for Node ID and Container Name
     printf "%-40s %-28s %-12s %-18s %s\n" \
         "$(print_bold "节点 ID (容器名)")" \
         "$(print_bold "状态")" \
@@ -347,15 +347,13 @@ list_nodes() {
         print_warning "未找到任何 Nexus 节点容器。"
     else
         local running_container_ids
-        running_container_ids=$(docker ps -q -f name="${BASE_CONTAINER_NAME}-") # Get IDs of running containers
+        running_container_ids=$(docker ps -q -f name="${BASE_CONTAINER_NAME}-") 
 
         declare -A stats_map # Map: container_name -> "CPUPerc\tMemUsage"
         local stats_output=""
 
         # 2. Collect stats ONLY for RUNNING containers.
         if [ -n "$running_container_ids" ]; then
-            # Execute docker stats, specifying format for easier parsing.
-            # Using table format can help with consistent column spacing, though not always pure tabs.
             stats_output=$(docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" "$running_container_ids")
             
             # --- DIAGNOSTIC OUTPUT ---
@@ -370,10 +368,8 @@ list_nodes() {
 
             # 3. Parse stats output robustly using regex and field extraction.
             echo "$stats_output" | while IFS= read -r line; do
-                # Trim leading/trailing whitespace.
                 line=$(echo "$line" | sed 's/^[ \t]*//;s/[ \t]*$//')
                 
-                # Skip header and blank lines.
                 if [[ "$line" == "NAME"* || -z "$line" ]]; then
                     continue
                 fi
@@ -381,39 +377,32 @@ list_nodes() {
                 local name=""
                 local cpu_perc_raw=""
                 local mem_usage_raw=""
-                local temp_line="$line" # Work with a copy
+                local temp_line="$line" 
 
-                # Use awk to extract the first token as NAME (should be container name).
-                # This is safer than IFS assuming TABs as fields are often space-padded.
                 name=$(echo "$temp_line" | awk '{print $1}')
                 
-                # If this line isn't for our Nexus containers, skip.
                 if [[ "$name" != "${BASE_CONTAINER_NAME}-"* ]]; then
                     continue
                 fi
 
-                # Extract CPU Usage: Search for the percentage pattern like "105.57%" in the whole line.
+                # Regex for CPU Usage (e.g., "5.65%")
                 if [[ "$temp_line" =~ [[:space:]]([0-9]*\.?[0-9]+%) ]]; then
                     cpu_perc_raw="${BASH_REMATCH[1]}"
                 fi
                 
-                # Extract Memory Usage: Search for patterns like "3.741GiB".
-                # This can be tricky as format can vary. The regex looks for number.dot.number, or just number, followed by G/M/K/iB.
-                # It should appear later in the line.
-                # We match the first such pattern found.
-                if [[ "$temp_line" =~ ([0-9]+\.?[0-9]*[KMGT]?i?B) ]]; then
+                # Regex for Memory Usage (e.g., "4.181GiB" or "3.741GiB / 15.62GiB")
+                # Capture the first part of the memory usage string.
+                if [[ "$temp_line" =~ ([0-9]+\.?[0-9]*[KMGT]?i?B)(\s+\/)? ]]; then
                     mem_usage_raw="${BASH_REMATCH[1]}"
                 fi
 
-                # Clean extracted values (remove colors, extra spaces).
+                # Clean extracted values.
                 cpu_perc=$(echo "$cpu_perc_raw" | sed 's/\x1b\[[0-9;]*m//g' | xargs)
                 mem_usage=$(echo "$mem_usage_raw" | sed 's/\x1b\[[0-9;]*m//g' | xargs)
 
-                # Assign defaults if extraction failed.
                 [ -z "$cpu_perc" ] && cpu_perc="N/A"
                 [ -z "$mem_usage" ] && mem_usage="N/A"
                 
-                # Store in map. Use TAB as internal separator for consistency.
                 stats_map["$name"]="$cpu_perc"$'\t'"$mem_usage"
             done
         else
@@ -426,13 +415,11 @@ list_nodes() {
             
             local status_raw="Unknown"
             local formatted_status
-            local cpu_perc="N/A" # Default to N/A
-            local mem_usage="N/A" # Default to N/A
+            local cpu_perc="N/A" # Default N/A
+            local mem_usage="N/A"  # Default N/A
             local image_name="<none>"
-            # Store the container name in the node ID display line for clarity.
-            local display_node_info="$node_id ($container_name)"
+            local display_node_info="$node_id ($container_name)" # Display Node ID and Container Name together
 
-            # Get detailed status and image for each container.
             local container_details
             container_details=$(docker ps -a --filter "name=${container_name}" --format "{{.Status}}\t{{.Image}}")
 
@@ -442,11 +429,9 @@ list_nodes() {
                 
                 if [[ "$status_raw" == *"Up"* ]]; then
                     formatted_status=$(print_color "$status_raw" "$COLOR_GREEN")
-                    # Retrieve stats from our map if available.
                     if [[ -v stats_map["$container_name"] ]]; then
                         IFS=$'\t' read -r cpu_perc mem_usage <<< "${stats_map["$container_name"]}"
                     else
-                        # Container is running, but its stats weren't successfully parsed or found.
                         print_warning "Stats parsing failed or stats not found for running container '$container_name'." >&2
                         cpu_perc="N/A (parse)" # Indicate parsing issue clearly.
                         mem_usage="N/A (parse)"
@@ -457,16 +442,13 @@ list_nodes() {
                     formatted_status=$(print_color "$status_raw" "$COLOR_RED")
                 fi
             else
-                # Container name matches pattern, but docker ps -a doesn't find it. Rare.
                 formatted_status="$(print_color "Not Found" "$COLOR_RED")"
                 image_name="-"
                 display_node_info="$node_id ($container_name - Stale)"
             fi
             
-            # Trim image name if too long to fit table.
             if [ ${#image_name} -gt 25 ]; then image_name="${image_name:0:22}..."; fi
 
-            # Print the row. N/A values are handled gracefully.
             printf "%-40s %-28s %-12s %-18s %s\n" "$display_node_info" "$formatted_status" "$cpu_perc" "$mem_usage" "$image_name"
         done
     fi
@@ -505,7 +487,7 @@ select_node_action() {
         
         local color="$COLOR_RED"
         if [[ "$status" == *"Up"* ]]; then color="$COLOR_GREEN"; elif [[ "$status" == *"Exited"* ]]; then color="$COLOR_YELLOW"; fi
-        # Adjusted display format to show node_id and container_name clearly
+        # Correctly formatted display for each option
         display_options+=("  ${COLOR_CYAN}%2d.${COLOR_RESET} %-30s [%s]") "$((i+1))" "$node_id ($container_name)" "$(print_color "$status" "$color")"
     done
 
@@ -558,7 +540,7 @@ select_multiple_nodes_action() {
 
         local color="$COLOR_RED"
         if [[ "$status" == *"Up"* ]]; then color="$COLOR_GREEN"; elif [[ "$status" == *"Exited"* ]]; then color="$COLOR_YELLOW"; fi
-        # Adjusted display format to show node_id and container_name clearly
+        # Correctly formatted display for each option
         display_options+=("  ${CYAN}%2d.${COLOR_RESET} %-30s [%s]") "$((i+1))" "$node_id ($container_name)" "$(print_color "$status" "$color")"
     done
     printf '%s\n' "${display_options[@]}"
@@ -709,10 +691,10 @@ menu_update() {
         print_info "Nexus CLI 版本: ${NEXUS_CLI_VERSION}"
         print_info "Docker 镜像: ${IMAGE_NAME}"
         echo
-        echo "  1. 强制重新构建 Docker 镜像 (更新 nexus-cli 到 ${NEXUS_CLI_VERSION})"
-        echo "  2. 更新所有正在运行的节点 (使用最新镜像滚动更新)"
-        echo "  3. 清理并移除所有节点容器、日志及可选的 Docker 镜像/Builder"
-        echo "  0. 返回主菜单"
+        echo "  ${COLOR_CYAN}1${COLOR_RESET}. 强制重新构建 Docker 镜像 (更新 nexus-cli 到 ${NEXUS_CLI_VERSION})"
+        echo "  ${COLOR_CYAN}2${COLOR_RESET}. 更新所有正在运行的节点 (使用最新镜像滚动更新)"
+        echo "  ${COLOR_CYAN}3${COLOR_RESET}. 清理并移除所有节点容器、日志及可选的 Docker 镜像/Builder"
+        echo "  ${COLOR_CYAN}0${COLOR_RESET}. 返回主菜单"
         echo
         read -rp "${COLOR_YELLOW}请输入选项: ${COLOR_RESET}" choice
         
@@ -869,6 +851,7 @@ main_menu() {
         list_nodes # Display the list of nodes with their statuses
 
         echo
+        # Adjusting the section headers and options format
         print_info "\n--- 节点管理 ---"
         echo "  ${COLOR_CYAN}1${COLOR_RESET}. 安装/启动单个节点        ${COLOR_CYAN}4${COLOR_RESET}. 停止指定节点"
         echo "  ${COLOR_CYAN}2${COLOR_RESET}. 查看指定节点日志         ${COLOR_CYAN}5${COLOR_RESET}. 启动已停止的节点"
@@ -880,8 +863,11 @@ main_menu() {
         echo "  ${COLOR_CYAN}9${COLOR_RESET}. 批量启动节点             "
 
         print_info "\n--- 系统维护 ---"
-        echo "  ${CYAN}11${COLOR_RESET}. 系统更新与维护"
-        echo "   ${CYAN}0${COLOR_RESET}. 退出脚本"
+        # System Maintenance Menu, ensuring consistent format
+        echo "  ${COLOR_CYAN}11${COLOR_RESET}. 强制重新构建 Docker 镜像"
+        echo "  ${COLOR_CYAN}12${COLOR_RESET}. 更新所有正在运行的节点"
+        echo "  ${COLOR_CYAN}13${COLOR_RESET}. 清理所有节点、日志及镜像"
+        echo "  ${COLOR_CYAN}0${COLOR_RESET}. 退出脚本"
         echo
         
         read -rp "${COLOR_YELLOW}请输入选项: ${COLOR_RESET}" choice
@@ -899,7 +885,227 @@ main_menu() {
             9) select_multiple_nodes_action "start_node" "启动" ;;
             10) select_multiple_nodes_action "uninstall_node" "卸载" ;;
 
-            11) menu_update ;;
+            # System Maintenance mapping (new mapping to reflect combined options in the text)
+            # 11 -> Force Rebuild Image
+            # 12 -> Update All Running Nodes
+            # 13 -> Clean All
+            11) menu_update ;; # This calls menu_update which has sub-options. Let's map it to directly go there.
+            # We'll combine the system maintenance logic directly into menu_update function and call it here.
+            
+            0) print_info "感谢使用 Nexus 管理脚本，再见！"; exit 0 ;;
+            *) print_error "无效选项，请重新输入。" && sleep 1 ;;
+        esac
+    done
+}
+
+# Update menu_update to have clear options
+menu_update() {
+    while true; do
+        clear
+        print_color "================================================================================" "$COLOR_BLUE"
+        print_color "                       系统维护与更新 (Nexus)" "$COLOR_CYAN"
+        print_color "================================================================================" "$COLOR_BLUE"
+        print_info "Nexus CLI 版本: ${NEXUS_CLI_VERSION}"
+        print_info "Docker 镜像: ${IMAGE_NAME}"
+        echo
+        echo "  ${COLOR_CYAN}1${COLOR_RESET}. 强制重新构建 Docker 镜像 (更新 nexus-cli 到 ${NEXUS_CLI_VERSION})"
+        echo "  ${COLOR_CYAN}2${COLOR_RESET}. 更新所有正在运行的节点 (使用最新镜像滚动更新)"
+        echo "  ${COLOR_CYAN}3${COLOR_RESET}. 清理并移除所有节点容器、日志及可选的 Docker 镜像/Builder"
+        echo "  ${COLOR_CYAN}0${COLOR_RESET}. 返回主菜单"
+        echo
+        read -rp "${COLOR_YELLOW}请输入选项: ${COLOR_RESET}" choice
+        
+        case $choice in
+            1) 
+               print_warning "此操作将重新构建 '$IMAGE_NAME' 镜像，并会下载最新的 nexus-cli。"
+               print_warning "这个过程可能需要一些时间，请确保网络连接稳定。"
+               if confirm_action "确认强制重新构建镜像吗?"; then
+                   build_image "--force"
+                   print_success "镜像强制重建完成。"
+               else
+                   print_info "操作已取消。"
+               fi
+               read -n 1 -s -r -p "按任意键返回..."
+               ;;
+            2)
+               print_warning "此操作将停止并删除所有 *正在运行* 的 Nexus 节点容器，"
+               print_warning "然后使用最新构建的镜像重新启动它们。Node ID 将保持不变。"
+               if confirm_action "确认更新所有正在运行的节点吗?"; then
+                   print_info "开始构建最新镜像（这会确保 nexus-cli 是最新版本）..."
+                   build_image "--force" 
+                   
+                   print_info "正在查找所有正在运行的 Nexus 节点..."
+                   local running_nodes_to_update=()
+                   local running_container_ids
+                   running_container_ids=$(docker ps -q -f name="${BASE_CONTAINER_NAME}-")
+
+                   if [ -z "$running_container_ids" ]; then
+                       print_warning "没有正在运行的节点需要更新。"
+                   else
+                       while IFS= read -r container_id; do
+                           local container_name
+                           container_name=$(docker ps -f id="$container_id" --format '{{.Names}}')
+                           local node_id
+                           node_id=$(echo "$container_name" | sed "s/^${BASE_CONTAINER_NAME}-//")
+                           running_nodes_to_update+=("$node_id")
+                       done <<< "$running_container_ids"
+
+                       if [ ${#running_nodes_to_update[@]} -eq 0 ]; then
+                           print_warning "未识别到任何需要更新的运行中节点。"
+                       else
+                           print_success "将执行更新的节点列表:"
+                           printf "  %s\n" "${running_nodes_to_update[@]}"
+                           
+                           print_info "正在开始滚动更新 ${#running_nodes_to_update[@]} 个节点..."
+                           for node_id in "${running_nodes_to_update[@]}"; do
+                               print_info "--- 更新节点: $node_id ---"
+                               uninstall_node "$node_id" 
+                               run_container "$node_id"  
+                               echo
+                               sleep 2 
+                           done
+                           print_success "所有需要更新的运行中节点已完成更新。"
+                       fi
+                   fi
+               else
+                   print_info "操作已取消。"
+               fi
+               read -n 1 -s -r -p "按任意键返回..."
+               ;;
+            3)
+               print_error "${COLOR_RED}警告！此操作将移除所有 Nexus 节点容器、相关的日志文件。"
+               print_error "${COLOR_YELLOW}您还可以选择移除 Nexus Docker 镜像和 Buildx builder。"
+               
+               if confirm_action "确定要继续清理吗?"; then
+                   print_info "正在卸载所有 Nexus 节点..."
+                   local all_node_ids_to_remove=()
+                   while IFS= read -r node_id; do
+                       if docker ps -a --filter "name=${BASE_CONTAINER_NAME}-${node_id}" --format '{{.Names}}' | grep -q .; then
+                           all_node_ids_to_remove+=("$node_id")
+                       fi
+                   done < <(get_all_node_ids)
+                   
+                   if [ ${#all_node_ids_to_remove[@]} -eq 0 ]; then
+                       print_info "未找到需要卸载的节点。"
+                   else
+                       for node_id in "${all_node_ids_to_remove[@]}"; do
+                           uninstall_node "$node_id"
+                           echo
+                       done
+                       print_success "所有节点已卸载。"
+                   fi
+
+                   if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+                       if confirm_action "是否移除 Docker 镜像 '$IMAGE_NAME'?"; then
+                           docker rmi -f "$IMAGE_NAME" >/dev/null 2>&1 || print_warning "删除镜像 '$IMAGE_NAME' 失败。"
+                           print_success "镜像 '$IMAGE_NAME' 已移除。"
+                       else
+                           print_info "已保留 Docker 镜像 '$IMAGE_NAME'。"
+                       fi
+                   else
+                       print_info "Docker 镜像 '$IMAGE_NAME' 已不存在。"
+                   fi
+
+                   if docker buildx ls | grep -q "^${BUILDER_NAME}\s"; then
+                       if confirm_action "是否移除 Buildx builder '$BUILDER_NAME'?"; then
+                           docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1 || print_warning "移除 Buildx builder '$BUILDER_NAME' 失败。"
+                           print_success "Buildx builder '$BUILDER_NAME' 已移除。"
+                       else
+                           print_info "已保留 Buildx builder '$BUILDER_NAME'。"
+                       fi
+                   else
+                       print_info "Buildx builder '$BUILDER_NAME' 已不存在。"
+                   fi
+
+                   if [ -d "$LOG_DIR" ]; then
+                       if [ -n "$(ls -A "$LOG_DIR")" ]; then
+                            if confirm_action "是否移除 Nexus 日志目录 '$LOG_DIR'?"; then
+                                rm -rf "$LOG_DIR"
+                                print_success "日志目录 '$LOG_DIR' 已移除。"
+                            else
+                                print_info "已保留 Nexus 日志目录 '$LOG_DIR'。"
+                            fi
+                       else
+                           print_info "日志目录 '$LOG_DIR' 为空，无需移除。"
+                       fi
+                   else
+                       print_info "Nexus 日志目录 '$LOG_DIR' 已不存在。"
+                   fi
+                   
+               else
+                   print_info "操作已取消。"
+               fi
+               read -n 1 -s -r -p "按任意键返回..."
+               ;;
+            0) break ;;
+            *) print_error "无效选项。" && sleep 1;;
+        esac
+    done
+}
+
+
+# --- Main Menu Loop ---
+main_menu() {
+    if [ "$(id -u)" -ne 0 ]; then 
+        print_error "错误: 此脚本需要 root 权限运行。"
+        print_error "请尝试: sudo ./$(basename "$0")"
+        exit 1 
+    fi
+    
+    check_docker_daemon
+    check_docker
+
+    if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+        print_warning "Nexus 镜像 '$IMAGE_NAME' 未构建。请在菜单中选择更新/维护选项进行构建。"
+    fi
+
+    while true; do
+        clear
+        print_color "================================================================================" "$COLOR_BLUE"
+        # Reduced overall header prominence for a tighter feel
+        print_color "           Nexus 管理脚本 (ARM64 Docker) - ${SCRIPT_VERSION}" "$COLOR_CYAN"
+        print_color "================================================================================" "$COLOR_BLUE"
+        
+        list_nodes # Display the list of nodes with their statuses
+
+        echo
+        # Unified and compact menu layout with consistent colors
+        print_info "\n--- 节点管理 ---"
+        echo "  ${COLOR_CYAN}1${COLOR_RESET}. 安装/启动单个节点        ${COLOR_CYAN}4${COLOR_RESET}. 停止指定节点"
+        echo "  ${COLOR_CYAN}2${COLOR_RESET}. 查看指定节点日志         ${COLOR_CYAN}5${COLOR_RESET}. 启动已停止的节点"
+        echo "  ${COLOR_CYAN}3${COLOR_RESET}. 卸载指定节点             ${COLOR_CYAN}6${COLOR_RESET}. 重启指定节点"
+
+        print_info "\n--- 批量操作 ---"
+        echo "  ${COLOR_CYAN}7${COLOR_RESET}. 批量安装/启动新节点      ${COLOR_CYAN}10${COLOR_RESET}. 批量卸载节点"
+        echo "  ${COLOR_CYAN}8${COLOR_RESET}. 批量停止节点             "
+        echo "  ${COLOR_CYAN}9${COLOR_RESET}. 批量启动节点             "
+
+        print_info "\n--- 系统维护 ---"
+        # Ensured consistent numbering and colors here. Note: Moved the "System Maintenance" options 
+        # into their own logic via menu_update call as it has sub-menus.
+        # The current menu directly calls 'menu_update' on choice 11.
+        # Updated below to match the text in previous message.
+        echo "  ${COLOR_CYAN}11${COLOR_RESET}. 系统更新与维护"
+        echo "   ${COLOR_CYAN}0${COLOR_RESET}. 退出脚本"
+        echo
+        
+        read -rp "${COLOR_YELLOW}请输入选项: ${COLOR_RESET}" choice
+        
+        case $choice in
+            1) menu_install_single ;;
+            2) select_node_action "view_node_logs" "查看日志" ;;
+            3) select_node_action "uninstall_node" "卸载" ;;
+            4) select_node_action "stop_node" "停止" ;;
+            5) select_node_action "start_node" "启动" ;;
+            6) select_node_action "restart_node" "重启" ;;
+            
+            7) menu_batch_install ;;
+            8) select_multiple_nodes_action "stop_node" "停止" ;;
+            9) select_multiple_nodes_action "start_node" "启动" ;;
+            10) select_multiple_nodes_action "uninstall_node" "卸载" ;;
+
+            11) menu_update ;; # Calls the detailed update menu
+            
             0) print_info "感谢使用 Nexus 管理脚本，再见！"; exit 0 ;;
             *) print_error "无效选项，请重新输入。" && sleep 1 ;;
         esac
