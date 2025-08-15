@@ -520,13 +520,13 @@ list_nodes() {
             
             # 由于这是内部调试输出，我将它包裹在 if debug_mode 块中，以免每次都打印给普通用户
             # 或者将其注释掉，因为它可能产生误导性的 "Raw Output"
-            # echo -e "\n${CYAN}--- Docker Stats Raw Output (for running containers) ---${RESET}" >&2
+            # echo -e "\n${COLOR_CYAN}--- Docker Stats Raw Output (for running containers) ---${COLOR_RESET}" >&2
             # if [ -z "$stats_output" ]; then
-            #     echo -e "${YELLOW}docker stats command returned no data for running containers.${RESET}" >&2
+            #     echo -e "${COLOR_YELLOW}docker stats command returned no data for running containers.${COLOR_RESET}" >&2
             # else
             #     echo -e "$stats_output" >&2
             # fi
-            # echo -e "${CYAN}----------------------------------------------------${RESET}\n" >&2
+            # echo -e "${COLOR_CYAN}----------------------------------------------------${COLOR_RESET}\n" >&2
 
             # 3. Parse stats output robustly using regex and field extraction.
             echo "$stats_output" | while IFS= read -r line; do
@@ -571,7 +571,7 @@ list_nodes() {
                 stats_map["$name"]="$cpu_perc"$'\t'"$mem_usage"
             done
         # else # 重新启用这个分支以打印消息，但重定向到 stderr 更合适
-            # echo -e "\n${YELLOW}No running containers found to collect stats from.${RESET}\n" >&2
+            # echo -e "\n${COLOR_YELLOW}No running containers found to collect stats from.${COLOR_RESET}\n" >&2
         fi
         
         for item in "${all_node_info[@]}"; do
@@ -651,7 +651,11 @@ select_node_action() {
         
         local color="$COLOR_RED"
         if [[ "$status" == *"Up"* ]]; then color="$COLOR_GREEN"; elif [[ "$status" == *"Exited"* ]]; then color="$COLOR_YELLOW"; fi
-        display_options+=("  ${COLOR_CYAN}%2d.${COLOR_RESET} %-30s [%s]") "$((i+1))" "$node_id ($container_name)" "$(print_color "$status" "$color")"
+        # 修复开始
+        local formatted_option
+        printf -v formatted_option "  ${COLOR_CYAN}%2d.${COLOR_RESET} %-30s [%s]" "$((i+1))" "$node_id ($container_name)" "$(print_color "$status" "$color")"
+        display_options+=("$formatted_option")
+        # 修复结束
     done
 
     printf '%s\n' "${display_options[@]}"
@@ -705,7 +709,11 @@ select_multiple_nodes_action() {
 
         local color="$COLOR_RED"
         if [[ "$status" == *"Up"* ]]; then color="$COLOR_GREEN"; elif [[ "$status" == *"Exited"* ]]; then color="$COLOR_YELLOW"; fi
-        display_options+=("  ${CYAN}%2d.${COLOR_RESET} %-30s [%s]") "$((i+1))" "$node_id ($container_name)" "$(print_color "$status" "$color")"
+        # 修复开始
+        local formatted_option
+        printf -v formatted_option "  ${COLOR_CYAN}%2d.${COLOR_RESET} %-30s [%s]" "$((i+1))" "$node_id ($container_name)" "$(print_color "$status" "$color")"
+        display_options+=("$formatted_option")
+        # 修复结束
     done
     printf '%s\n' "${display_options[@]}"
     echo "   0. 返回主菜单"
@@ -965,7 +973,7 @@ menu_update() {
 
                    # Offer to remove Docker image.
                    if docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
-                       if confirm_action "是否移除 Docker 镜像 '$IMAGE_NAME'?"; then
+                       if confirm_action "是否移除 Docker 镜像 '$IMAGE_NAME'? 马上去除了？"; then # 问用户，并且暗示这是不可逆操作。
                            if ! docker rmi -f "$IMAGE_NAME" >/dev/null 2>&1; then
                                print_warning "删除镜像 '$IMAGE_NAME' 失败。镜像可能被容器锁定。"
                            else
