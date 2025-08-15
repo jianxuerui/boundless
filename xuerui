@@ -2,47 +2,38 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 (ARM64 Docker) - v5.5 终极智能修复版
+# Nexus 多节点管理脚本 (ARM64 Docker) - v5.6 权威网络配置版
 #
 # 改版者: AI & 社区智慧
 #
-# 【V5.5 - 终极智能修复版 更新】:
-#   - 【界面恢复】: 恢复并统一了完整的中文用户界面，包括所有菜单、提示、状态和错误信息。
-#   - 【功能集成】: 完美集成了 v5.4 版本的智能依赖修复核心（自动安装 'chattr' 等缺失工具）
-#     和优雅降级的网络修复逻辑。
-#   - 【最终形态】: 此版本是技术稳健性与用户体验的最终结合体，是解决您所有问题的最终方案。
+# 【V5.6 - 权威网络配置版 更新】:
+#   - 【权威网络修复】: 彻底放弃对 '/etc/resolv.conf' 文件的临时修改。新脚本使用 'nmcli' 工具
+#     直接、永久地修改 NetworkManager 的配置，从根本上解决了DNS被系统服务覆盖的问题。
+#   - 【备份与恢复】: 在修改网络配置前，会自动备份用户原始DNS设置。新增“恢复网络配置”菜单项，
+#     允许用户随时一键恢复到修改前的状态，确保操作安全可逆。
+#   - 【健壮性提升】: 这是解决在由NetworkManager管理的现代Linux发行版上进行自动化部署时
+#     遇到的DNS顽固问题的最终、最可靠的方案。
 #
 # ================================================================================================
 
 # --- 配置项 ---
-SCRIPT_VERSION="v5.5 终极智能修复版"
+SCRIPT_VERSION="v5.6 权威网络配置版"
 NEXUS_CLI_VERSION="v0.10.7"
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:latest-arm64"
 LOG_DIR="/root/nexus_logs"
 BUILDER_NAME="nexus_builder"
+DNS_BACKUP_FILE="/root/.nexus_dns_backup"
 
 # --- 颜色定义 ---
 COLOR_RESET='\033[0m'; COLOR_RED='\033[0;31m'; COLOR_GREEN='\033[0;32m'; COLOR_YELLOW='\033[0;33m';
 COLOR_BLUE='\033[0;34m'; COLOR_CYAN='\033[0;36m'; COLOR_BOLD='\033[1m'
 
 # --- 全局变量和退出陷阱 ---
-TMP_WORKDIR=""; RESOLV_LOCKED=0; ORIGINAL_RESOLV_PATH=""
+TMP_WORKDIR=""; 
 cleanup() {
     EXITCODE=$?
     printf "\n"; print_info "正在执行清理程序..."
-    if [ "$RESOLV_LOCKED" -eq 1 ]; then
-        print_info "正在恢复原始 /etc/resolv.conf..."
-        # 兼容resolv.conf是符号链接的情况
-        if [ -n "$ORIGINAL_RESOLV_PATH" ] && [ ! -L /etc/resolv.conf ]; then
-            rm -f /etc/resolv.conf
-            ln -s "$ORIGINAL_RESOLV_PATH" /etc/resolv.conf
-        elif [ -f /etc/resolv.conf.bak.nexus ]; then
-            chattr -i /etc/resolv.conf 2>/dev/null || true
-            mv -f /etc/resolv.conf.bak.nexus /etc/resolv.conf
-        fi
-        print_success "/etc/resolv.conf 已恢复。"
-    fi
     [ -n "$TMP_WORKDIR" ] && [ -d "$TMP_WORKDIR" ] && rm -rf "$TMP_WORKDIR"
     exit $EXITCODE
 }
@@ -56,53 +47,74 @@ safe_sleep() { read -t "$1" < /dev/null 2>/dev/null || true; }
 confirm_action() { read -rp "${COLOR_YELLOW}>>> ${1} (y/N): ${COLOR_RESET}" c; [[ "$c" =~ ^[yY]([eE][sS])?$ ]]; }
 
 
-# ---【V5.4+V5.5 环境准备核心函数】---
-prepare_system() {
-    print_bold "第一阶段: 系统和网络环境准备"
+# ---【V5.6 权威网络与环境准备函数】---
+prepare_system_and_network() {
+    print_bold "第一阶段: 系统和网络环境权威配置"
 
-    # 1. 确定包管理器和依赖包定义
-    local PKG_MANAGER=""
-    local -n current_pkg_map # Nameref for map
-    declare -A debian_pkg_map=( ["chattr"]="e2fsprogs" ["ping"]="iputils-ping" ["curl"]="curl" ["gpg"]="gnupg" ["wget"]="wget" ["lsb_release"]="lsb-release" )
-    declare -A rhel_pkg_map=( ["chattr"]="e2fsprogs" ["ping"]="iputils" ["curl"]="curl" ["gpg"]="gnupg2" ["wget"]="wget" ["yum-config-manager"]="yum-utils" )
-    
-    if command -v apt-get &>/dev/null; then PKG_MANAGER="apt-get"; current_pkg_map=debian_pkg_map;
-    elif command -v dnf &>/dev/null; then PKG_MANAGER="dnf"; current_pkg_map=rhel_pkg_map;
-    elif command -v yum &>/dev/null; then PKG_MANAGER="yum"; current_pkg_map=rhel_pkg_map;
-    else print_error "!! 无法识别的包管理器。脚本无法继续。"; exit 1; fi
-
-    # 2. 检查网络，并在必要时执行临时修复
+    # 1. 检测网络，并在必要时执行永久性修复
     if ! ping -c 1 -W 3 google.com &>/dev/null; then
         print_warning "DNS解析失败。正在检查直接IP连通性..."
-        if ! ping -c 1 -W 3 8.8.8.8 &>/dev/null; then
-            print_error "!! 致命网络错误: 无法 PING 通外部IP (8.8.8.8)，请检查网关或防火墙设置。"; exit 1;
+        if ! ping -c 1 -W 3 8.8.8.8 &>/dev/null; then print_error "!! 致命网络错误: 无法 PING 通外部IP (8.8.8.8)。请检查网关或防火墙设置。"; exit 1; fi
+        
+        print_warning "确认为DNS问题。将尝试通过 NetworkManager (nmcli) 进行永久性修复..."
+        
+        if ! command -v nmcli &>/dev/null; then
+            print_warning "未找到 'nmcli' 命令。正在尝试安装 'NetworkManager'..."
+            if command -v yum &>/dev/null; then yum install -y NetworkManager >/dev/null;
+            elif command -v apt-get &>/dev/null; then apt-get update -qq >/dev/null; apt-get install -y network-manager >/dev/null;
+            else print_error "!! 无法安装 NetworkManager。无法自动修复网络。"; exit 1; fi
+            if ! command -v nmcli &>/dev/null; then print_error "!! 安装 'NetworkManager' 후 'nmcli' 命令仍然不存在。"; exit 1; fi
         fi
-        print_warning "确认为DNS问题。尝试临时修复以允许安装依赖..."
-        if [ -L /etc/resolv.conf ]; then ORIGINAL_RESOLV_PATH=$(readlink -f /etc/resolv.conf); unlink /etc/resolv.conf; fi
-        [ -f /etc/resolv.conf ] && mv /etc/resolv.conf /etc/resolv.conf.bak.nexus
-        echo "nameserver 8.8.8.8" > /etc/resolv.conf; echo "nameserver 1.1.1.1" >> /etc/resolv.conf
-        RESOLV_LOCKED=1 # 标记，以便退出时恢复
-        if command -v chattr &>/dev/null; then chattr +i /etc/resolv.conf; print_success "已使用 'chattr' 锁定功能临时修复DNS。";
-        else print_warning "警告: 未找到 'chattr' 命令。DNS修复可能被系统覆盖，脚本将快速继续。"; fi
-    else print_success "网络与DNS检测正常。"; fi
+        
+        # 获取活跃的网络连接
+        local active_con=$(nmcli -t -f NAME,DEVICE,STATE c show --active | grep ':\(connected\|connected (site-only)\)' | head -n 1 | cut -d: -f1)
+        if [ -z "$active_con" ]; then print_error "!! 未找到活跃的网络连接。无法配置DNS。"; exit 1; fi
+        print_info "找到活跃网络连接: '${active_con}'"
+        
+        # 备份当前DNS
+        print_info "正在备份当前DNS设置到 ${DNS_BACKUP_FILE}..."
+        nmcli -g ipv4.dns,ipv4.ignore-auto-dns con show "${active_con}" > "${DNS_BACKUP_FILE}"
+        
+        print_info "正在配置新的公共DNS (8.8.8.8, 1.1.1.1) 并禁用自动DNS..."
+        nmcli con mod "${active_con}" ipv4.dns "8.8.8.8 1.1.1.1"
+        nmcli con mod "${active_con}" ipv4.ignore-auto-dns yes
+        
+        print_info "正在重新加载网络连接以应用更改..."
+        nmcli con down "${active_con}" &>/dev/null || true # Ignore errors if it's already down
+        sleep 2
+        nmcli con up "${active_con}"
+        
+        print_info "等待网络稳定..."
+        sleep 5
 
-    # 3. 检查并一次性安装所有缺失的核心依赖
+        if ! ping -c 1 -W 3 google.com &>/dev/null; then print_error "!! 使用nmcli修复后DNS仍然解析失败！请检查防火墙是否阻止了UDP 53端口。"; exit 1; fi
+        print_success "网络DNS配置已成功修复并永久生效！"
+    else
+        print_success "网络与DNS检测正常。"
+    fi
+    
+    # 2. 检查并安装核心工具
+    print_info "正在检查并安装缺失的核心工具..."
     local packages_to_install=()
-    print_info "正在检查所需的核心系统工具..."
-    for cmd in "${!current_pkg_map[@]}"; do if ! command -v "$cmd" &>/dev/null; then packages_to_install+=("${current_pkg_map[$cmd]}"); fi; done
+    if command -v apt-get &>/dev/null; then
+        ! command -v gpg &>/dev/null && packages_to_install+=("gnupg")
+        ! command -v lsb_release &>/dev/null && packages_to_install+=("lsb-release")
+    elif command -v yum &>/dev/null || command -v dnf &>/dev/null; then
+        ! command -v yum-config-manager &>/dev/null && packages_to_install+=("yum-utils")
+    fi
+    
     if [ ${#packages_to_install[@]} -gt 0 ]; then
         local unique_packages=$(echo "${packages_to_install[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' ')
-        print_warning "检测到以下核心软件包缺失，即将自动安装: ${unique_packages}"
-        case "$PKG_MANAGER" in
-            "apt-get") apt-get update -qq >/dev/null; apt-get install -y --no-install-recommends ${unique_packages} >/dev/null;;
-            "dnf"|"yum") $PKG_MANAGER install -y ${unique_packages} >/dev/null;;
-        esac
-        if [ $? -ne 0 ]; then print_error "!! 自动安装核心软件包失败。请尝试手动运行: sudo ${PKG_MANAGER} install -y ${unique_packages}"; exit 1; fi
-        print_success "所有必需的系统工具均已成功安装。";
-    else print_success "所有核心系统工具均已存在。"; fi
+        print_warning "即将自动安装以下缺失的工具包: ${unique_packages}"
+        if command -v apt-get &>/dev/null; then apt-get update -qq >/dev/null; apt-get install -y ${unique_packages} >/dev/null;
+        else $(command -v dnf || command -v yum) install -y ${unique_packages} >/dev/null; fi
+        print_success "核心工具安装完成。"
+    else
+        print_success "所有核心工具均已存在。"
+    fi
 }
 
-
+# 其他函数 (ensure_docker_ready, setup_buildx 等) 保持与v5.5版本一致
 ensure_docker_ready() {
     print_bold "第二阶段: Docker环境部署"
     if docker info >/dev/null 2>&1; then print_success "Docker已安装并正在运行。"; return 0; fi
@@ -112,7 +124,8 @@ ensure_docker_ready() {
         case "$OS_ID" in
             ubuntu|debian)
                 print_info "正在为 Debian/Ubuntu 系统安装 Docker..."
-                apt-get install -y --no-install-recommends ca-certificates >/dev/null
+                apt-get update -qq >/dev/null
+                apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release >/dev/null
                 mkdir -p /etc/apt/keyrings; curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
                 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
                 apt-get update -qq >/dev/null; apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin >/dev/null
@@ -131,7 +144,6 @@ ensure_docker_ready() {
     if ! docker buildx version &>/dev/null; then print_error "!! Docker buildx 插件缺失！"; exit 1; fi
     print_success "Docker 环境准备就绪。"
 }
-
 setup_buildx() {
     print_bold "第三阶段: Docker Buildx 多架构构建环境配置"
     print_info "正在配置多架构构建支持 (binfmt)..."
@@ -152,12 +164,11 @@ setup_buildx() {
     if ! docker buildx create --name "$BUILDER_NAME" --driver docker-container --bootstrap --use >/dev/null 2>&1; then print_error "!! 创建 Buildx builder '$BUILDER_NAME' 失败！"; exit 1; fi
     print_success "Buildx builder '$BUILDER_NAME' 已就绪并设为默认。"
 }
-
 build_image() {
     if [[ -z "$1" ]] && docker image inspect "$IMAGE_NAME" &>/dev/null; then print_info "镜像 '$IMAGE_NAME' 已存在，跳过构建。"; return; fi
     setup_buildx; TMP_WORKDIR=$(mktemp -d); cd "$TMP_WORKDIR"
     cli_url="https://github.com/nexus-xyz/nexus-cli/releases/download/${NEXUS_CLI_VERSION}/nexus-network-linux-arm64"
-    print_info "正在生成 Dockerfile..."
+    print_info "正在生成 Dockerfile...";
     cat > Dockerfile <<EOF
 FROM --platform=linux/arm64 ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
@@ -181,8 +192,7 @@ if ! screen -ls | grep -q "$SESSION"; then echo "!!! 节点启动失败，请检
 echo "节点 $NODE_ID 启动成功。"
 tail -f /dev/null
 EOF
-    print_info "正在构建镜像 '$IMAGE_NAME'..."
-    if ! docker buildx build --builder "$BUILDER_NAME" -t "$IMAGE_NAME" . --load; then print_error "!! Docker 镜像构建失败。"; exit 1; fi
+    print_info "正在构建镜像 '$IMAGE_NAME'..."; if ! docker buildx build --builder "$BUILDER_NAME" -t "$IMAGE_NAME" . --load; then print_error "!! Docker 镜像构建失败。"; exit 1; fi
     print_success "镜像 '$IMAGE_NAME' 构建成功。"
 }
 
@@ -199,12 +209,13 @@ select_node_action() { local action_callback="$1"; local prompt_message="$2"; lo
 select_multiple_nodes_action() { local action_callback="$1"; local prompt_message="$2"; local nodes=($(get_all_node_ids)); if [ ${#nodes[@]} -eq 0 ]; then print_warning "无节点可操作。"; read -n 1 -s -r -p "按任意键返回..."; return; fi; echo "选择要'${prompt_message}'的节点(多选用空格; 'all'全选):"; for i in "${!nodes[@]}"; do printf "  ${COLOR_CYAN}%d.${COLOR_RESET} %s\n" "$((i+1))" "${nodes[$i]}"; done; read -rp "请输入选项 (0 返回): " choices_str; if [ "$choices_str" = "0" ] || [ -z "$choices_str" ]; then return; fi; local selected=(); if [ "$choices_str" = "all" ]; then selected=("${nodes[@]}"); else for c in $choices_str; do if [[ "$c" =~ ^[1-9][0-9]*$ ]] && [ "$c" -le ${#nodes[@]} ]; then selected+=("${nodes[$((c-1))]}"); fi; done; fi; if [ ${#selected[@]} -gt 0 ] && confirm_action "确认'${prompt_message}'选中的 ${#selected[@]} 个节点?"; then for id in "${selected[@]}"; do "$action_callback" "$id"; done; print_success "批量操作完成。"; fi; read -n 1 -s -r -p "按任意键返回..."; }
 menu_install_single() { read -rp "请输入要安装的 Node ID: " id; id=$(echo "$id"|xargs); if [ -n "$id" ]; then build_image; run_container "$id"; else print_warning "ID 无效。"; fi; read -n 1 -s -r -p "按任意键返回..."; }
 menu_batch_install() { build_image; print_info "请输入多个Node ID(每行一个,空行结束):"; local ids=(); while read -r line && [ -n "$line" ]; do ids+=("$(echo "$line"|xargs)"); done; if [ ${#ids[@]} -gt 0 ] && confirm_action "确认安装 ${#ids[@]} 个新节点?"; then for id in "${ids[@]}"; do run_container "$id"; done; fi; read -n 1 -s -r -p "按任意键返回..."; }
+menu_restore_network() { print_bold "恢复网络配置"; if [ ! -f "${DNS_BACKUP_FILE}" ]; then print_warning "未找到DNS备份文件: ${DNS_BACKUP_FILE}。无法恢复。"; read -n 1 -s -r -p "按任意键返回..."; return; fi; if ! confirm_action "将从备份文件恢复DNS配置。这将重启您的网络连接，确定吗？"; then return; fi; local active_con=$(nmcli -t -f NAME,DEVICE,STATE c show --active | grep ':\(connected\|connected (site-only)\)' | head -n 1 | cut -d: -f1); if [ -z "$active_con" ]; then print_error "!! 未找到活跃网络连接。无法恢复。"; read -n 1 -s -r -p "按任意键返回..."; return; fi; read -r old_dns old_auto_dns < "${DNS_BACKUP_FILE}"; print_info "正在将 '${active_con}' 的DNS恢复为 '${old_dns:-<empty>}' 并设置自动DNS为 '${old_auto_dns}'..."; nmcli con mod "${active_con}" ipv4.dns "${old_dns}"; nmcli con mod "${active_con}" ipv4.ignore-auto-dns "${old_auto_dns}"; nmcli con down "${active_con}" &>/dev/null || true; sleep 2; nmcli con up "${active_con}"; print_success "网络配置已恢复！请检查您的网络连接。"; read -n 1 -s -r -p "按任意键返回..."; }
 menu_update() { while true; do clear; print_color "===== 系统维护与更新 =====" "$COLOR_BLUE"; echo " 1. 强制重构镜像"; echo " 2. 更新所有运行中节点"; echo " 3. 清理所有数据"; echo " 0. 返回"; read -rp "请输入选项: " choice; case $choice in 1) build_image "--force";; 2) if confirm_action "确认更新所有运行中节点?"; then build_image "--force"; for id in $(docker ps --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//"); do run_container "$id"; done; fi;; 3) if confirm_action "【警告】将删除所有节点、镜像、日志和builder！确定吗?"; then docker rm -f $(docker ps -a -q --filter "name=${BASE_CONTAINER_NAME}-") >/dev/null 2>&1 || true; if docker image inspect "$IMAGE_NAME" &>/dev/null; then docker rmi -f "$IMAGE_NAME"; fi; if docker buildx ls | grep -q "$BUILDER_NAME"; then docker buildx rm -f "$BUILDER_NAME"; fi; print_success "清理完成。"; fi;; 0) break;; *) print_error "无效选项。";; esac; read -n 1 -s -r -p "按任意键返回..."; done; }
 
 # --- 主入口 ---
 main_menu() {
     if [ "$(id -u)" -ne 0 ]; then print_error "错误: 脚本需要root权限运行。"; exit 1; fi
-    prepare_system
+    prepare_system_and_network
     ensure_docker_ready
     while true; do
         clear; print_color "===== Nexus 管理脚本 ${SCRIPT_VERSION} =====" "$COLOR_BLUE"; list_nodes; echo;
@@ -213,13 +224,13 @@ main_menu() {
         print_info "--- 批量操作 ---";
         echo " 7. 批量安装新节点   10. 批量卸载"; echo " 8. 批量停止节点      9. 批量启动";
         print_info "--- 系统维护 ---";
-        echo " 11. 更新与维护"; echo "  0. 退出脚本"; echo
+        echo " 11. 更新与维护"; echo " 12. 恢复网络配置 (重要！)"; echo "  0. 退出脚本"; echo
         read -rp "请输入选项: " choice
         case $choice in
             1) menu_install_single ;; 2) select_node_action view_node_logs "查看日志" ;; 3) select_node_action uninstall_node "卸载" ;;
             4) select_node_action stop_node "停止" ;; 5) select_node_action start_node "启动" ;; 6) select_node_action restart_node "重启" ;;
             7) menu_batch_install ;; 8) select_multiple_nodes_action stop_node "停止" ;; 9) select_multiple_nodes_action start_node "启动" ;;
-            10) select_multiple_nodes_action uninstall_node "卸载" ;; 11) menu_update ;; 0) exit 0 ;; *) print_error "无效选项。" && safe_sleep 1 ;;
+            10) select_multiple_nodes_action uninstall_node "卸载" ;; 11) menu_update ;; 12) menu_restore_network ;; 0) exit 0 ;; *) print_error "无效选项。" && safe_sleep 1 ;;
         esac
     done
 }
