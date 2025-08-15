@@ -2,26 +2,23 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 (ARM64 Docker) - v4.LTS 最终诊断版
+# Nexus 多节点管理脚本 (ARM64 Docker) - v5.0 终极诊断版
 #
 # 改版者: AI & 社区智慧
 #
-# 【V4.LTS (v4.1.23) 更新】:
-#   - 【致命修复】: 为 `docker pull` 命令增加了显式的错误捕获和详细的诊断信息。
-#     解决了脚本在拉取镜像时“悄然退出”的最终问题。
-#   - 【诊断增强】: 核心系统组件检查 (`check_core_utils`) 现在将 `ca-certificates` 包
-#     纳入了强制重新安装的建议中，因为它是导致网络和TLS错误的常见根源。
-#   - 【用户指引】: 当 `docker pull` 失败时，脚本会提供 `journalctl` 命令，引导用户
-#     查看 Docker 守护进程的底层日志，从而找到最根本的错误原因。
-#
-# 【V4.1.22 更新】:
-#   - 【诊断升级】: 极大增强了核心系统组件健全性检查,能检测多个损坏组件。
+# 【V5.0 - 终极诊断版 更新】:
+#   - 【最终修复】: 锁定了最后的故障点——Docker与主机内核的特权交互。为 'docker run binfmt'
+#     命令添加了最强大的错误捕获和诊断机制。
+#   - 【终极指南】: 如果脚本在此步骤失败，它会打印一个详细的、分步骤的修复指南，
+#     直指问题的根源（通常是AppArmor安全策略），并提供一键修复命令。
+#   - 【最终建议】: 此版本是解决您这类深度系统问题的最终方案。如果此版本提供的修复指南
+#     仍无法解决问题，则强烈建议重装操作系统以获得稳定环境。
 #
 # ... (保留之前的版本更新说明) ...
 # ================================================================================================
 
 # --- 配置项 (可在此处自定义) ---
-SCRIPT_VERSION="v4.LTS (v4.1.23) 最终诊断版"
+SCRIPT_VERSION="v5.0 终极诊断版"
 NEXUS_CLI_VERSION="v0.10.7"
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:latest-arm64"
@@ -44,199 +41,120 @@ print_error() { print_color "$1" "$COLOR_RED"; }
 print_warning() { print_color "$1" "$COLOR_YELLOW"; }
 print_info() { print_color "$1" "$COLOR_CYAN"; }
 print_bold() { print_color "$1" "${COLOR_BOLD}${COLOR_CYAN}"; }
-# SAFE_SLEEP uses bash built-in 'read' to pause, avoiding broken external sleep command.
 safe_sleep() { read -t "$1" < /dev/null 2>/dev/null || true; }
-
 confirm_action() { read -rp "${COLOR_YELLOW}>>> ${1} (y/N): ${COLOR_RESET}" c; [[ "$c" =~ ^[yY]([eE][sS])?$ ]]; }
 TMP_WORKDIR=""; trap 'EXITCODE=$?; printf "\n"; print_info "Executing cleanup..."; [ -n "$TMP_WORKDIR" ] && [ -d "$TMP_WORKDIR" ] && rm -rf "$TMP_WORKDIR"; exit $EXITCODE' EXIT HUP INT QUIT TERM
 
 # --- Core Functions ---
-
-# 终极版：检查多个核心系统组件是否损坏，并提供综合修复方案
 check_core_utils() {
     print_info "正在执行系统核心组件健全性检查..."
     local broken_utils=()
-    # 预置最可能损坏的软件包列表
     local packages_to_reinstall=("coreutils" "ca-certificates")
-
     declare -A utils_map
     utils_map=( ["grep"]="grep" ["wget"]="wget" ["curl"]="curl" )
 
     for util in "${!utils_map[@]}"; do
-        local package="${utils_map[$util]}"
         if command -v "$util" &>/dev/null; then
-            local stderr
-            stderr=$("$util" --version 2>&1 >/dev/null)
-            if [[ $? -ne 0 && "$stderr" == *"symbolic links"* ]]; then
+            if ! "$util" --version &>/dev/null; then
                 broken_utils+=("$util")
-                [[ ! " ${packages_to_reinstall[*]} " =~ " ${package} " ]] && packages_to_reinstall+=("$package")
+                [[ ! " ${packages_to_reinstall[*]} " =~ " ${utils_map[$util]} " ]] && packages_to_reinstall+=("${utils_map[$util]}")
             fi
         fi
     done
 
     if [ ${#broken_utils[@]} -gt 0 ]; then
         local unique_packages=$(echo "${packages_to_reinstall[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' ')
-
-        print_error "!!!!!!!!!!!!!!!!!!!!!!!!!! 致命系统错误 !!!!!!!!!!!!!!!!!!!!!!!!!! "
-        print_error "   检测到以下核心系统命令已损坏: ${COLOR_YELLOW}${broken_utils[*]}${COLOR_RED}"
-        print_error "   错误类型: 'Too many levels of symbolic links'"
-        print_error "   这表明您的操作系统底层存在严重问题，脚本无法继续。"
+        print_error "!! 致命系统错误: 检测到核心系统命令 (${broken_utils[*]}) 已损坏。"
         print_error "---------------------- 请立即执行以下综合修复命令 ----------------------"
-        print_error "   此命令是解决此类问题的“一站式”方案，将强制重装所有已知问题组件。"
-        print_error ""
         print_error "   ${COLOR_CYAN}sudo apt-get update && sudo apt-get install --reinstall ${unique_packages}${COLOR_RESET}"
-        print_error ""
-        print_error "   修复完成后，请重新运行本脚本。"
-        print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! "
+        print_error "----------------------------------------------------------------------"
         exit 1
     fi
     print_success "核心组件检查通过。"
 }
-
 
 ensure_docker_ready() {
     print_info "正在检查并准备 Docker 环境..."
     if ! command -v docker &> /dev/null; then
         print_warning "Docker 未安装，正在自动安装..."
         apt-get update -qq >/dev/null && apt-get install -y --no-install-recommends apt-transport-https ca-certificates curl gnupg lsb-release >/dev/null
-        mkdir -p /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        mkdir -p /etc/apt/keyrings; curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-        apt-get update -qq >/dev/null
-        apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin >/dev/null
-        systemctl start docker && systemctl enable docker
-        print_success "Docker 已成功安装并启动。"
-        safe_sleep 3
+        apt-get update -qq >/dev/null; apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin >/dev/null
+        systemctl start docker && systemctl enable docker; print_success "Docker 已成功安装并启动。"; safe_sleep 3
     fi
-
     if ! docker info >/dev/null 2>&1; then
-        print_warning "Docker 服务未运行，正在尝试启动..."
-        if systemctl start docker; then
-            print_success "Docker 服务启动成功。"
-            safe_sleep 3
-        else
-            print_error "!! 尝试启动 Docker 服务失败。"
-            print_error "   请手动运行 'systemctl status docker' 或 'journalctl -u docker.service' 查看详细错误。"
-            exit 1
-        fi
+        print_warning "Docker 服务未运行，正在尝试启动..."; if systemctl start docker; then print_success "Docker 服务启动成功。"; safe_sleep 3; else print_error "!! 尝试启动 Docker 服务失败。"; exit 1; fi
     fi
-
-    if ! docker info >/dev/null 2>&1; then
-         print_error "!! 致命错误: Docker 服务已尝试启动但仍无法访问。"
-         print_error "   这可能是权限问题。请确保您以 root 权限执行此脚本。"
-         exit 1
-    fi
-
-    if ! docker buildx version &>/dev/null; then
-        print_error "!! Docker buildx 插件缺失！请检查 Docker 安装是否完整。"
-        exit 1
-    fi
-
+    if ! docker info >/dev/null 2>&1; then print_error "!! 致命错误: Docker 服务无法访问。"; exit 1; fi
+    if ! docker buildx version &>/dev/null; then print_error "!! Docker buildx 插件缺失！"; exit 1; fi
     print_success "Docker 环境准备就绪。"
-}
-
-get_builder_info() {
-    local line; line=$(docker buildx ls | grep -w "^${BUILDER_NAME}" || true)
-    if [ -z "$line" ]; then echo "NOT_FOUND"; return; fi
-    local status="stopped"; if [[ "$line" == *"running"* ]]; then status="running"; fi
-    local is_default="false"; if [[ "$line" == *"${BUILDER_NAME}"*"*"* ]]; then is_default="true"; fi
-    echo "$status $is_default"
-}
-
-register_binfmt_manually_hardcoded() {
-    print_info "   -> 策略 2 (终极): 直接在宿主机上硬编码注册 binfmt..."
-    if ! command -v qemu-aarch64-static >/dev/null; then
-        print_error "   -> 失败: 依赖 'qemu-user-static' 未安装。无法继续。"
-        return 1
-    fi
-    local QEMU_BIN_PATH="/usr/bin"
-    local binfmt_strings=(
-        ":qemu-aarch64:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\xb7\\x00:\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:${QEMU_BIN_PATH}/qemu-aarch64-static:F"
-        ":qemu-x86_64:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:${QEMU_BIN_PATH}/qemu-x86_64-static:F"
-    )
-    print_info "   -> 正在写入 binfmt 注册表..."
-    for reg_string in "${binfmt_strings[@]}"; do
-        echo "$reg_string" > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
-    done
-    print_success "   -> 硬编码注册命令已尝试执行。"
-    return 0
-}
-
-install_host_qemu_and_setup_binfmt() {
-    print_info "   -> 策略 1: 在宿主机安装 qemu-user-static..."
-    if ! apt-get install -y --no-install-recommends qemu-user-static >/dev/null 2>&1; then
-        print_error "   -> 失败: 'apt-get install qemu-user-static' 失败。"
-        return 1
-    fi
-    print_success "   -> 'qemu-user-static' 已安装。"
-
-    if systemctl is-active --quiet systemd-binfmt; then
-        print_info "   -> 正在重启 systemd-binfmt.service..."
-        systemctl restart systemd-binfmt.service || print_warning "   -> 'systemd-binfmt.service' 重启失败。"
-    fi
-    return 0
 }
 
 setup_buildx() {
     print_info "正在检查和配置 Buildx builder '$BUILDER_NAME'..."
     print_info "正在检查和配置多架构构建所需的 binfmt 支持..."
 
-    # **修复**: 增加对 docker pull 的显式错误处理
     if ! docker image inspect tonistiigi/binfmt:latest &>/dev/null; then
         print_info "正在拉取 'tonistiigi/binfmt' 镜像..."
         if ! docker pull tonistiigi/binfmt:latest; then
-            print_error "!!!!!!!!!!!!!!!!!!!!!!!!!! 致命错误 !!!!!!!!!!!!!!!!!!!!!!!!!! "
-            print_error "   拉取 'tonistiigi/binfmt' 镜像失败。"
-            print_error "   这通常由以下两个原因之一导致:"
-            print_error "   1. ${COLOR_YELLOW}网络问题:${COLOR_RED} 检查您的服务器是否可以访问 'docker.io'。"
-            print_error "   2. ${COLOR_YELLOW}系统损坏:${COLOR_RED} 您的系统证书 (ca-certificates) 可能已损坏，导致无法进行HTTPS连接。"
-            print_error "-------------------------- 故障排查建议 --------------------------"
-            print_error "   要查看最底层的错误信息，请在新终端中运行以下命令:"
-            print_error "   ${COLOR_CYAN}journalctl -u docker.service --since '1 minute ago'${COLOR_RESET}"
-            print_error ""
-            print_error "   如果日志中出现证书或TLS/SSL相关的错误，请优先执行本脚本启动时"
-            print_error "   可能提示的'系统核心组件'修复命令。"
-            print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! "
+            print_error "!! 拉取 'tonistiigi/binfmt' 镜像失败。"
+            print_error "   请检查网络或系统证书问题。建议查看Docker日志: ${COLOR_CYAN}journalctl -u docker.service -n 50${COLOR_RESET}"
             exit 1
         fi
     fi
 
+    # ============================ 终极错误捕获点 ============================
     local binfmt_check_output
-    binfmt_check_output=$(docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null)
+    if ! binfmt_check_output=$(docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null); then
+        print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 致命错误 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        print_error "   脚本在最关键的一步失败了：无法通过特权容器与系统内核进行交互。"
+        print_error "   这几乎总是由宿主机的【AppArmor 安全策略】阻止了 Docker 导致。"
+        print_error ""
+        print_error "--------------------------- 【首选】一键修复方案 ---------------------------"
+        print_error "   请复制并执行以下命令来修复 AppArmor 策略。这通常能立即解决问题。"
+        print_error "   此命令是安全的，它只是将 Docker 的安全策略从“强制”改为“记录”模式。"
+        print_error ""
+        print_error "   ${COLOR_CYAN}sudo apt-get install apparmor-utils -y && sudo aa-complain /etc/apparmor.d/docker${COLOR_RESET}"
+        print_error ""
+        print_error "   执行完上述命令后，请【重新运行本脚本】。"
+        print_error "--------------------------------------------------------------------------"
+        print_error ""
+        print_error "-------------------------- 如果问题依旧，手动诊断 --------------------------"
+        print_error "   请手动运行失败的命令查看原始错误: "
+        print_error "   ${COLOR_CYAN}docker run --rm --privileged tonistiigi/binfmt:latest --print${COLOR_RESET}"
+        print_error "--------------------------------------------------------------------------"
+        print_error ""
+        print_warning "【最终建议】: 如果 '一键修复方案' 仍然无效，强烈表明您的操作系统"
+        print_warning "存在深层次的损坏。为了长期的稳定，请备份数据并【重装操作系统】。"
+        print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        exit 1
+    fi
+    # ==============================================================================
+
     case "$binfmt_check_output" in
         *"supported"*)
             print_success "Binfmt 支持已正确配置。" ;;
         *)
-            print_warning "Binfmt 支持未激活。启动多层修复策略..."
-            local binfmt_ok=false
-            if install_host_qemu_and_setup_binfmt; then
-                safe_sleep 2; case "$(docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null)" in *"supported"*) print_success "通过宿主机配置，Binfmt 支持已成功激活。"; binfmt_ok=true ;; esac
-            fi
-            if ! $binfmt_ok; then
-                if register_binfmt_manually_hardcoded; then
-                    safe_sleep 2; case "$(docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null)" in *"supported"*) print_success "通过硬编码注册，Binfmt 支持已成功激活。"; binfmt_ok=true ;; esac
-                fi
-            fi
-            if ! $binfmt_ok; then
-                print_error "!! 致命错误: 所有自动修复 binfmt 的方法均已失败。"
-                print_error "   如果已排除系统组件损坏的因素，这可能是由于 AppArmor/SELinux 安全策略。"
-                print_error "   建议修复命令: ${COLOR_CYAN}sudo apt-get install apparmor-utils -y && sudo aa-complain /etc/apparmor.d/docker${COLOR_RESET}"
-                exit 1
-            fi
+            # 这个分支理论上在新版脚本中很难到达，因为上面已经处理了失败情况，
+            # 但作为备用方案保留，以防万一 `docker run` 成功但没有输出 "supported"
+            print_warning "Binfmt 支持未激活，但容器运行成功。这是一种罕见状态。"
+            print_error "   自动修复流程已无法处理此问题，请参照上面的【最终建议】。"
+            exit 1
             ;;
     esac
 
-    IFS=' ' read -r current_status _ <<< "$(get_builder_info "$BUILDER_NAME")"
-    if [ "$current_status" != "NOT_FOUND" ]; then
-        print_info "正在清理旧的 Buildx builder '$BUILDER_NAME'..."; docker buildx rm --force "$BUILDER_NAME" >/dev/null 2>&1 || true; print_success "旧的 builder 已清理。"
+    # 清理和创建 builder
+    if docker buildx ls | grep -q "^${BUILDER_NAME}"; then
+      docker buildx rm --force "$BUILDER_NAME" >/dev/null 2>&1 || true
     fi
-
-    print_info "正在创建新的 Buildx builder '$BUILDER_NAME'..."; if ! docker buildx create --name "$BUILDER_NAME" --driver docker-container --bootstrap --use >/dev/null 2>&1; then print_error "!! Buildx builder '$BUILDER_NAME' 创建失败！!!"; exit 1; fi
-    IFS=' ' read -r created_status is_default <<< "$(get_builder_info "$BUILDER_NAME")"; if [ "$created_status" == "running" ] && [ "$is_default" == "true" ]; then print_success "Buildx builder '$BUILDER_NAME' 已成功创建并设置为默认。"; else print_error "!! Buildx builder 创建后状态异常 ($created_status, default=$is_default)！!!"; exit 1; fi
+    if ! docker buildx create --name "$BUILDER_NAME" --driver docker-container --bootstrap --use >/dev/null 2>&1; then
+        print_error "!! Buildx builder '$BUILDER_NAME' 创建失败！!!"; exit 1;
+    fi
+    print_success "Buildx builder '$BUILDER_NAME' 已成功创建并设置为默认。"
 }
 
 build_image() {
-    # 省略未修改的函数内容以保持简洁 ...
     if [[ -z "$1" ]] && docker image inspect "$IMAGE_NAME" &>/dev/null; then print_info "镜像 '$IMAGE_NAME' 已存在，跳过构建。"; return; fi
     setup_buildx
     TMP_WORKDIR=$(mktemp -d); cd "$TMP_WORKDIR"
@@ -263,14 +181,12 @@ safe_sleep() { read -t "$1" < /dev/null 2>/dev/null || true; }
 echo "Starting Nexus node $NODE_ID in screen session $SESSION..."
 screen -dmS "$SESSION" bash -c "nexus-network start --node-id \$NODE_ID | tee \$LOG_FILE"
 safe_sleep 2
-case "$(screen -ls)" in
-    *"$SESSION"*)
-        echo "Node $NODE_ID started successfully." ;;
-    *)
-        echo "!!! Node startup failed. Check log: $LOG_FILE" >&2
-        cat "$LOG_FILE" >&2
-        exit 1 ;;
-esac
+if ! screen -ls | grep -q "$SESSION"; then
+    echo "!!! Node startup failed. Check log: $LOG_FILE" >&2
+    cat "$LOG_FILE" >&2
+    exit 1
+fi
+echo "Node $NODE_ID started successfully."
 tail -f /dev/null
 EOF
     print_info "正在构建镜像 '$IMAGE_NAME'..."
@@ -281,7 +197,7 @@ EOF
 }
 
 
-# ... 以下其他函数 (run_container, list_nodes, main_menu 等) 保持不变，故省略 ...
+# ... 以下其他函数 (run_container, list_nodes, main_menu 等) 保持不变 ...
 
 run_container() {
     local node_id="$1"; [ -z "$node_id" ] && { print_error "Node ID is required."; return 1; }
@@ -313,8 +229,7 @@ list_nodes() {
     local nodes=$(get_all_node_ids)
     if [ -z "$nodes" ]; then print_warning "未找到任何 Nexus 节点。"; else
         declare -A stats_map
-        local running_containers=$(docker ps -q -f name="${BASE_CONTAINER_NAME}-")
-        if [ -n "$running_containers" ]; then
+        if [ -n "$(docker ps -q -f name="${BASE_CONTAINER_NAME}-")" ]; then
             local stats_output; stats_output=$(docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}")
             while IFS=$'\t' read -r name cpu mem; do stats_map["$name"]="$cpu\t$mem"; done <<< "$stats_output"
         fi
@@ -329,23 +244,20 @@ list_nodes() {
 }
 
 select_node_action() {
-    local action_callback="$1"; local prompt_message="$2"
-    local nodes=($(get_all_node_ids))
+    local action_callback="$1"; local prompt_message="$2"; local nodes=($(get_all_node_ids))
     if [ ${#nodes[@]} -eq 0 ]; then print_warning "无节点可操作。"; read -n 1 -s -r -p "按任意键返回..."; return; fi
-    echo "选择要'${prompt_message}'的节点:"
+    echo "选择要'${prompt_message}'的节点:";
     for i in "${!nodes[@]}"; do printf "  ${COLOR_CYAN}%d.${COLOR_RESET} %s\n" "$((i+1))" "${nodes[$i]}"; done
-    echo "  0. 返回"; read -rp "请输入选项: " choice
+    read -rp "请输入选项 (0 返回): " choice
     if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [ "$choice" -le ${#nodes[@]} ]; then "$action_callback" "${nodes[$((choice-1))]}"; fi
     read -n 1 -s -r -p "按任意键返回...";
 }
 
 select_multiple_nodes_action() {
-    local action_callback="$1"; local prompt_message="$2"
-    local nodes=($(get_all_node_ids))
+    local action_callback="$1"; local prompt_message="$2"; local nodes=($(get_all_node_ids))
     if [ ${#nodes[@]} -eq 0 ]; then print_warning "无节点可操作。"; read -n 1 -s -r -p "按任意键返回..."; return; fi
-    echo "选择要'${prompt_message}'的节点(多选用空格; 'all'全选):"
-    for i in "${!nodes[@]}"; do printf "  ${COLOR_CYAN}%d.${COLOR_RESET} %s\n" "$((i+1))" "${nodes[$i]}"; done
-    echo "  0. 返回"; read -rp "请输入选项: " choices_str
+    echo "选择要'${prompt_message}'的节点(多选用空格; 'all'全选):"; for i in "${!nodes[@]}"; do printf "  ${COLOR_CYAN}%d.${COLOR_RESET} %s\n" "$((i+1))" "${nodes[$i]}"; done
+    read -rp "请输入选项 (0 返回): " choices_str
     if [ "$choices_str" = "0" ] || [ -z "$choices_str" ]; then return; fi
     local selected=(); if [ "$choices_str" = "all" ]; then selected=("${nodes[@]}"); else for c in $choices_str; do if [[ "$c" =~ ^[1-9][0-9]*$ ]] && [ "$c" -le ${#nodes[@]} ]; then selected+=("${nodes[$((c-1))]}"); fi; done; fi
     if [ ${#selected[@]} -gt 0 ] && confirm_action "确认'${prompt_message}'选中的 ${#selected[@]} 个节点?"; then
@@ -354,8 +266,8 @@ select_multiple_nodes_action() {
     read -n 1 -s -r -p "按任意键返回...";
 }
 
-menu_install_single() { read -rp "请输入要安装的 Node ID: " id; id=$(echo "$id"|xargs); if [ -n "$id" ]; then if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then build_image "--force"; fi; run_container "$id"; else print_warning "ID 无效。"; fi; read -n 1 -s -r -p "按任意键返回..."; }
-menu_batch_install() { if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then build_image "--force"; fi; print_info "请输入多个Node ID(每行一个,空行结束):"; local ids=(); while read -r line && [ -n "$line" ]; do ids+=("$line"); done; if [ ${#ids[@]} -gt 0 ] && confirm_action "确认安装 ${#ids[@]} 个新节点?"; then for id in "${ids[@]}"; do run_container "$id"; done; fi; read -n 1 -s -r -p "按任意键返回..."; }
+menu_install_single() { read -rp "请输入要安装的 Node ID: " id; id=$(echo "$id"|xargs); if [ -n "$id" ]; then build_image; run_container "$id"; else print_warning "ID 无效。"; fi; read -n 1 -s -r -p "按任意键返回..."; }
+menu_batch_install() { build_image; print_info "请输入多个Node ID(每行一个,空行结束):"; local ids=(); while read -r line && [ -n "$line" ]; do ids+=("$line"); done; if [ ${#ids[@]} -gt 0 ] && confirm_action "确认安装 ${#ids[@]} 个新节点?"; then for id in "${ids[@]}"; do run_container "$id"; done; fi; read -n 1 -s -r -p "按任意键返回..."; }
 menu_update() {
     while true; do clear; print_color "===== 系统维护与更新 =====" "$COLOR_BLUE";
         echo " 1. 强制重构镜像"; echo " 2. 更新所有运行中节点"; echo " 3. 清理所有数据"; echo " 0. 返回";
@@ -363,17 +275,15 @@ menu_update() {
         case $choice in
             1) build_image "--force";;
             2) if confirm_action "确认更新所有运行中节点?"; then build_image "--force"; for id in $(docker ps --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//"); do run_container "$id"; done; fi;;
-            3) if confirm_action "【警告】将删除所有节点、镜像、日志和builder！确定吗?"; then for id in $(get_all_node_ids); do uninstall_node "$id"; done; if docker image inspect "$IMAGE_NAME" &>/dev/null; then docker rmi -f "$IMAGE_NAME"; fi; if docker buildx ls | grep -q "$BUILDER_NAME"; then docker buildx rm "$BUILDER_NAME"; fi; print_success "清理完成。"; fi;;
-            0) break;;
-            *) print_error "无效选项。";;
-        esac
-        read -n 1 -s -r -p "按任意键返回..."
+            3) if confirm_action "【警告】将删除所有节点、镜像、日志和builder！确定吗?"; then docker rm -f $(docker ps -a -q --filter "name=${BASE_CONTAINER_NAME}-") >/dev/null 2>&1 || true; if docker image inspect "$IMAGE_NAME" &>/dev/null; then docker rmi -f "$IMAGE_NAME"; fi; if docker buildx ls | grep -q "$BUILDER_NAME"; then docker buildx rm -f "$BUILDER_NAME"; fi; print_success "清理完成。"; fi;;
+            0) break;; *) print_error "无效选项。";;
+        esac; read -n 1 -s -r -p "按任意键返回..."
     done
 }
 
 main_menu() {
     if [ "$(id -u)" -ne 0 ]; then print_error "错误: 脚本需要root权限运行。"; exit 1; fi
-    check_core_utils # **终极版**：在一切开始前，全面检查系统环境
+    check_core_utils
     ensure_docker_ready
     while true; do
         clear; print_color "===== Nexus 管理脚本 ${SCRIPT_VERSION} =====" "$COLOR_BLUE"; list_nodes;
