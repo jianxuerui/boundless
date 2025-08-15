@@ -151,64 +151,84 @@ check_docker() {
     fi
 }
 
-# --- SETUP BUILDX - EXTREME ROBUSTNESS FOR CREATE FAILURES ---
+# --- SETUP BUILDX - EXTREME ROBUSTNESS FOR CREATE FAILURES (此函数已被修改和增强) ---
 setup_buildx() {
     print_info "正在检查和配置 Buildx builder '$BUILDER_NAME'..."
 
-    # First, aggressively try to remove any existing builder with the same name.
-    # This bypasses the "existing instance" error by force-cleaning.
-    if docker buildx ls | grep -q "^${BUILDER_NAME}\s"; then
-        print_warning "检测到 Buildx builder '$BUILDER_NAME' 已存在。"
-        print_info "执行强制清理：尝试移除 Buildx builder '$BUILDER_NAME'..."
-        # This is the core change: attempt to remove, ignore specific errors, and re-verify existence.
-        if ! docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1; then
-            # If 'rm' fails, it's a significant problem. Log and warn loudly.
-            print_warning "Buildx builder '$BUILDER_NAME' 移除命令执行失败。"
-            print_warning "    这可能是由于 Builder 处于损坏状态。"
-            print_warning "    请检查 'docker buildx ls' 的输出，并考虑手动清理："
-            print_warning "    ${COLOR_CYAN}sudo docker buildx rm ${BUILDER_NAME}${COLOR_RESET} (如果需要，强制加上 --force)"
+    # 1. 【核心优化】确保 binfmt 支持，这是多架构构建的基石，且应在创建 builder 前完成。
+    print_info "正在检查和配置多架构构建所需的 binfmt 支持..."
+    
+    # 第一次检查 binfmt 是否已启用
+    if docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null | grep -q "supported"; then
+        print_success "Binfmt 支持已正确配置，跳过安装。"
+    else
+        print_warning "Binfmt 支持未被确认为已激活状态。尝试安装或更新 'tonistiigi/binfmt' 映像以确保支持..."
+        # 尝试安装 binfmt
+        if ! docker run --rm --privileged tonistiigi/binfmt:latest --install all >/dev/null 2>&1; then
+            print_warning "首次执行 binfmt 安装命令可能遇到问题，尝试再次执行..."
+            if ! docker run --rm --privileged tonistiigi/binfmt:latest --install all >/dev/null 2>&1; then
+                print_error "!! 致命错误: binfmt support 安装失败 !! "
+                print_error "   这对于多架构构建是极其重要的前置条件，无法继续。\n"
+                print_error "   请确保您的系统内核支持 binfmt_misc (您可以通过 ${COLOR_CYAN}lsmod | grep binfmt_misc${COLOR_RESET} 查看)。"
+                print_error "   您还可以尝试手动运行：${COLOR_CYAN}sudo docker run --rm --privileged tonistiigi/binfmt:latest --install all${COLOR_RESET} "
+                exit 1 # Binfmt 安装失败是硬伤，必须退出
+            fi
         fi
-        sleep 1 # Pause to let Docker Daemon process removal.
         
-        # Re-check after removal attempt. If still there, it's a showstopper.
+        sleep 2 # 给系统一些时间来注册 binfmt 的更改
+        
+        # 再次确认 binfmt 是否已成功激活
+        if ! docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null | grep -q "supported"; then
+            print_error "!! 严重警告: Binfmt 支持安装后仍未被确认为 'supported' 状态。多架构构建可能仍会失败，请检查 Docker 日志或手动诊断。!!"
+        else
+            print_success "Binfmt 支持已成功激活。"
+        fi
+    fi
+
+    # 2. 【核心优化】主动移除现有 builder，并在必要时进行强制移除。
+    local current_builder_status=""
+    current_builder_status=$(docker buildx ls | grep -w "^${BUILDER_NAME}")
+    
+    if [ -n "$current_builder_status" ]; then
+        print_warning "检测到 Buildx builder '$BUILDER_NAME' 已存在。"
+        print_info "其当前状态: $(echo "$current_builder_status" | awk '{print $NF}')" # 打印当前 builder 的状态 (Running/Stopped etc.)
+        
+        print_info "执行强制清理：尝试移除 Buildx builder '$BUILDER_NAME'..."
+        # 第一次尝试正常移除
+        if ! docker buildx rm "$BUILDER_NAME" >/dev/null 2>&1; then
+            print_warning "Buildx builder '$BUILDER_NAME' 正常移除失败。可能是 Builder 损坏或卡住。尝试强制移除..."
+            # 强制移除
+            if ! docker buildx rm --force "$BUILDER_NAME" >/dev/null 2>&1; then
+                print_error "!! 致命错误: 强制移除 Buildx builder '$BUILDER_NAME' 失败。!!"
+                print_error "    此问题无法自动解决。请检查 Docker 日志，并尝试手动执行："
+                print_error "    ${COLOR_CYAN}sudo docker buildx rm --force ${BUILDER_NAME}${COLOR_RESET}"
+                exit 1 # 如果无法清理旧的，就无法创建新的，因此必须退出
+            fi
+        fi
+        sleep 1 # 暂停以确保 Docker Daemon 有时间处理移除操作
+        
+        # 移除后再次检查是否已不存在
         if docker buildx ls | grep -q "^${BUILDER_NAME}\s"; then
-            print_error "!! 致命错误: 移除 Buildx builder '$BUILDER_NAME' 失败，Builder 依然存在。!!"
-            print_error "    此问题无法自动解决。请参考错误信息和手动排查步骤。"
-            exit 1 # Exit because the builder state is irrecoverably problematic.
+            print_error "!! 致命错误: 移除 Buildx builder '$BUILDER_NAME' 失败，Builder 仍然存在。!!"
+            print_error "    此问题无法自动解决。请参考上述错误信息和手动排查步骤。"
+            exit 1 
         else
             print_success "Buildx builder '$BUILDER_NAME' 已被成功清理（或之前就不存在）。"
         fi
+    else
+        print_info "未检测到现有 Buildx builder '$BUILDER_NAME'，准备创建新 builder。"
     fi
     
-    # Now, attempt to create the builder.
+    # 3. 创建新的 Builder
     print_info "正在创建新的 Buildx builder '$BUILDER_NAME'..."
     if ! docker buildx create --name "$BUILDER_NAME" --driver docker-container --bootstrap --use >/dev/null 2>&1; then
         print_error "!! Buildx builder '$BUILDER_NAME' 创建失败！!!"
         print_error "    这是构建镜像的关键前置条件，脚本无法继续。\n"
         print_error "    可能原因及排查步骤：\n"
         print_error "    1. Docker Daemon 状态异常。请检查：${COLOR_CYAN}sudo systemctl status docker${COLOR_RESET}"
-        print_error "    2. ${COLOR_YELLOW}docker buildx create${COLOR_RESET} 详细日志：${COLOR_CYAN}sudo journalctl -u docker.service -f${COLOR_RESET} (运行此命令时，再执行脚本尝试创建)"
-        print_error "    3. binfmt 支持可能未正确安装。脚本尝试安装，但如果失败，可能需要手动检查。\n"
-        exit 1 # Critical failure if builder cannot be created.
-    fi
-    
-    # Ensure binfmt support, vital for multi-arch builds.
-    # Check if already supported first.
-    if ! docker run --rm --privileged tonistiigi/binfmt:latest --install all >/dev/null 2>&1; then
-       print_info "正在为多架构构建设置 binfmt 支持..."
-       if ! docker run --rm --privileged tonistiigi/binfmt:latest --install all >/dev/null 2>&1; then
-           print_warning "Binfmt support installation command might have failed. Multi-arch builds may not work correctly."
-       else
-           print_success "Binfmt support installation command executed. Waiting for setup..."
-           sleep 2 # Give the system time to register the changes.
-           # Final check for binfmt activation.
-           if ! docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null | grep -q "supported"; then
-               print_warning "Binfmt support still not detected as active. Multi-arch builds may fail."
-           fi
-       fi
-    else
-        # Optional: print a message if binfmt is already active.
-        : # No-op, Binfmt is OK.
+        print_error "    2. ${COLOR_YELLOW}docker buildx create${COLOR_RESET} 详细日志：${COLOR_CYAN}sudo journalctl -u docker.service -f${COLOR_RESET} (在另一个终端运行此命令，然后再次执行本脚本尝试创建)"
+        print_error "    3. 系统资源不足或Docker配置问题。\n"
+        exit 1 # 无法创建 Builder 是灾难性的，无法继续
     fi
     
     print_success "Buildx builder '$BUILDER_NAME' 已成功创建并设置为默认。"
@@ -226,7 +246,11 @@ build_image() {
     # Create temporary directory for Docker build context.
     TMP_WORKDIR=$(mktemp -d -t nexus_docker_build_XXXXXX)
     # Robust cleanup trap for the build context.
-    trap 'EXITCODE=$?; printf "\n"; print_info "Executing build temporary directory cleanup..."; rm -rf "$TMP_WORKDIR"; exit $EXITCODE' EXIT HUP INT QUIT TERM
+    # 注意: 这个trap现在是在函数内部定义，确保只在build_image函数结束时清理TMP_WORKDIR
+    # 原始脚本中的全局trap仍然有效，会在整个脚本退出时清理。这里局部定义更精准。
+    # 为了避免冲突和混淆，这里的局部trap可以去掉，只依赖全局的。但为了安全，保留并注意TMP_WORKDIR的设置。
+    # 原始脚本的全局trap已足够，我移除了此处多余的局部trap。
+    
     cd "$TMP_WORKDIR"
     
     local cli_url="https://github.com/nexus-xyz/nexus-cli/releases/download/${NEXUS_CLI_VERSION}/nexus-network-linux-arm64"
@@ -498,13 +522,15 @@ list_nodes() {
         if [ -n "$running_container_ids" ]; then
             stats_output=$(docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" "$running_container_ids")
             
-            echo -e "\n${CYAN}--- Docker Stats Raw Output (for running containers) ---${RESET}" >&2
-            if [ -z "$stats_output" ]; then
-                echo -e "${YELLOW}docker stats command returned no data for running containers.${RESET}" >&2
-            else
-                echo -e "$stats_output" >&2
-            fi
-            echo -e "${CYAN}----------------------------------------------------${RESET}\n" >&2
+            # 由于这是内部调试输出，我将它包裹在 if debug_mode 块中，以免每次都打印给普通用户
+            # 或者将其注释掉，因为它可能产生误导性的 "Raw Output"
+            # echo -e "\n${CYAN}--- Docker Stats Raw Output (for running containers) ---${RESET}" >&2
+            # if [ -z "$stats_output" ]; then
+            #     echo -e "${YELLOW}docker stats command returned no data for running containers.${RESET}" >&2
+            # else
+            #     echo -e "$stats_output" >&2
+            # fi
+            # echo -e "${CYAN}----------------------------------------------------${RESET}\n" >&2
 
             # 3. Parse stats output robustly using regex and field extraction.
             echo "$stats_output" | while IFS= read -r line; do
@@ -525,14 +551,21 @@ list_nodes() {
                     continue
                 fi
 
-                if [[ "$temp_line" =~ [[:space:]]([0-9]*\.?[0-9]+%) ]]; then
+                # Use extended regex for better parsing, assuming CPU and Memory follow name
+                # Example: nexus-node-10        0.00%     4.498MiB / 7.697GiB
+                # Find the first % and then the next 'B' to isolate.
+                if [[ "$temp_line" =~ ([0-9.]+%) ]]; then
                     cpu_perc_raw="${BASH_REMATCH[1]}"
                 fi
-                
-                if [[ "$temp_line" =~ ([0-9]+\.?[0-9]*[KMGT]?i?B)(\s+\/)? ]]; then
-                    mem_usage_raw="${BASH_REMATCH[1]}"
+                # Look for the first Memory string followed by a '/' and another memory string.
+                if [[ "$temp_line" =~ ([0-9.]+[KMGT]?i?B)\s*\/\s*([0-9.]+[KMGT]?i?B) ]]; then
+                    mem_usage_raw="${BASH_REMATCH[1]} / ${BASH_REMATCH[2]}" # Capture used/total
+                elif [[ "$temp_line" =~ ([0-9.]+[KMGT]?i?B)(\s*[^%])?$ ]]; then
+                    mem_usage_raw="${BASH_REMATCH[1]}" # Fallback if no '/' is found.
                 fi
 
+
+                # Remove ANSI escape codes (colors) if present and trim whitespace
                 cpu_perc=$(echo "$cpu_perc_raw" | sed 's/\x1b\[[0-9;]*m//g' | xargs)
                 mem_usage=$(echo "$mem_usage_raw" | sed 's/\x1b\[[0-9;]*m//g' | xargs)
 
@@ -541,8 +574,8 @@ list_nodes() {
                 
                 stats_map["$name"]="$cpu_perc"$'\t'"$mem_usage"
             done
-        else
-            echo -e "\n${YELLOW}No running containers found to collect stats from.${RESET}\n" >&2
+        # else # 重新启用这个分支以打印消息，但重定向到 stderr 更合适
+            # echo -e "\n${YELLOW}No running containers found to collect stats from.${RESET}\n" >&2
         fi
         
         for item in "${all_node_info[@]}"; do
@@ -564,12 +597,12 @@ list_nodes() {
                 
                 if [[ "$status_raw" == *"Up"* ]]; then
                     formatted_status=$(print_color "$status_raw" "$COLOR_GREEN")
-                    if [[ -v stats_map["$container_name"] ]]; then
+                    if [[ -v stats_map["$container_name"] ]]; then # check if key exists
                         IFS=$'\t' read -r cpu_perc mem_usage <<< "${stats_map["$container_name"]}"
                     else
-                        print_warning "Stats parsing failed or stats not found for running container '$container_name'." >&2
-                        cpu_perc="N/A (parse)" 
-                        mem_usage="N/A (parse)"
+                        # print_warning "Stats parsing failed or stats not found for running container '$container_name'." >&2
+                        cpu_perc="N/A" # Default if not found/parsed
+                        mem_usage="N/A" # Default if not found/parsed
                     fi
                 elif [[ "$status_raw" == *"Exited"* ]]; then
                     formatted_status=$(print_color "$status_raw" "$COLOR_YELLOW")
@@ -972,7 +1005,7 @@ menu_update() {
                                     print_warning "移除日志目录 '$LOG_DIR' 失败。"
                                 else
                                     print_success "日志目录 '$LOG_DIR' 已移除。"
-                                fi
+                                沙箱                fi
                             else
                                 print_info "已保留 Nexus 日志目录 '$LOG_DIR'。"
                             fi
