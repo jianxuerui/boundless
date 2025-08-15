@@ -245,11 +245,7 @@ build_image() {
     
     # Create temporary directory for Docker build context.
     TMP_WORKDIR=$(mktemp -d -t nexus_docker_build_XXXXXX)
-    # Robust cleanup trap for the build context.
-    # 注意: 这个trap现在是在函数内部定义，确保只在build_image函数结束时清理TMP_WORKDIR
-    # 原始脚本中的全局trap仍然有效，会在整个脚本退出时清理。这里局部定义更精准。
-    # 为了避免冲突和混淆，这里的局部trap可以去掉，只依赖全局的。但为了安全，保留并注意TMP_WORKDIR的设置。
-    # 原始脚本的全局trap已足够，我移除了此处多余的局部trap。
+    # 此处无需额外trap，因为脚本顶部已经有全局trap处理TMP_WORKDIR清理。
     
     cd "$TMP_WORKDIR"
     
@@ -558,10 +554,10 @@ list_nodes() {
                     cpu_perc_raw="${BASH_REMATCH[1]}"
                 fi
                 # Look for the first Memory string followed by a '/' and another memory string.
-                if [[ "$temp_line" =~ ([0-9.]+[KMGT]?i?B)\s*\/\s*([0-9.]+[KMGT]?i?B) ]]; then
-                    mem_usage_raw="${BASH_REMATCH[1]} / ${BASH_REMATCH[2]}" # Capture used/total
-                elif [[ "$temp_line" =~ ([0-9.]+[KMGT]?i?B)(\s*[^%])?$ ]]; then
-                    mem_usage_raw="${BASH_REMATCH[1]}" # Fallback if no '/' is found.
+                if [[ "$temp_line" =~ ([0-9.]+[KMGT]?i?B)(\s*\/\s*[0-9.]+[KMGT]?i?B)? ]]; then
+                    mem_usage_raw="${BASH_REMATCH[1]}${BASH_REMATCH[2]}" # Capture used/total or just used
+                elif [[ "$temp_line" =~ ([0-9.]+[KMGT]?i?B)$ ]]; then # Fallback if only used memory is at the end of the line
+                    mem_usage_raw="${BASH_REMATCH[1]}"
                 fi
 
 
@@ -1005,7 +1001,7 @@ menu_update() {
                                     print_warning "移除日志目录 '$LOG_DIR' 失败。"
                                 else
                                     print_success "日志目录 '$LOG_DIR' 已移除。"
-                                沙箱                fi
+                                fi
                             else
                                 print_info "已保留 Nexus 日志目录 '$LOG_DIR'。"
                             fi
