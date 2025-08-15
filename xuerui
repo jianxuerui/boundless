@@ -2,9 +2,14 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 (ARM64 Docker) - v5.9 稳定性与健壮性重构
+# Nexus 多节点管理脚本 (ARM64 Docker) - v5.9.1 命令修复版
 #
 # 改版者: AI & 社区智慧
+#
+# 【V5.9.1 - 命令修复版】:
+#   - 【修复】: 修正了 entrypoint.sh 中 nexus-network 的启动命令。`start` 命令不接受 `--node-id`
+#     参数，它会自动从 /root/.nexus 目录读取配置。错误的参数导致容器启动后立即退出。
+#   - 【优化】: 调整了“更新所有运行中节点”的逻辑，使其更加健壮，先构建新镜像再逐个替换容器。
 #
 # 【V5.9 - 稳定性与健壮性重构】:
 #   - 【根治掉线】: 彻底废除在容器内使用 'screen' 的反模式。现在，nexus-network 进程作为
@@ -27,7 +32,7 @@ set -e
 # ================================================================================================
 
 # --- 配置项 ---
-SCRIPT_VERSION="v5.9 稳定性重构"
+SCRIPT_VERSION="v5.9.1 命令修复版"
 NEXUS_CLI_VERSION="v0.10.8"
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:stable-arm64" # 镜像名更新以反映其稳定性
@@ -71,7 +76,6 @@ fix_centos_repos() {
             print_info "正在自动切换到 vault.centos.org 归档源以确保稳定性..."
             
             local repo_dir="/etc/yum.repos.d"
-            # 简单检查，避免重复备份
             if [ ! -f "${repo_dir}/CentOS-Stream-Base.repo.bak" ] && [ ! -d "${repo_dir}.bak" ]; then
                 cp -r ${repo_dir} ${repo_dir}.bak
             fi
@@ -89,17 +93,11 @@ fix_centos_repos() {
 
 prepare_system() {
     print_bold "第一阶段: 系统环境准备"
-    
-    # 首先检查网络，这是一个基础前提
     print_info "正在检查基础网络连通性..."
     if ! ping -c 1 -W 3 8.8.8.8 &>/dev/null; then print_error "!! 致命网络错误: 无法 PING 通外部IP (8.8.8.8)。请检查本地网络配置或防火墙。"; exit 1; fi
     if ! ping -c 1 -W 3 google.com &>/dev/null; then print_error "!! 致命DNS错误: 无法解析域名 (google.com)。请检查您的DNS服务器设置。"; exit 1; fi
     print_success "基础网络连通性正常。"
-
-    # 【核心修复】检查并修复CentOS 8的软件源问题
     fix_centos_repos
-
-    # 检查并安装核心工具
     print_info "正在检查并安装缺失的核心工具..."
     local packages_to_install=()
     if command -v apt-get &>/dev/null; then
@@ -173,15 +171,19 @@ setup_buildx() {
     docker buildx use "$BUILDER_NAME"
     print_success "Buildx builder '$BUILDER_NAME' 已就绪并设为默认。"
 }
+
 build_image() {
-    if [[ -z "$1" ]] && docker image inspect "$IMAGE_NAME" &>/dev/null; then print_info "镜像 '$IMAGE_NAME' 已存在，跳过构建。"; return; fi
+    if [[ "$1" != "--force" ]] && docker image inspect "$IMAGE_NAME" &>/dev/null; then 
+        print_info "镜像 '$IMAGE_NAME' 已存在，跳过构建。"
+        return 0;
+    fi
     
     print_bold "第四阶段: 构建健壮的Nexus节点镜像"
     setup_buildx;
     
     TMP_WORKDIR=$(mktemp -d); cd "$TMP_WORKDIR"
     cli_url="https://github.com/nexus-xyz/nexus-cli/releases/download/${NEXUS_CLI_VERSION}/nexus-network-linux-arm64"
-    print_info "正在生成 Dockerfile (v5.9)...";
+    print_info "正在生成 Dockerfile (v5.9.1)...";
     
     # 【魔改核心】重写 Dockerfile 和 entrypoint
     cat > Dockerfile <<EOF
@@ -192,11 +194,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates procps && rm -rf /var/lib/apt/lists/*
 
 # 下载CLI工具
-RUN curl -L -o /usr/local/bin/nexus-network ${cli_url} && chmod +x /usr/local/bin/nexus-network
+ADD ${cli_url} /usr/local/bin/nexus-network
+RUN chmod +x /usr/local/bin/nexus-network
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# nexus-cli 将数据写入/root/.nexus
 VOLUME /root/.nexus
 ENTRYPOINT ["/entrypoint.sh"]
 
@@ -215,20 +219,27 @@ if [ -z "$NODE_ID" ]; then
     exit 1
 fi
 
-# 初始化节点ID文件
-echo "正在为节点 $NODE_ID 初始化配置..."
-mkdir -p /root/.nexus
-echo "$NODE_ID" > /root/.nexus/node-id
+# 初始化节点ID文件 (如果不存在)
+# 这一步确保了即使是全新启动的容器也能正确配置
+if [ ! -f /root/.nexus/node-id ]; then
+    echo "正在为节点 $NODE_ID 初始化配置..."
+    mkdir -p /root/.nexus
+    echo "$NODE_ID" > /root/.nexus/node-id
+fi
 
 echo ">>> 即将启动 Nexus 节点 $NODE_ID... 日志将由 Docker 捕获 <<<"
-# 【核心变更】使用 exec, 让 nexus-network 成为容器的主进程 (PID 1)
+
+# 【核心修正】: `start` 命令不带任何参数。
+# 它会自动从 /root/.nexus 目录读取配置。
+# 使用 exec, 让 nexus-network 成为容器的主进程 (PID 1)。
 # 这样，它的崩溃会直接导致容器退出，从而触发 Docker 的重启策略。
-exec nexus-network start --node-id "$NODE_ID"
+exec nexus-network start
 EOF
 
     print_info "正在构建镜像 '$IMAGE_NAME'..."; if ! docker buildx build --builder "$BUILDER_NAME" -t "$IMAGE_NAME" . --load; then print_error "!! Docker 镜像构建失败。"; exit 1; fi
     print_success "镜像 '$IMAGE_NAME' 构建成功。"
 }
+
 run_container() {
     local node_id="$1";
     [ -z "$node_id" ] && { print_error "Node ID不能为空。"; return 1; };
@@ -238,7 +249,6 @@ run_container() {
         docker rm "$cname" &>/dev/null || true
     fi
     
-    # 准备资源限制参数
     local run_opts=""
     if [[ "$NODE_MEM_LIMIT" != "0" && -n "$NODE_MEM_LIMIT" ]]; then
         run_opts+=" --memory=${NODE_MEM_LIMIT}"
@@ -249,12 +259,11 @@ run_container() {
 
     print_info "正在启动节点 ${node_id} (CPU限制: ${NODE_CPU_LIMIT:-无}, 内存限制: ${NODE_MEM_LIMIT:-无})..."
     
-    # 【魔改】移除了日志文件 -v 挂载, 添加了资源限制
     if ! docker run -d --name "$cname" -e NODE_ID="$node_id" $run_opts --restart unless-stopped "$IMAGE_NAME" &>/dev/null; then
         print_error "!! 容器 '${cname}' 启动失败。"; return 1
     fi
     
-    safe_sleep 5 # 给予更长的启动缓冲时间
+    safe_sleep 5
     
     if [ -n "$(docker ps -q -f name="^${cname}$")" ]; then
         print_success "节点 $node_id 启动成功。使用菜单选项 '2' 查看实时日志。"
@@ -269,7 +278,7 @@ start_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if [ -n "$(docker ps -
 restart_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker restart "$cname" &>/dev/null; safe_sleep 2; print_success "节点 ${1} 已重启。"; else print_error "未找到节点 ${1}。"; fi; }
 uninstall_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; print_info "正在卸载节点 ${1}..."; if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker stop "$cname" &>/dev/null || true; docker rm "$cname" &>/dev/null || true; fi; print_success "节点 ${1} 已卸载 (不再有单独的日志文件)。"; }
 get_all_node_ids() { docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//" | sort -u; }
-view_node_logs() { print_info "按 Ctrl+C 退出日志查看。"; docker logs -f "${BASE_CONTAINER_NAME}-${1}"; } # 此函数行为不变，但意义已变
+view_node_logs() { print_info "按 Ctrl+C 退出日志查看。"; docker logs -f "${BASE_CONTAINER_NAME}-${1}"; }
 list_nodes() {
     print_color "======================================= 当前 Nexus 节点状态 =======================================" "$COLOR_BLUE";
     printf "%-38s %-32s %-12s %-18s\n" "$(print_bold "节点ID(容器名)")" "$(print_bold "状态")" "$(print_bold "CPU")" "$(print_bold "内存")";
@@ -292,32 +301,15 @@ list_nodes() {
             local cpu="N/A"; local mem="N/A"
 
             if [[ "$raw_status" == *"Up"* ]]; then
-                if [[ "$raw_status" == *"(healthy)"* ]]; then
-                    s_color="$COLOR_GREEN"
-                    status_text="运行中 (健康)"
-                elif [[ "$raw_status" == *"(unhealthy)"* ]]; then
-                    s_color="$COLOR_RED"
-                    status_text="运行中 (不健康!)"
-                elif [[ "$raw_status" == *"(health: starting)"* ]]; then
-                    s_color="$COLOR_YELLOW"
-                    status_text="启动中 (健康检查..)"
-                else
-                    s_color="$COLOR_GREEN"
-                    status_text="运行中" # Fallback for older Docker versions
+                if [[ "$raw_status" == *"(healthy)"* ]]; then s_color="$COLOR_GREEN"; status_text="运行中 (健康)";
+                elif [[ "$raw_status" == *"(unhealthy)"* ]]; then s_color="$COLOR_RED"; status_text="运行中 (不健康!)";
+                elif [[ "$raw_status" == *"(health: starting)"* ]]; then s_color="$COLOR_YELLOW"; status_text="启动中 (健康检查..)";
+                else s_color="$COLOR_GREEN"; status_text="运行中";
                 fi
-
-                if [[ -v stats_map["$cname"] ]]; then
-                    IFS=$'\t' read -r cpu mem <<< "${stats_map[$cname]}";
-                fi;
-            elif [[ "$raw_status" == *"Exited"* ]]; then
-                s_color="$COLOR_YELLOW";
-                status_text="已退出"
-            elif [[ "$raw_status" == *"Created"* ]]; then
-                 s_color="$COLOR_CYAN";
-                 status_text="已创建"
-            else
-                status_text="$raw_status" # 原始状态
-            fi;
+                if [[ -v stats_map["$cname"] ]]; then IFS=$'\t' read -r cpu mem <<< "${stats_map[$cname]}"; fi;
+            elif [[ "$raw_status" == *"Exited"* ]]; then s_color="$COLOR_YELLOW"; status_text="已退出";
+            elif [[ "$raw_status" == *"Created"* ]]; then s_color="$COLOR_CYAN"; status_text="已创建";
+            else status_text="$raw_status"; fi;
 
             printf "%-38s %-32s %-12s %-18s\n" "$id ($cname)" "$(print_color "$status_text" "$s_color")" "$cpu" "$mem"
         done;
@@ -328,7 +320,7 @@ select_node_action() { local action_callback="$1"; local prompt_message="$2"; lo
 select_multiple_nodes_action() { local action_callback="$1"; local prompt_message="$2"; local nodes=($(get_all_node_ids)); if [ ${#nodes[@]} -eq 0 ]; then print_warning "无节点可操作。"; read -n 1 -s -r -p "按任意键返回..."; return; fi; echo "选择要'${prompt_message}'的节点(多选用空格; 'all'全选):"; for i in "${!nodes[@]}"; do printf "  ${COLOR_CYAN}%d.${COLOR_RESET} %s\n" "$((i+1))" "${nodes[$i]}"; done; read -rp "请输入选项 (0 返回): " choices_str; if [ "$choices_str" = "0" ] || [ -z "$choices_str" ]; then return; fi; local selected=(); if [ "$choices_str" = "all" ]; then selected=("${nodes[@]}"); else for c in $choices_str; do if [[ "$c" =~ ^[1-9][0-9]*$ ]] && [ "$c" -le ${#nodes[@]} ]; then selected+=("${nodes[$((c-1))]}"); fi; done; fi; if [ ${#selected[@]} -gt 0 ] && confirm_action "确认'${prompt_message}'选中的 ${#selected[@]} 个节点?"; then for id in "${selected[@]}"; do "$action_callback" "$id"; done; print_success "批量操作完成。"; fi; read -n 1 -s -r -p "按任意键返回..."; }
 menu_install_single() { read -rp "请输入要安装的 Node ID: " id; id=$(echo "$id"|xargs); if [ -n "$id" ]; then build_image; run_container "$id"; else print_warning "ID 无效。"; fi; read -n 1 -s -r -p "按任意键返回..."; }
 menu_batch_install() { build_image; print_info "请输入多个Node ID(每行一个,空行结束):"; local ids=(); while read -r line && [ -n "$line" ]; do ids+=("$(echo "$line"|xargs)"); done; if [ ${#ids[@]} -gt 0 ] && confirm_action "确认安装 ${#ids[@]} 个新节点?"; then for id in "${ids[@]}"; do run_container "$id"; done; fi; read -n 1 -s -r -p "按任意键返回..."; }
-menu_update() { while true; do clear; print_color "===== 系统维护与更新 =====" "$COLOR_BLUE"; echo " 1. 强制重构镜像"; echo " 2. 更新所有运行中节点 (重建镜像并重启)"; echo " 3. 清理所有数据"; echo " 0. 返回"; read -rp "请输入选项: " choice; case $choice in 1) build_image "--force";; 2) if confirm_action "确认更新所有运行中节点?"; then build_image "--force"; for id in $(docker ps --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//"); do run_container "$id"; done; fi;; 3) if confirm_action "【警告】将删除所有节点容器、镜像和builder！确定吗?"; then docker rm -f $(docker ps -a -q --filter "name=${BASE_CONTAINER_NAME}-") >/dev/null 2>&1 || true; if docker image inspect "$IMAGE_NAME" &>/dev/null; then docker rmi -f "$IMAGE_NAME"; fi; if docker buildx ls | grep -q "$BUILDER_NAME"; then docker buildx rm -f "$BUILDER_NAME"; fi; print_success "清理完成。"; fi;; 0) break;; *) print_error "无效选项。";; esac; read -n 1 -s -r -p "按任意键返回..."; done; }
+menu_update() { while true; do clear; print_color "===== 系统维护与更新 =====" "$COLOR_BLUE"; echo " 1. 强制重构镜像"; echo " 2. 更新所有运行中节点 (重建镜像并重启)"; echo " 3. 清理所有数据"; echo " 0. 返回"; read -rp "请输入选项: " choice; case $choice in 1) build_image "--force";; 2) if confirm_action "这将强制重建镜像，并用新镜像重启所有正在运行的节点。确定吗?"; then print_info "步骤1: 强制重构镜像..."; if ! build_image --force; then print_error "镜像构建失败，更新中止。"; break; fi; print_success "镜像构建成功。"; local running_nodes=(); while IFS= read -r line; do running_nodes+=("$line"); done < <(docker ps --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//"); if [ ${#running_nodes[@]} -gt 0 ]; then print_info "步骤2: 正在逐个更新 ${#running_nodes[@]} 个运行中的节点..."; for id in "${running_nodes[@]}"; do run_container "$id"; done; print_success "所有运行中节点更新完成。"; else print_warning "没有正在运行的节点需要更新。"; fi; fi;; 3) if confirm_action "【警告】将删除所有节点容器、镜像和builder！确定吗?"; then docker rm -f $(docker ps -a -q --filter "name=${BASE_CONTAINER_NAME}-") >/dev/null 2>&1 || true; if docker image inspect "$IMAGE_NAME" &>/dev/null; then docker rmi -f "$IMAGE_NAME"; fi; if docker buildx ls | grep -q "$BUILDER_NAME"; then docker buildx rm -f "$BUILDER_NAME"; fi; print_success "清理完成。"; fi;; 0) break;; *) print_error "无效选项。";; esac; read -n 1 -s -r -p "按任意键返回..."; done; }
 
 main_menu() {
     if [ "$(id -u)" -ne 0 ]; then print_error "错误: 脚本需要root权限运行。"; exit 1; fi
