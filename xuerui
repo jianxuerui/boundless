@@ -2,25 +2,24 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 (ARM64 Docker) - v4.1.21 最终系统兼容版
+# Nexus 多节点管理脚本 (ARM64 Docker) - v4.1.22 最终系统兼容版
 #
 # 改版者: AI & 社区智慧
 #
-# 【V4.1.21 更新】:
-#   - 【致命修复】: 增加核心系统组件健全性检查。脚本启动时会优先检测`grep`等命令是否损坏。
-#   - 【精准诊断】: 解决了用户报告的 'grep: Too many levels of symbolic links' 错误。
-#     现在脚本能识别出是操作系统组件损坏，并提供正确的 `apt-get install --reinstall` 修复命令，
-#     而不是错误地引导用户去检查 AppArmor。
-#   - 【健壮性】: 替换了脚本内部部分简单的`grep`用法，以增强在轻度损坏系统下的兼容性。
+# 【V4.1.22 更新】:
+#   - 【诊断升级】: 极大增强了核心系统组件健全性检查 (`check_core_utils`)。
+#   - 【综合修复】: 脚本现在能同时检测 `grep`, `wget`, `curl` 等多个组件的损坏情况。
+#   - 【精准指令】: 当检测到多个组件损坏时，会生成一条统一的、全面的 `apt-get --reinstall`
+#     修复命令，帮助用户一次性解决所有底层系统问题，避免反复出错。
 #
-# 【V4.1.20 更新】:
-#   - 【修复/增强】: 重构 Docker 检查逻辑。脚本现在会自动尝试启动未运行的 Docker 服务。
+# 【V4.1.21 更新】:
+#   - 【致命修复】: 增加核心系统组件健全性检查，解决 'grep: Too many...' 错误。
 #
 # ... (保留之前的版本更新说明) ...
 # ================================================================================================
 
 # --- 配置项 (可在此处自定义) ---
-SCRIPT_VERSION="v4.1.21 最终系统兼容版"
+SCRIPT_VERSION="v4.1.22 最终系统兼容版"
 NEXUS_CLI_VERSION="v0.10.7"
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:latest-arm64"
@@ -51,25 +50,49 @@ TMP_WORKDIR=""; trap 'EXITCODE=$?; printf "\n"; print_info "Executing cleanup...
 
 # --- Core Functions ---
 
-# 新增：检查核心系统组件是否损坏
+# 增强版：检查多个核心系统组件是否损坏
 check_core_utils() {
     print_info "正在执行系统核心组件健全性检查..."
-    local stderr
-    # 测试 grep 命令是否能正常工作
-    stderr=$(echo "test" | grep "test" 2>&1 >/dev/null)
-    local exit_code=$?
+    local broken_utils=()
+    local packages_to_reinstall=("coreutils") # coreutils 包含大量基础命令，通常是问题根源
 
-    if [[ "$stderr" == *"symbolic links"* || $exit_code -ne 0 ]]; then
+    # 定义要检查的工具及其对应的包名
+    declare -A utils_map
+    utils_map=(
+        ["grep"]="grep"
+        ["wget"]="wget"
+        ["curl"]="curl"
+    )
+
+    for util in "${!utils_map[@]}"; do
+        local package="${utils_map[$util]}"
+        # 使用 command -v 检查命令是否存在并可执行，然后用一次简单调用测试其功能
+        if command -v "$util" &>/dev/null; then
+            local stderr
+            # 执行一个无害的命令，捕获其标准错误输出
+            stderr=$("$util" --version 2>&1 >/dev/null)
+            local exit_code=$?
+            # 如果退出码不为0，并且错误信息包含 "symbolic links"，则判定为损坏
+            if [[ $exit_code -ne 0 && "$stderr" == *"symbolic links"* ]]; then
+                broken_utils+=("$util")
+                [[ ! " ${packages_to_reinstall[*]} " =~ " ${package} " ]] && packages_to_reinstall+=("$package")
+            fi
+        fi
+    done
+
+    if [ ${#broken_utils[@]} -gt 0 ]; then
+        local unique_packages=$(echo "${packages_to_reinstall[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' ')
+
         print_error "!!!!!!!!!!!!!!!!!!!!!!!!!! 致命系统错误 !!!!!!!!!!!!!!!!!!!!!!!!!! "
-        print_error "   检测到核心系统命令 'grep' 已损坏，无法正常运行。"
-        print_error "   具体错误: 'Too many levels of symbolic links'"
+        print_error "   检测到以下核心系统命令已损坏: ${COLOR_YELLOW}${broken_utils[*]}${COLOR_RED}"
+        print_error "   错误类型: 'Too many levels of symbolic links'"
         print_error "   这表明您的操作系统底层存在严重问题，脚本无法继续。"
-        print_error "---------------------- 请立即执行以下修复命令 ----------------------"
-        print_error "   此命令将强制重新安装系统核心工具包和 grep。"
+        print_error "---------------------- 请立即执行以下综合修复命令 ----------------------"
+        print_error "   此命令将强制重新安装所有已知受影响的核心工具包。"
         print_error ""
-        print_error "   ${COLOR_CYAN}sudo apt-get install --reinstall coreutils grep${COLOR_RESET}"
+        print_error "   ${COLOR_CYAN}sudo apt-get update && sudo apt-get install --reinstall ${unique_packages}${COLOR_RESET}"
         print_error ""
-        print_error "   修复后，请重新运行本脚本。"
+        print_error "   修复完成后，请重新运行本脚本。"
         print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! "
         exit 1
     fi
@@ -79,7 +102,6 @@ check_core_utils() {
 
 ensure_docker_ready() {
     print_info "正在检查并准备 Docker 环境..."
-    # 步骤 1: 检查 Docker 是否已安装。如果未安装，则进行安装。
     if ! command -v docker &> /dev/null; then
         print_warning "Docker 未安装，正在自动安装..."
         apt-get update -qq >/dev/null && apt-get install -y --no-install-recommends apt-transport-https ca-certificates curl gnupg lsb-release >/dev/null
@@ -90,15 +112,14 @@ ensure_docker_ready() {
         apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin >/dev/null
         systemctl start docker && systemctl enable docker
         print_success "Docker 已成功安装并启动。"
-        safe_sleep 3 # 等待 Docker 服务完全初始化
+        safe_sleep 3
     fi
 
-    # 步骤 2: 检查 Docker 服务是否正在运行。如果未运行，则尝试启动它。
     if ! docker info >/dev/null 2>&1; then
         print_warning "Docker 服务未运行，正在尝试启动..."
         if systemctl start docker; then
             print_success "Docker 服务启动成功。"
-            safe_sleep 3 # 给予足够的时间让服务完全启动
+            safe_sleep 3
         else
             print_error "!! 尝试启动 Docker 服务失败。"
             print_error "   请手动运行 'systemctl status docker' 或 'journalctl -u docker.service' 查看详细错误。"
@@ -106,14 +127,12 @@ ensure_docker_ready() {
         fi
     fi
 
-    # 步骤 3: 最终验证。如果此时 Docker 服务仍然无法访问，则判定为致命错误。
     if ! docker info >/dev/null 2>&1; then
          print_error "!! 致命错误: Docker 服务已尝试启动但仍无法访问。"
          print_error "   这可能是权限问题。请确保您以 root 权限执行此脚本。"
          exit 1
     fi
 
-    # 步骤 4: 检查 buildx 插件是否存在。
     if ! docker buildx version &>/dev/null; then
         print_error "!! Docker buildx 插件缺失！请检查 Docker 安装是否完整。"
         exit 1
@@ -125,8 +144,8 @@ ensure_docker_ready() {
 get_builder_info() {
     local line; line=$(docker buildx ls | grep -w "^${BUILDER_NAME}" || true)
     if [ -z "$line" ]; then echo "NOT_FOUND"; return; fi
-    local status="stopped"; if echo "$line" | grep -q "running"; then status="running"; fi
-    local is_default="false"; if echo "$line" | grep -q "^\s*${BUILDER_NAME}\s\+\*\s"; then is_default="true"; fi
+    local status="stopped"; if [[ "$line" == *"running"* ]]; then status="running"; fi
+    local is_default="false"; if [[ "$line" == *"${BUILDER_NAME}   *"* ]]; then is_default="true"; fi # Regex alternative
     echo "$status $is_default"
 }
 
@@ -171,7 +190,6 @@ setup_buildx() {
         print_info "正在拉取 'tonistiigi/binfmt' 镜像..."; docker pull tonistiigi/binfmt:latest >/dev/null;
     fi
 
-    # 使用case语句代替grep来提高健壮性
     local binfmt_check_output
     binfmt_check_output=$(docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null)
     case "$binfmt_check_output" in
@@ -259,17 +277,13 @@ safe_sleep() { read -t "$1" < /dev/null 2>/dev/null || true; }
 echo "Starting Nexus node $NODE_ID in screen session $SESSION..."
 screen -dmS "$SESSION" bash -c "nexus-network start --node-id \$NODE_ID | tee \$LOG_FILE"
 safe_sleep 2
-# 使用 case 语句替换 grep -q
-screen_check=$(screen -ls)
-case "$screen_check" in
+case "$(screen -ls)" in
     *"$SESSION"*)
-        echo "Node $NODE_ID started successfully."
-        ;;
+        echo "Node $NODE_ID started successfully." ;;
     *)
         echo "!!! Node startup failed. Check log: $LOG_FILE" >&2
         cat "$LOG_FILE" >&2
-        exit 1
-        ;;
+        exit 1 ;;
 esac
 tail -f /dev/null
 EOF
@@ -370,7 +384,7 @@ menu_update() {
 
 main_menu() {
     if [ "$(id -u)" -ne 0 ]; then print_error "错误: 脚本需要root权限运行。"; exit 1; fi
-    check_core_utils # **新增**：在一切开始前，检查系统环境
+    check_core_utils # **增强版**：在一切开始前，全面检查系统环境
     ensure_docker_ready
     while true; do
         clear; print_color "===== Nexus 管理脚本 ${SCRIPT_VERSION} =====" "$COLOR_BLUE"; list_nodes;
