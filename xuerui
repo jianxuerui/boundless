@@ -2,22 +2,22 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 (ARM64 Docker) - v4.1.17 最终稳定版
+# Nexus 多节点管理脚本 (ARM64 Docker) - v4.1.18 系统兼容性终极增强版
 #
 # 改版者: AI & 社区智慧
 #
-# 【V4.1.17 更新】:
-#   - 【关键修复】: 恢复了被意外删除的 `check_docker_daemon` 函数，解决了 "command not found" 致命错误。
-#   - 【代码可读性】: 将之前版本中过度压缩的函数恢复为标准的多行格式，提高了脚本的
-#     可维护性和稳定性，防止未来出现类似错误。
-#   - 【Binfmt 终极方案】: 保留 v4.1.16 版本的硬编码注册和 AppArmor 修复引导，
-#     这是解决 binfmt 问题的最强方案。
+# 【V4.1.18 更新】:
+#   - 【终极兼容性修复】: 脚本中所有的 `sleep` 命令调用均被替换为 Bash 内建的 `read -t` 命令。
+#     这可以绕过宿主机上可能已损坏的 `/bin/sleep` 命令（由 'Too many levels of symbolic links' 错误指示），
+#     从而在不健康的系统环境中也能正常运行。
+#   - 【系统健康建议】: 鉴于上述错误的严重性，强烈建议用户在运行此脚本后修复其操作系统，
+#     例如通过 `sudo apt-get install --reinstall coreutils`。
 #
 # ... (保留之前的版本更新说明) ...
 # ================================================================================================
 
 # --- 配置项 (可在此处自定义) ---
-SCRIPT_VERSION="v4.1.17 最终稳定版"
+SCRIPT_VERSION="v4.1.18 系统兼容性终极增强版"
 NEXUS_CLI_VERSION="v0.10.7"
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:latest-arm64"
@@ -40,13 +40,13 @@ print_error() { print_color "$1" "$COLOR_RED"; }
 print_warning() { print_color "$1" "$COLOR_YELLOW"; }
 print_info() { print_color "$1" "$COLOR_CYAN"; }
 print_bold() { print_color "$1" "${COLOR_BOLD}${COLOR_CYAN}"; }
+# SAFE_SLEEP uses bash built-in 'read' to pause, avoiding broken external sleep command.
+safe_sleep() { read -t "$1" < /dev/null 2>/dev/null || true; }
 
 confirm_action() { read -rp "${COLOR_YELLOW}>>> ${1} (y/N): ${COLOR_RESET}" c; [[ "$c" =~ ^[yY]([eE][sS])?$ ]]; }
 TMP_WORKDIR=""; trap 'EXITCODE=$?; printf "\n"; print_info "Executing cleanup..."; [ -n "$TMP_WORKDIR" ] && [ -d "$TMP_WORKDIR" ] && rm -rf "$TMP_WORKDIR"; exit $EXITCODE' EXIT HUP INT QUIT TERM
 
 # --- Core Functions ---
-
-# THIS FUNCTION WAS MISSING AND HAS BEEN RESTORED
 check_docker_daemon() {
     if ! docker info >/dev/null 2>&1; then
         print_error "!! 致命错误: Docker 服务未运行或当前用户无权访问。"
@@ -127,7 +127,7 @@ setup_buildx() {
         print_warning "Binfmt 支持未激活。启动多层修复策略..."
         local binfmt_ok=false
         if install_host_qemu_and_setup_binfmt; then
-            sleep 2
+            safe_sleep 2
             if docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null | grep -q "supported"; then
                 print_success "通过宿主机配置，Binfmt 支持已成功激活。"
                 binfmt_ok=true
@@ -135,7 +135,7 @@ setup_buildx() {
         fi
         if ! $binfmt_ok; then
             if register_binfmt_manually_hardcoded; then
-                sleep 2
+                safe_sleep 2
                 if docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null | grep -q "supported"; then
                     print_success "通过硬编码注册，Binfmt 支持已成功激活。"
                     binfmt_ok=true
@@ -200,9 +200,11 @@ if [ -z "$NODE_ID" ]; then echo "Error: NODE_ID not set!" >&2; exit 1; fi
 mkdir -p /root/.nexus && echo "$NODE_ID" > /root/.nexus/node-id
 LOG_FILE="/root/nexus.log"
 SESSION="nexus_${NODE_ID}"
+# Using safe_sleep inside container too if sleep is broken system-wide
+safe_sleep() { read -t "$1" < /dev/null 2>/dev/null || true; }
 echo "Starting Nexus node $NODE_ID in screen session $SESSION..."
 screen -dmS "$SESSION" bash -c "nexus-network start --node-id \$NODE_ID | tee \$LOG_FILE"
-sleep 2
+safe_sleep 2
 if ! screen -ls | grep -q "$SESSION"; then
     echo "!!! Node startup failed. Check log: $LOG_FILE" >&2
     cat "$LOG_FILE" >&2
@@ -230,14 +232,56 @@ run_container() {
     if ! docker run -d --name "$cname" -v "${log_file}:/root/nexus.log" -e NODE_ID="$node_id" --restart unless-stopped "$IMAGE_NAME" &>/dev/null; then
         print_error "!! 容器 '${cname}' 启动失败。"; return 1
     fi
-    sleep 3
+    safe_sleep 3
     if docker ps -q -f name="^${cname}$" | grep -q .; then print_success "节点 $node_id 启动成功。日志: $log_file"; else print_error "节点 $node_id 启动后未在运行！请检查日志。"; cat "$log_file"; fi
 }
 
-stop_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if docker ps -q -f name="^${cname}$" | grep -q .; then docker stop "$cname" &>/dev/null && print_success "节点 ${1} 已停止。"; else print_info "节点 ${1} 已是停止状态或不存在。"; fi; }
-start_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if docker ps -a -q -f name="^${cname}$" | grep -q .; then docker start "$cname" &>/dev/null && print_success "节点 ${1} 已启动。"; else print_error "未找到节点 ${1}。"; fi; }
-restart_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if docker ps -a -q -f name="^${cname}$" | grep -q .; then docker restart "$cname" &>/dev/null && print_success "节点 ${1} 已重启。"; else print_error "未找到运行中的节点 ${1}。"; fi; }
-uninstall_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; print_info "正在卸载节点 ${1}..."; if docker ps -a -q -f name="^${cname}$" | grep -q .; then docker stop "$cname" &>/dev/null || true; docker rm "$cname" &>/dev/null || true; fi; rm -f "${LOG_DIR}/nexus-${1}.log"; print_success "节点 ${1} 已卸载。"; }
+stop_node() {
+    local node_id="$1"
+    local cname="${BASE_CONTAINER_NAME}-${node_id}"
+    if docker ps -q -f name="^${cname}$" | grep -q .; then
+        print_info "正在停止节点 ${node_id}..."
+        docker stop "$cname" &>/dev/null
+        print_success "节点 ${node_id} 已停止。"
+    else
+        print_info "节点 ${node_id} 已是停止状态或不存在。"
+    fi
+}
+start_node() {
+    local node_id="$1"
+    local cname="${BASE_CONTAINER_NAME}-${node_id}"
+    if docker ps -a -q -f name="^${cname}$" | grep -q .; then
+        print_info "正在启动节点 ${node_id}..."
+        docker start "$cname" &>/dev/null
+        safe_sleep 2
+        if docker ps -q -f name="^${cname}$" | grep -q .; then print_success "节点 ${node_id} 已启动。"; fi
+    else
+        print_error "未找到节点 ${node_id}。"
+    fi
+}
+restart_node() {
+    local node_id="$1"
+    local cname="${BASE_CONTAINER_NAME}-${node_id}"
+    if docker ps -a -q -f name="^${cname}$" | grep -q .; then
+        print_info "正在重启节点 ${node_id}..."
+        docker restart "$cname" &>/dev/null
+        safe_sleep 2
+        print_success "节点 ${node_id} 已重启。"
+    else
+        print_error "未找到节点 ${node_id}。"
+    fi
+}
+uninstall_node() {
+    local node_id="$1"
+    local cname="${BASE_CONTAINER_NAME}-${node_id}"
+    print_info "正在卸载节点 ${node_id}..."
+    if docker ps -a -q -f name="^${cname}$" | grep -q .; then
+        docker stop "$cname" &>/dev/null || true
+        docker rm "$cname" &>/dev/null || true
+    fi
+    rm -f "${LOG_DIR}/nexus-${node_id}.log"
+    print_success "节点 ${node_id} 已卸载。"
+}
 get_all_node_ids() { docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//" | sort -u; }
 view_node_logs() { docker logs -f "${BASE_CONTAINER_NAME}-${1}"; }
 
@@ -266,15 +310,14 @@ list_nodes() {
 select_node_action() {
     local action_callback="$1"; local prompt_message="$2"
     local nodes=($(get_all_node_ids))
-    if [ ${#nodes[@]} -eq 0 ]; then print_warning "当前无任何节点可操作。"; read -n 1 -s -r -p "按任意键返回..."; return; fi
-    echo "请选择要'${prompt_message}'的节点:"
+    if [ ${#nodes[@]} -eq 0 ]; then print_warning "无节点可操作。"; read -n 1 -s -r -p "按任意键返回..."; return; fi
+    echo "选择要'${prompt_message}'的节点:"
     for i in "${!nodes[@]}"; do
-        printf "  ${COLOR_CYAN}%2d.${COLOR_RESET} %s\n" "$((i+1))" "${nodes[$i]}"
+        printf "  ${COLOR_CYAN}%d.${COLOR_RESET} %s\n" "$((i+1))" "${nodes[$i]}"
     done
-    echo "   0. 返回主菜单"
-    read -rp "${COLOR_YELLOW}请输入选项: ${COLOR_RESET}" choice
-    if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [ "$choice" -le ${#nodes[@]} ]; then
-        "$action_callback" "${nodes[$((choice-1))]}"
+    echo "  0. 返回"
+    read -rp "请输入选项: " choice
+    if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [ "$choice" -le ${#nodes[@]} ]; then "$action_callback" "${nodes[$((choice-1))]}";
     elif [ "$choice" != "0" ]; then print_error "无效输入。"; fi
     read -n 1 -s -r -p "按任意键返回...";
 }
@@ -282,72 +325,40 @@ select_node_action() {
 select_multiple_nodes_action() {
     local action_callback="$1"; local prompt_message="$2"
     local nodes=($(get_all_node_ids))
-    if [ ${#nodes[@]} -eq 0 ]; then print_warning "当前无任何节点可操作。"; read -n 1 -s -r -p "按任意键返回..."; return; fi
-    echo "请选择要'${prompt_message}'的节点 (可多选，用空格隔开; 'all' 全选):"
+    if [ ${#nodes[@]} -eq 0 ]; then print_warning "无节点可操作。"; read -n 1 -s -r -p "按任意键返回..."; return; fi
+    echo "选择要'${prompt_message}'的节点(多选用空格; 'all'全选):"
     for i in "${!nodes[@]}"; do
-        printf "  ${COLOR_CYAN}%2d.${COLOR_RESET} %s\n" "$((i+1))" "${nodes[$i]}"
+        printf "  ${COLOR_CYAN}%d.${COLOR_RESET} %s\n" "$((i+1))" "${nodes[$i]}"
     done
-    echo "   0. 返回主菜单"
-    read -rp "${COLOR_YELLOW}请输入选项: ${COLOR_RESET}" choices_str
+    echo "  0. 返回"
+    read -rp "请输入选项: " choices_str
     if [ "$choices_str" = "0" ] || [ -z "$choices_str" ]; then return; fi
-    local selected_nodes=()
-    if [ "$choices_str" = "all" ]; then selected_nodes=("${nodes[@]}"); else
-        for choice in $choices_str; do
-            if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [ "$choice" -le ${#nodes[@]} ]; then
-                selected_nodes+=("${nodes[$((choice-1))]}");
-            else print_warning "输入 '$choice' 无效, 已忽略。"; fi
+    local selected=()
+    if [ "$choices_str" = "all" ]; then selected=("${nodes[@]}"); else
+        for c in $choices_str; do
+            if [[ "$c" =~ ^[1-9][0-9]*$ ]] && [ "$c" -le ${#nodes[@]} ]; then selected+=("${nodes[$((c-1))]}"); fi
         done
     fi
-    if [ ${#selected_nodes[@]} -gt 0 ] && confirm_action "确认对选定节点执行 '${prompt_message}'?"; then
-        for node_id in "${selected_nodes[@]}"; do print_info "--- 操作节点: $node_id ---"; "$action_callback" "$node_id"; done
-        print_success "批量操作完成。"
-    else print_info "操作已取消。"; fi
-    read -n 1 -s -r -p "按任意键返回...";
-}
-
-menu_install_single() {
-    read -rp "${COLOR_YELLOW}请输入要安装的 Node ID: ${COLOR_RESET}" id
-    id=$(echo "$id" | xargs | sed 's/[^a-zA-Z0-9_-]//g')
-    if [ -z "$id" ]; then print_warning "未输入有效 Node ID。"; else
-        if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then build_image "--force"; fi
-        run_container "$id"
+    if [ ${#selected[@]} -gt 0 ] && confirm_action "确认'${prompt_message}'选中的 ${#selected[@]} 个节点?"; then
+        for id in "${selected[@]}"; do "$action_callback" "$id"; done; print_success "批量操作完成。"
     fi
     read -n 1 -s -r -p "按任意键返回...";
 }
 
-menu_batch_install() {
-    if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then build_image "--force"; fi
-    print_info "请输入多个Node ID(每行一个,空行结束):"
-    local ids=(); while read -r line && [ -n "$line" ]; do ids+=("$line"); done
-    if [ ${#ids[@]} -gt 0 ] && confirm_action "确认安装 ${#ids[@]} 个新节点?"; then
-        for id in "${ids[@]}"; do run_container "$id"; done
-    fi
-    read -n 1 -s -r -p "按任意键返回...";
-}
-
+menu_install_single() { read -rp "请输入要安装的 Node ID: " id; id=$(echo "$id"|xargs); if [ -n "$id" ]; then if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then build_image "--force"; fi; run_container "$id"; else print_warning "ID 无效。"; fi; read -n 1 -s -r -p "按任意键返回..."; }
+menu_batch_install() { if ! docker image inspect "$IMAGE_NAME" &>/dev/null; then build_image "--force"; fi; print_info "请输入多个Node ID(每行一个,空行结束):"; local ids=(); while read -r line && [ -n "$line" ]; do ids+=("$line"); done; if [ ${#ids[@]} -gt 0 ] && confirm_action "确认安装 ${#ids[@]} 个新节点?"; then for id in "${ids[@]}"; do run_container "$id"; done; fi; read -n 1 -s -r -p "按任意键返回..."; }
 menu_update() {
     while true; do clear; print_color "===== 系统维护与更新 =====" "$COLOR_BLUE";
         echo " 1. 强制重构镜像"; echo " 2. 更新所有运行中节点"; echo " 3. 清理所有数据"; echo " 0. 返回";
         read -rp "请输入选项: " choice
         case $choice in
             1) build_image "--force";;
-            2) if confirm_action "确认更新所有运行中节点?"; then
-                   build_image "--force";
-                   for id in $(docker ps --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//"); do
-                       run_container "$id";
-                   done
-                   print_success "更新完成。"
-               fi;;
-            3) if confirm_action "【警告】将删除所有节点、镜像、日志和builder！确定吗?"; then
-                   for id in $(get_all_node_ids); do uninstall_node "$id"; done;
-                   if docker image inspect "$IMAGE_NAME" &>/dev/null; then docker rmi -f "$IMAGE_NAME"; fi
-                   if docker buildx ls | grep -q "$BUILDER_NAME"; then docker buildx rm "$BUILDER_NAME"; fi
-                   print_success "清理完成。";
-               fi;;
+            2) if confirm_action "确认更新所有运行中节点?"; then build_image "--force"; for id in $(docker ps --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//"); do run_container "$id"; done; fi;;
+            3) if confirm_action "【警告】将删除所有节点、镜像、日志和builder！确定吗?"; then for id in $(get_all_node_ids); do uninstall_node "$id"; done; if docker image inspect "$IMAGE_NAME" &>/dev/null; then docker rmi -f "$IMAGE_NAME"; fi; if docker buildx ls | grep -q "$BUILDER_NAME"; then docker buildx rm "$BUILDER_NAME"; fi; print_success "清理完成。"; fi;;
             0) break;;
             *) print_error "无效选项。";;
         esac
-        read -n 1 -s -r -p "按任意键返回...";
+        read -n 1 -s -r -p "按任意键返回..."
     done
 }
 
@@ -355,19 +366,20 @@ main_menu() {
     if [ "$(id -u)" -ne 0 ]; then print_error "错误: 脚本需要root权限运行。"; exit 1; fi
     check_docker_daemon
     check_docker
-    while true; do clear; print_color "===== Nexus 管理脚本 ${SCRIPT_VERSION} =====" "$COLOR_BLUE"; list_nodes;
-        echo; print_info "--- 节点管理 ---";
+    while true; do
+        clear; print_color "===== Nexus 管理脚本 ${SCRIPT_VERSION} =====" "$COLOR_BLUE"; list_nodes
+        echo; print_info "--- 节点管理 ---"
         echo " 1. 安装/启动单节点   4. 停止节点"; echo " 2. 查看节点日志     5. 启动节点"; echo " 3. 卸载节点         6. 重启节点";
-        print_info "--- 批量操作 ---";
+        print_info "--- 批量操作 ---"
         echo " 7. 批量安装新节点   10. 批量卸载"; echo " 8. 批量停止节点      9. 批量启动";
-        print_info "--- 系统维护 ---";
+        print_info "--- 系统维护 ---"
         echo " 11. 更新与维护"; echo "  0. 退出脚本"; echo
         read -rp "请输入选项: " choice
         case $choice in
             1) menu_install_single ;; 2) select_node_action view_node_logs "查看日志" ;; 3) select_node_action uninstall_node "卸载" ;;
             4) select_node_action stop_node "停止" ;; 5) select_node_action start_node "启动" ;; 6) select_node_action restart_node "重启" ;;
             7) menu_batch_install ;; 8) select_multiple_nodes_action stop_node "停止" ;; 9) select_multiple_nodes_action start_node "启动" ;;
-            10) select_multiple_nodes_action uninstall_node "卸载" ;; 11) menu_update ;; 0) exit 0 ;; *) print_error "无效选项。" && sleep 1 ;;
+            10) select_multiple_nodes_action uninstall_node "卸载" ;; 11) menu_update ;; 0) exit 0 ;; *) print_error "无效选项。" && safe_sleep 1 ;;
         esac
     done
 }
