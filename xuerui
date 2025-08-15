@@ -2,24 +2,26 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 (ARM64 Docker) - v4.1.22 最终系统兼容版
+# Nexus 多节点管理脚本 (ARM64 Docker) - v4.LTS 最终诊断版
 #
 # 改版者: AI & 社区智慧
 #
-# 【V4.1.22 更新】:
-#   - 【诊断升级】: 极大增强了核心系统组件健全性检查 (`check_core_utils`)。
-#   - 【综合修复】: 脚本现在能同时检测 `grep`, `wget`, `curl` 等多个组件的损坏情况。
-#   - 【精准指令】: 当检测到多个组件损坏时，会生成一条统一的、全面的 `apt-get --reinstall`
-#     修复命令，帮助用户一次性解决所有底层系统问题，避免反复出错。
+# 【V4.LTS (v4.1.23) 更新】:
+#   - 【致命修复】: 为 `docker pull` 命令增加了显式的错误捕获和详细的诊断信息。
+#     解决了脚本在拉取镜像时“悄然退出”的最终问题。
+#   - 【诊断增强】: 核心系统组件检查 (`check_core_utils`) 现在将 `ca-certificates` 包
+#     纳入了强制重新安装的建议中，因为它是导致网络和TLS错误的常见根源。
+#   - 【用户指引】: 当 `docker pull` 失败时，脚本会提供 `journalctl` 命令，引导用户
+#     查看 Docker 守护进程的底层日志，从而找到最根本的错误原因。
 #
-# 【V4.1.21 更新】:
-#   - 【致命修复】: 增加核心系统组件健全性检查，解决 'grep: Too many...' 错误。
+# 【V4.1.22 更新】:
+#   - 【诊断升级】: 极大增强了核心系统组件健全性检查,能检测多个损坏组件。
 #
 # ... (保留之前的版本更新说明) ...
 # ================================================================================================
 
 # --- 配置项 (可在此处自定义) ---
-SCRIPT_VERSION="v4.1.22 最终系统兼容版"
+SCRIPT_VERSION="v4.LTS (v4.1.23) 最终诊断版"
 NEXUS_CLI_VERSION="v0.10.7"
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:latest-arm64"
@@ -50,30 +52,22 @@ TMP_WORKDIR=""; trap 'EXITCODE=$?; printf "\n"; print_info "Executing cleanup...
 
 # --- Core Functions ---
 
-# 增强版：检查多个核心系统组件是否损坏
+# 终极版：检查多个核心系统组件是否损坏，并提供综合修复方案
 check_core_utils() {
     print_info "正在执行系统核心组件健全性检查..."
     local broken_utils=()
-    local packages_to_reinstall=("coreutils") # coreutils 包含大量基础命令，通常是问题根源
+    # 预置最可能损坏的软件包列表
+    local packages_to_reinstall=("coreutils" "ca-certificates")
 
-    # 定义要检查的工具及其对应的包名
     declare -A utils_map
-    utils_map=(
-        ["grep"]="grep"
-        ["wget"]="wget"
-        ["curl"]="curl"
-    )
+    utils_map=( ["grep"]="grep" ["wget"]="wget" ["curl"]="curl" )
 
     for util in "${!utils_map[@]}"; do
         local package="${utils_map[$util]}"
-        # 使用 command -v 检查命令是否存在并可执行，然后用一次简单调用测试其功能
         if command -v "$util" &>/dev/null; then
             local stderr
-            # 执行一个无害的命令，捕获其标准错误输出
             stderr=$("$util" --version 2>&1 >/dev/null)
-            local exit_code=$?
-            # 如果退出码不为0，并且错误信息包含 "symbolic links"，则判定为损坏
-            if [[ $exit_code -ne 0 && "$stderr" == *"symbolic links"* ]]; then
+            if [[ $? -ne 0 && "$stderr" == *"symbolic links"* ]]; then
                 broken_utils+=("$util")
                 [[ ! " ${packages_to_reinstall[*]} " =~ " ${package} " ]] && packages_to_reinstall+=("$package")
             fi
@@ -88,7 +82,7 @@ check_core_utils() {
         print_error "   错误类型: 'Too many levels of symbolic links'"
         print_error "   这表明您的操作系统底层存在严重问题，脚本无法继续。"
         print_error "---------------------- 请立即执行以下综合修复命令 ----------------------"
-        print_error "   此命令将强制重新安装所有已知受影响的核心工具包。"
+        print_error "   此命令是解决此类问题的“一站式”方案，将强制重装所有已知问题组件。"
         print_error ""
         print_error "   ${COLOR_CYAN}sudo apt-get update && sudo apt-get install --reinstall ${unique_packages}${COLOR_RESET}"
         print_error ""
@@ -145,7 +139,7 @@ get_builder_info() {
     local line; line=$(docker buildx ls | grep -w "^${BUILDER_NAME}" || true)
     if [ -z "$line" ]; then echo "NOT_FOUND"; return; fi
     local status="stopped"; if [[ "$line" == *"running"* ]]; then status="running"; fi
-    local is_default="false"; if [[ "$line" == *"${BUILDER_NAME}   *"* ]]; then is_default="true"; fi # Regex alternative
+    local is_default="false"; if [[ "$line" == *"${BUILDER_NAME}"*"*"* ]]; then is_default="true"; fi
     echo "$status $is_default"
 }
 
@@ -186,71 +180,63 @@ install_host_qemu_and_setup_binfmt() {
 setup_buildx() {
     print_info "正在检查和配置 Buildx builder '$BUILDER_NAME'..."
     print_info "正在检查和配置多架构构建所需的 binfmt 支持..."
+
+    # **修复**: 增加对 docker pull 的显式错误处理
     if ! docker image inspect tonistiigi/binfmt:latest &>/dev/null; then
-        print_info "正在拉取 'tonistiigi/binfmt' 镜像..."; docker pull tonistiigi/binfmt:latest >/dev/null;
+        print_info "正在拉取 'tonistiigi/binfmt' 镜像..."
+        if ! docker pull tonistiigi/binfmt:latest; then
+            print_error "!!!!!!!!!!!!!!!!!!!!!!!!!! 致命错误 !!!!!!!!!!!!!!!!!!!!!!!!!! "
+            print_error "   拉取 'tonistiigi/binfmt' 镜像失败。"
+            print_error "   这通常由以下两个原因之一导致:"
+            print_error "   1. ${COLOR_YELLOW}网络问题:${COLOR_RED} 检查您的服务器是否可以访问 'docker.io'。"
+            print_error "   2. ${COLOR_YELLOW}系统损坏:${COLOR_RED} 您的系统证书 (ca-certificates) 可能已损坏，导致无法进行HTTPS连接。"
+            print_error "-------------------------- 故障排查建议 --------------------------"
+            print_error "   要查看最底层的错误信息，请在新终端中运行以下命令:"
+            print_error "   ${COLOR_CYAN}journalctl -u docker.service --since '1 minute ago'${COLOR_RESET}"
+            print_error ""
+            print_error "   如果日志中出现证书或TLS/SSL相关的错误，请优先执行本脚本启动时"
+            print_error "   可能提示的'系统核心组件'修复命令。"
+            print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! "
+            exit 1
+        fi
     fi
 
     local binfmt_check_output
     binfmt_check_output=$(docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null)
     case "$binfmt_check_output" in
         *"supported"*)
-            print_success "Binfmt 支持已正确配置。"
-            ;;
+            print_success "Binfmt 支持已正确配置。" ;;
         *)
             print_warning "Binfmt 支持未激活。启动多层修复策略..."
             local binfmt_ok=false
             if install_host_qemu_and_setup_binfmt; then
-                safe_sleep 2
-                case "$(docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null)" in
-                    *"supported"*) print_success "通过宿主机配置，Binfmt 支持已成功激活。"; binfmt_ok=true ;;
-                esac
+                safe_sleep 2; case "$(docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null)" in *"supported"*) print_success "通过宿主机配置，Binfmt 支持已成功激活。"; binfmt_ok=true ;; esac
             fi
             if ! $binfmt_ok; then
                 if register_binfmt_manually_hardcoded; then
-                    safe_sleep 2
-                    case "$(docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null)" in
-                         *"supported"*) print_success "通过硬编码注册，Binfmt 支持已成功激活。"; binfmt_ok=true ;;
-                    esac
+                    safe_sleep 2; case "$(docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null)" in *"supported"*) print_success "通过硬编码注册，Binfmt 支持已成功激活。"; binfmt_ok=true ;; esac
                 fi
             fi
             if ! $binfmt_ok; then
-                print_error "!!!!!!!!!!!!!!!!!!!!!!!!!! 致命错误 !!!!!!!!!!!!!!!!!!!!!!!!!! "
-                print_error "   所有自动修复 binfmt 的方法均已失败。"
-                print_error "   如果排除系统组件损坏的因素，这可能是由于 AppArmor 或 SELinux 等安全策略。"
-                print_error "------------------------ 请执行以下修复命令 ------------------------"
-                print_error "   这会将 Docker 的 AppArmor 配置文件切换到“抱怨”模式，"
-                print_error "   它会记录违规行为但不会阻止它们。这是一个安全的临时解决方案。"
-                print_error ""
-                print_error "   ${COLOR_CYAN}sudo apt-get install apparmor-utils -y && sudo aa-complain /etc/apparmor.d/docker${COLOR_RESET}"
-                print_error ""
-                print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! "
+                print_error "!! 致命错误: 所有自动修复 binfmt 的方法均已失败。"
+                print_error "   如果已排除系统组件损坏的因素，这可能是由于 AppArmor/SELinux 安全策略。"
+                print_error "   建议修复命令: ${COLOR_CYAN}sudo apt-get install apparmor-utils -y && sudo aa-complain /etc/apparmor.d/docker${COLOR_RESET}"
                 exit 1
             fi
             ;;
     esac
 
-
     IFS=' ' read -r current_status _ <<< "$(get_builder_info "$BUILDER_NAME")"
     if [ "$current_status" != "NOT_FOUND" ]; then
-        print_info "正在清理旧的 Buildx builder '$BUILDER_NAME'..."
-        docker buildx rm --force "$BUILDER_NAME" >/dev/null 2>&1 || true
-        print_success "旧的 builder 已清理。"
+        print_info "正在清理旧的 Buildx builder '$BUILDER_NAME'..."; docker buildx rm --force "$BUILDER_NAME" >/dev/null 2>&1 || true; print_success "旧的 builder 已清理。"
     fi
 
-    print_info "正在创建新的 Buildx builder '$BUILDER_NAME'..."
-    if ! docker buildx create --name "$BUILDER_NAME" --driver docker-container --bootstrap --use >/dev/null 2>&1; then
-        print_error "!! Buildx builder '$BUILDER_NAME' 创建失败！!!"; exit 1;
-    fi
-
-    IFS=' ' read -r created_status is_default <<< "$(get_builder_info "$BUILDER_NAME")"
-    if [ "$created_status" == "running" ] && [ "$is_default" == "true" ]; then
-        print_success "Buildx builder '$BUILDER_NAME' 已成功创建并设置为默认。"
-    else
-        print_error "!! Buildx builder 创建后状态异常 ($created_status, default=$is_default)！!!"; exit 1;
-    fi
+    print_info "正在创建新的 Buildx builder '$BUILDER_NAME'..."; if ! docker buildx create --name "$BUILDER_NAME" --driver docker-container --bootstrap --use >/dev/null 2>&1; then print_error "!! Buildx builder '$BUILDER_NAME' 创建失败！!!"; exit 1; fi
+    IFS=' ' read -r created_status is_default <<< "$(get_builder_info "$BUILDER_NAME")"; if [ "$created_status" == "running" ] && [ "$is_default" == "true" ]; then print_success "Buildx builder '$BUILDER_NAME' 已成功创建并设置为默认。"; else print_error "!! Buildx builder 创建后状态异常 ($created_status, default=$is_default)！!!"; exit 1; fi
 }
 
 build_image() {
+    # 省略未修改的函数内容以保持简洁 ...
     if [[ -z "$1" ]] && docker image inspect "$IMAGE_NAME" &>/dev/null; then print_info "镜像 '$IMAGE_NAME' 已存在，跳过构建。"; return; fi
     setup_buildx
     TMP_WORKDIR=$(mktemp -d); cd "$TMP_WORKDIR"
@@ -288,11 +274,14 @@ esac
 tail -f /dev/null
 EOF
     print_info "正在构建镜像 '$IMAGE_NAME'..."
-    if ! docker buildx build --builder "$BUILDER_NAME" -t "$IMAGE_NAME" . --load >/dev/null 2>&1; then
-        print_error "!! Docker buildx build 失败。请尝试手动运行查看详细错误。"; exit 1;
+    if ! docker buildx build --builder "$BUILDER_NAME" -t "$IMAGE_NAME" . --load; then
+        print_error "!! Docker buildx build 失败。请查看上面的详细错误日志。"; exit 1;
     fi
     print_success "镜像 '$IMAGE_NAME' 构建完成。"
 }
+
+
+# ... 以下其他函数 (run_container, list_nodes, main_menu 等) 保持不变，故省略 ...
 
 run_container() {
     local node_id="$1"; [ -z "$node_id" ] && { print_error "Node ID is required."; return 1; }
@@ -384,7 +373,7 @@ menu_update() {
 
 main_menu() {
     if [ "$(id -u)" -ne 0 ]; then print_error "错误: 脚本需要root权限运行。"; exit 1; fi
-    check_core_utils # **增强版**：在一切开始前，全面检查系统环境
+    check_core_utils # **终极版**：在一切开始前，全面检查系统环境
     ensure_docker_ready
     while true; do
         clear; print_color "===== Nexus 管理脚本 ${SCRIPT_VERSION} =====" "$COLOR_BLUE"; list_nodes;
