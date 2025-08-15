@@ -2,23 +2,22 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 (ARM64 Docker) - v5.2 网络自愈版
+# Nexus 多节点管理脚本 (ARM64 Docker) - v5.3 高级网络修复版
 #
 # 改版者: AI & 社区智慧
 #
-# 【V5.2 - 网络自愈版 更新】:
-#   - 【网络自愈】: 新增 'check_network_and_dns' 函数。脚本启动时会首先检查 DNS 解析和外网
-#     连通性。如果发现问题，它会自动尝试添加公共 DNS (8.8.8.8) 来修复网络，从而解决了
-#     因 DNS 错误导致 'yum'/'apt-get' 失败的问题。
-#
-# 【V5.1 - 跨平台兼容版 更新】:
-#   - 【跨平台修复】: 重写了 'ensure_docker_ready' 函数，使其能够自动检测并支持
-#     Debian/Ubuntu 和 RHEL/CentOS 两大主流 Linux 发行版系列。
+# 【V5.3 - 高级网络修复版 更新】:
+#   - 【高级网络修复】: 彻底重写 'check_network_and_dns' 函数。当检测到DNS问题时，脚本现在会
+#     使用 'chattr +i' 命令临时锁定 '/etc/resolv.conf' 文件，以防止 'NetworkManager' 等系统
+#     服务覆盖修复。
+#   - 【安全回滚】: 增加了全局 'trap' 机制，确保无论脚本如何退出，被锁定的 '/etc/resolv.conf'
+#     文件都会被安全解锁并恢复，杜绝任何系统残留问题。
+#   - 【精准诊断】: 采用 'ping' 命令分步检测IP连通性和DNS解析，能更准确地向用户报告网络故障点。
 #
 # ================================================================================================
 
-# --- 配置项 (可在此处自定义) ---
-SCRIPT_VERSION="v5.2 网络自愈版"
+# --- 配置项 ---
+SCRIPT_VERSION="v5.3 高级网络修复版"
 NEXUS_CLI_VERSION="v0.10.7"
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:latest-arm64"
@@ -26,89 +25,123 @@ LOG_DIR="/root/nexus_logs"
 BUILDER_NAME="nexus_builder"
 
 # --- 颜色定义 ---
-COLOR_RESET='\033[0m'
-COLOR_RED='\033[0;31m'
-COLOR_GREEN='\033[0;32m'
-COLOR_YELLOW='\033[0;33m'
-COLOR_BLUE='\033[0;34m'
-COLOR_CYAN='\033[0;36m'
-COLOR_BOLD='\033[1m'
+COLOR_RESET='\033[0m'; COLOR_RED='\033[0;31m'; COLOR_GREEN='\033[0;32m'; COLOR_YELLOW='\033[0;33m';
+COLOR_BLUE='\033[0;34m'; COLOR_CYAN='\033[0;36m'; COLOR_BOLD='\033[1m'
+
+# --- 全局变量和退出陷阱 ---
+TMP_WORKDIR=""; RESOLV_LOCKED=0; ORIGINAL_RESOLV_ATTRS=""
+cleanup() {
+    EXITCODE=$?
+    printf "\n"
+    print_info "Executing cleanup..."
+    if [ "$RESOLV_LOCKED" -eq 1 ]; then
+        print_info "Restoring /etc/resolv.conf..."
+        if [ -f /etc/resolv.conf.bak.nexus ]; then
+            chattr -i /etc/resolv.conf 2>/dev/null || true
+            mv /etc/resolv.conf.bak.nexus /etc/resolv.conf
+            # Restore original attributes if they existed
+            if [ -n "$ORIGINAL_RESOLV_ATTRS" ]; then
+                chattr "$ORIGINAL_RESOLV_ATTRS" /etc/resolv.conf 2>/dev/null || true
+            fi
+            print_success "/etc/resolv.conf restored."
+        fi
+    fi
+    [ -n "$TMP_WORKDIR" ] && [ -d "$TMP_WORKDIR" ] && rm -rf "$TMP_WORKDIR"
+    exit $EXITCODE
+}
+trap cleanup EXIT HUP INT QUIT TERM
 
 # --- 辅助函数 ---
-print_color() { echo -e "${2}${1}${COLOR_RESET}"; }
-print_success() { print_color "$1" "$COLOR_GREEN"; }
-print_error() { print_color "$1" "$COLOR_RED"; }
-print_warning() { print_color "$1" "$COLOR_YELLOW"; }
-print_info() { print_color "$1" "$COLOR_CYAN"; }
-print_bold() { print_color "$1" "${COLOR_BOLD}${COLOR_CYAN}"; }
+print_color() { echo -e "${2}${1}${COLOR_RESET}"; }; print_success() { print_color "$1" "$COLOR_GREEN"; }
+print_error() { print_color "$1" "$COLOR_RED"; }; print_warning() { print_color "$1" "$COLOR_YELLOW"; }
+print_info() { print_color "$1" "$COLOR_CYAN"; }; print_bold() { print_color "$1" "${COLOR_BOLD}${COLOR_CYAN}"; }
 safe_sleep() { read -t "$1" < /dev/null 2>/dev/null || true; }
 confirm_action() { read -rp "${COLOR_YELLOW}>>> ${1} (y/N): ${COLOR_RESET}" c; [[ "$c" =~ ^[yY]([eE][sS])?$ ]]; }
-TMP_WORKDIR=""; trap 'EXITCODE=$?; printf "\n"; print_info "Executing cleanup..."; [ -n "$TMP_WORKDIR" ] && [ -d "$TMP_WORKDIR" ] && rm -rf "$TMP_WORKDIR"; exit $EXITCODE' EXIT HUP INT QUIT TERM
 
-# --- Core Functions ---
-
-# ---【新增的网络检查修复函数】---
+# ---【V5.3 全新网络修复函数】---
 check_network_and_dns() {
-    print_info "正在检查网络和DNS解析..."
-    if curl -s --head http://www.google.com | head -n 1 | grep "200 OK" > /dev/null; then
-        print_success "网络和DNS解析正常。"
+    print_info "正在进行高级网络诊断..."
+    
+    # 1. 检查IP连通性 (Gateway / Firewall)
+    if ! ping -c 1 -W 3 8.8.8.8 &>/dev/null; then
+        print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 致命网络错误 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!";
+        print_error "   无法 PING 通外部IP (8.8.8.8)。这不是DNS问题！"
+        print_error "   可能原因: "
+        print_error "   1. 机器网络配置错误 (IP, 子网掩码, 网关)。"
+        print_error "   2. 物理网络不通或虚拟网卡未连接。"
+        print_error "   3. 服务器提供商的安全组/ACL或公司防火墙阻止了所有出站流量。"
+        print_error "   请先解决底层的网络连接问题。脚本无法继续。"
+        print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"; exit 1;
+    fi
+    print_success "IP连通性正常。"
+
+    # 2. 检查DNS解析
+    if ping -c 1 -W 3 google.com &>/dev/null; then
+        print_success "DNS解析正常。"
         return 0
     fi
-    
-    print_warning "网络或DNS解析失败！尝试自动修复..."
-    # 检查resolv.conf是否可写
+
+    print_warning "检测到DNS解析失败！将尝试高级修复..."
+    if ! command -v chattr &>/dev/null; then
+        print_error "!! 关键命令 'chattr' 不存在，无法执行高级网络修复。"; exit 1;
+    fi
+
+    # 3. 执行强制DNS修复
+    print_info "为了防止系统覆盖，将临时锁定DNS配置文件..."
     if [ ! -w /etc/resolv.conf ]; then
-        print_error "!! DNS配置文件 /etc/resolv.conf 不可写。"
-        print_error "   请检查文件权限或是否被 'chattr +i' 锁定。自动修复失败。"
-        exit 1
+        # Check attributes if not writable
+        ORIGINAL_RESOLV_ATTRS=$(lsattr /etc/resolv.conf | awk '{print $1}')
+        if [[ "$ORIGINAL_RESOLV_ATTRS" == *i* ]]; then
+             print_info "发现 /etc/resolv.conf 已被锁定，将临时解锁..."
+             chattr -i /etc/resolv.conf
+        fi
+        if [ ! -w /etc/resolv.conf ]; then
+             print_error "!! DNS配置文件 /etc/resolv.conf 无法写入，且解锁失败。请检查权限。"; exit 1;
+        fi
+    fi
+    
+    # 备份并写入新的配置
+    cp /etc/resolv.conf /etc/resolv.conf.bak.nexus
+    cat > /etc/resolv.conf << EOF
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+options edns0
+EOF
+    # 锁定文件
+    chattr +i /etc/resolv.conf
+    RESOLV_LOCKED=1
+    print_success "/etc/resolv.conf 已临时配置并锁定。"
+
+    # 4. 最终验证
+    print_info "再次验证DNS解析..."
+    safe_sleep 1
+    if ! ping -c 1 -W 3 google.com &>/dev/null; then
+        print_error "!!!!!!!!!!!!!!!!!!!!!! 高级网络修复失败 !!!!!!!!!!!!!!!!!!!!!!!";
+        print_error "   强制设置DNS后依然无法解析域名！"
+        print_error "   这极有可能是因为您的网络防火墙阻止了向外的DNS查询 (UDP端口 53)。"
+        print_error "   请联系您的网络管理员或云服务商，放行DNS端口。"
+        print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!";
+        # cleanup will handle unlocking
+        exit 1;
     fi
 
-    # 备份并添加公共DNS
-    if ! grep -q "nameserver 8.8.8.8" /etc/resolv.conf; then
-        print_info "正在添加 Google DNS (8.8.8.8) 到 /etc/resolv.conf ..."
-        cp /etc/resolv.conf /etc/resolv.conf.bak.$(date +%s)
-        echo "nameserver 8.8.8.8" >> /etc/resolv.conf
-    fi
-
-    # 再次测试
-    print_info "再次尝试网络连接..."
-    safe_sleep 2
-    if curl -s --head http://www.google.com | head -n 1 | grep "200 OK" > /dev/null; then
-        print_success "网络问题已自动修复！"
-    else
-        print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 致命网络错误 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-        print_error "   自动修复DNS后，仍然无法连接到外部网络。"
-        print_error "   这可能由以下更深层的原因导致："
-        print_error "   1. 物理网络连接中断或网络配置错误 (IP地址/网关)。"
-        print_error "   2. 您的网络服务商或云服务商的安全组/防火墙策略过于严格。"
-        print_error "   请联系您的系统管理员或服务提供商解决网络问题。"
-        print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-        exit 1
-    fi
+    print_success "高级网络修复成功！脚本将在此环境下继续执行。"
 }
 
-check_core_utils() {
-    print_info "正在执行系统核心组件健全性检查..."
-    local broken_utils=()
-    if command -v apt-get &>/dev/null; then local packages_to_reinstall=("coreutils" "ca-certificates");
-    elif command -v yum &>/dev/null || command -v dnf &>/dev/null; then local packages_to_reinstall=("coreutils" "ca-certificates");
-    else packages_to_reinstall=(); fi
-    declare -A utils_map; utils_map=( ["grep"]="grep" ["wget"]="wget" ["curl"]="curl" )
 
-    for util in "${!utils_map[@]}"; do
-        if command -v "$util" &>/dev/null && ! "$util" --version &>/dev/null; then
-            broken_utils+=("$util"); [[ ! " ${packages_to_reinstall[*]} " =~ " ${utils_map[$util]} " ]] && packages_to_reinstall+=("${utils_map[$util]}")
-        fi
-    done
+# --- Core Functions ---
+check_core_utils() {
+    print_info "正在执行系统核心组件健全性检查...";
+    local packages_to_reinstall=();
+    if command -v apt-get &>/dev/null; then packages_to_reinstall=("coreutils" "ca-certificates");
+    elif command -v yum &>/dev/null || command -v dnf &>/dev/null; then packages_to_reinstall=("coreutils" "ca-certificates" "e2fsprogs"); # e2fsprogs for chattr
+    fi
+    declare -A utils_map; utils_map=( ["grep"]="grep" ["wget"]="wget" ["curl"]="curl" ["chattr"]="chattr" ["ping"]="ping" )
+    local broken_utils=()
+    for util in "${!utils_map[@]}"; do if command -v "$util" &>/dev/null && ! "$util" --version &>/dev/null 2>&1 && ! "$util" -V &>/dev/null 2>&1; then broken_utils+=("$util"); fi; done
 
     if [ ${#broken_utils[@]} -gt 0 ]; then
-        local unique_packages=$(echo "${packages_to_reinstall[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' ')
-        print_error "!! 致命系统错误: 检测到核心系统命令 (${broken_utils[*]}) 已损坏。"
-        print_error "---------------------- 请立即执行以下综合修复命令 ----------------------"
-        if command -v apt-get &>/dev/null; then print_error "   ${COLOR_CYAN}sudo apt-get update && sudo apt-get install --reinstall ${unique_packages}${COLOR_RESET}";
-        elif command -v dnf &>/dev/null; then print_error "   ${COLOR_CYAN}sudo dnf reinstall -y ${unique_packages}${COLOR_RESET}";
-        elif command -v yum &>/dev/null; then print_error "   ${COLOR_CYAN}sudo yum reinstall -y ${unique_packages}${COLOR_RESET}"; fi
-        print_error "----------------------------------------------------------------------"; exit 1
+        print_error "!! 致命系统错误: 检测到核心命令 (${broken_utils[*]}) 已损坏。"; exit 1
     fi
     print_success "核心组件检查通过。"
 }
@@ -158,9 +191,7 @@ setup_buildx() {
     print_info "正在检查和配置多架构构建所需的 binfmt 支持..."
     if ! docker image inspect tonistiigi/binfmt:latest &>/dev/null; then
         print_info "正在拉取 'tonistiigi/binfmt' 镜像..."
-        if ! docker pull tonistiigi/binfmt:latest; then
-            print_error "!! 拉取 'tonistiigi/binfmt' 镜像失败。"; print_error "   查看Docker日志: ${COLOR_CYAN}journalctl -u docker.service -n 50${COLOR_RESET}"; exit 1
-        fi
+        if ! docker pull tonistiigi/binfmt:latest; then print_error "!! 拉取 'tonistiigi/binfmt' 镜像失败。"; exit 1; fi
     fi
 
     local binfmt_check_output
@@ -174,11 +205,8 @@ setup_buildx() {
         print_warning "\n【最终建议】: 如果 '一键修复方案' 仍然无效，强烈建议【重装操作系统】。"
         print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"; exit 1
     fi
-
-    case "$binfmt_check_output" in
-        *"supported"*) print_success "Binfmt 支持已正确配置。" ;;
-        *) print_warning "Binfmt 支持未激活，但容器运行成功。此状态罕见。"; print_error "   自动修复流程无法处理，请参照【最终建议】。"; exit 1;;
-    esac
+    if [[ "$binfmt_check_output" != *"supported"* ]]; then print_error "Binfmt 支持配置异常，请参照【最终建议】。"; exit 1; fi
+    print_success "Binfmt 支持已正确配置。"
 
     if docker buildx ls | grep -q "^${BUILDER_NAME}"; then docker buildx rm --force "$BUILDER_NAME" >/dev/null 2>&1 || true; fi
     if ! docker buildx create --name "$BUILDER_NAME" --driver docker-container --bootstrap --use >/dev/null 2>&1; then print_error "!! Buildx builder '$BUILDER_NAME' 创建失败！"; exit 1; fi
@@ -219,7 +247,7 @@ EOF
     print_success "镜像 '$IMAGE_NAME' 构建完成。"
 }
 
-# --- 其他管理函数 ---
+# --- 其他管理函数 (无改动) ---
 run_container() {
     local node_id="$1"; [ -z "$node_id" ] && { print_error "Node ID is required."; return 1; }
     local cname="${BASE_CONTAINER_NAME}-${node_id}"; if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker stop "$cname" &>/dev/null || true; docker rm "$cname" &>/dev/null || true; fi
@@ -232,14 +260,14 @@ run_container() {
 stop_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if [ -n "$(docker ps -q -f name="^${cname}$")" ]; then docker stop "$cname" &>/dev/null && print_success "节点 ${1} 已停止。"; else print_info "节点 ${1} 已是停止状态或不存在。"; fi; }
 start_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker start "$cname" &>/dev/null; safe_sleep 2; if [ -n "$(docker ps -q -f name="^${cname}$")" ]; then print_success "节点 ${1} 已启动。"; fi; else print_error "未找到节点 ${1}。"; fi; }
 restart_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker restart "$cname" &>/dev/null; safe_sleep 2; print_success "节点 ${1} 已重启。"; else print_error "未找到节点 ${1}。"; fi; }
-uninstall_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; print_info "正在卸载节点 ${1}..."; if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker stop "$cname" &>/dev/null || true; docker rm "$cname" &>/dev/null || true; fi; rm -f "${LOG_DIR}/nexus-${1}.log"; print_success "节点 ${1} 已卸载。"; }
+uninstall_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker stop "$cname" &>/dev/null || true; docker rm "$cname" &>/dev/null || true; fi; rm -f "${LOG_DIR}/nexus-${1}.log"; print_success "节点 ${1} 已卸载。"; }
 get_all_node_ids() { docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//" | sort -u; }
 view_node_logs() { docker logs -f "${BASE_CONTAINER_NAME}-${1}"; }
 
 list_nodes() {
-    print_color "============================== 当前 Nexus 节点状态 ===============================" "$COLOR_BLUE"
-    printf "%-40s %-28s %-12s %-18s\n" "$(print_bold "节点ID(容器名)")" "$(print_bold "状态")" "$(print_bold "CPU")" "$(print_bold "内存")"
-    print_color "----------------------------------------------------------------------------------" "$COLOR_BLUE"
+    print_color "============================== 当前 Nexus 节点状态 ===============================" "$COLOR_BLUE";
+    printf "%-40s %-28s %-12s %-18s\n" "$(print_bold "节点ID(容器名)")" "$(print_bold "状态")" "$(print_bold "CPU")" "$(print_bold "内存")";
+    print_color "----------------------------------------------------------------------------------" "$COLOR_BLUE";
     local nodes=$(get_all_node_ids)
     if [ -z "$nodes" ]; then print_warning "未找到任何 Nexus 节点。"; else
         declare -A stats_map
@@ -254,52 +282,21 @@ list_nodes() {
             printf "%-40s %-28s %-12s %-18s\n" "$id ($cname)" "$(print_color "$status" "$s_color")" "$cpu" "$mem"
         done
     fi
-    print_color "==================================================================================" "$COLOR_BLUE"
+    print_color "==================================================================================" "$COLOR_BLUE";
 }
 
-select_node_action() {
-    local action_callback="$1"; local prompt_message="$2"; local nodes=($(get_all_node_ids))
-    if [ ${#nodes[@]} -eq 0 ]; then print_warning "无节点可操作。"; read -n 1 -s -r -p "按任意键返回..."; return; fi
-    echo "选择要'${prompt_message}'的节点:";
-    for i in "${!nodes[@]}"; do printf "  ${COLOR_CYAN}%d.${COLOR_RESET} %s\n" "$((i+1))" "${nodes[$i]}"; done
-    read -rp "请输入选项 (0 返回): " choice
-    if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [ "$choice" -le ${#nodes[@]} ]; then "$action_callback" "${nodes[$((choice-1))]}"; fi; read -n 1 -s -r -p "按任意键返回...";
-}
-
-select_multiple_nodes_action() {
-    local action_callback="$1"; local prompt_message="$2"; local nodes=($(get_all_node_ids))
-    if [ ${#nodes[@]} -eq 0 ]; then print_warning "无节点可操作。"; read -n 1 -s -r -p "按任意键返回..."; return; fi
-    echo "选择要'${prompt_message}'的节点(多选用空格; 'all'全选):"; for i in "${!nodes[@]}"; do printf "  ${COLOR_CYAN}%d.${COLOR_RESET} %s\n" "$((i+1))" "${nodes[$i]}"; done
-    read -rp "请输入选项 (0 返回): " choices_str
-    if [ "$choices_str" = "0" ] || [ -z "$choices_str" ]; then return; fi
-    local selected=(); if [ "$choices_str" = "all" ]; then selected=("${nodes[@]}"); else for c in $choices_str; do if [[ "$c" =~ ^[1-9][0-9]*$ ]] && [ "$c" -le ${#nodes[@]} ]; then selected+=("${nodes[$((c-1))]}"); fi; done; fi
-    if [ ${#selected[@]} -gt 0 ] && confirm_action "确认'${prompt_message}'选中的 ${#selected[@]} 个节点?"; then
-        for id in "${selected[@]}"; do "$action_callback" "$id"; done; print_success "批量操作完成。"
-    fi
-    read -n 1 -s -r -p "按任意键返回...";
-}
-
-# --- 菜单函数 ---
+# --- 菜单函数 (无改动) ---
+select_node_action() { local action_callback="$1"; local prompt_message="$2"; local nodes=($(get_all_node_ids)); if [ ${#nodes[@]} -eq 0 ]; then print_warning "无节点可操作。"; read -n 1 -s -r -p "按任意键返回..."; return; fi; echo "选择要'${prompt_message}'的节点:"; for i in "${!nodes[@]}"; do printf "  ${COLOR_CYAN}%d.${COLOR_RESET} %s\n" "$((i+1))" "${nodes[$i]}"; done; read -rp "请输入选项 (0 返回): " choice; if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [ "$choice" -le ${#nodes[@]} ]; then "$action_callback" "${nodes[$((choice-1))]}"; fi; read -n 1 -s -r -p "按任意键返回..."; }
+select_multiple_nodes_action() { local action_callback="$1"; local prompt_message="$2"; local nodes=($(get_all_node_ids)); if [ ${#nodes[@]} -eq 0 ]; then print_warning "无节点可操作。"; read -n 1 -s -r -p "按任意键返回..."; return; fi; echo "选择要'${prompt_message}'的节点(多选用空格; 'all'全选):"; for i in "${!nodes[@]}"; do printf "  ${COLOR_CYAN}%d.${COLOR_RESET} %s\n" "$((i+1))" "${nodes[$i]}"; done; read -rp "请输入选项 (0 返回): " choices_str; if [ "$choices_str" = "0" ] || [ -z "$choices_str" ]; then return; fi; local selected=(); if [ "$choices_str" = "all" ]; then selected=("${nodes[@]}"); else for c in $choices_str; do if [[ "$c" =~ ^[1-9][0-9]*$ ]] && [ "$c" -le ${#nodes[@]} ]; then selected+=("${nodes[$((c-1))]}"); fi; done; fi; if [ ${#selected[@]} -gt 0 ] && confirm_action "确认'${prompt_message}'选中的 ${#selected[@]} 个节点?"; then for id in "${selected[@]}"; do "$action_callback" "$id"; done; print_success "批量操作完成。"; fi; read -n 1 -s -r -p "按任意键返回..."; }
 menu_install_single() { read -rp "请输入要安装的 Node ID: " id; id=$(echo "$id"|xargs); if [ -n "$id" ]; then build_image; run_container "$id"; else print_warning "ID 无效。"; fi; read -n 1 -s -r -p "按任意键返回..."; }
 menu_batch_install() { build_image; print_info "请输入多个Node ID(每行一个,空行结束):"; local ids=(); while read -r line && [ -n "$line" ]; do ids+=("$line"); done; if [ ${#ids[@]} -gt 0 ] && confirm_action "确认安装 ${#ids[@]} 个新节点?"; then for id in "${ids[@]}"; do run_container "$id"; done; fi; read -n 1 -s -r -p "按任意键返回..."; }
-menu_update() {
-    while true; do clear; print_color "===== 系统维护与更新 =====" "$COLOR_BLUE";
-        echo " 1. 强制重构镜像"; echo " 2. 更新所有运行中节点"; echo " 3. 清理所有数据"; echo " 0. 返回";
-        read -rp "请输入选项: " choice
-        case $choice in
-            1) build_image "--force";;
-            2) if confirm_action "确认更新所有运行中节点?"; then build_image "--force"; for id in $(docker ps --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//"); do run_container "$id"; done; fi;;
-            3) if confirm_action "【警告】将删除所有节点、镜像、日志和builder！确定吗?"; then docker rm -f $(docker ps -a -q --filter "name=${BASE_CONTAINER_NAME}-") >/dev/null 2>&1 || true; if docker image inspect "$IMAGE_NAME" &>/dev/null; then docker rmi -f "$IMAGE_NAME"; fi; if docker buildx ls | grep -q "$BUILDER_NAME"; then docker buildx rm -f "$BUILDER_NAME"; fi; print_success "清理完成。"; fi;;
-            0) break;; *) print_error "无效选项。";;
-        esac; read -n 1 -s -r -p "按任意键返回..."
-    done
-}
+menu_update() { while true; do clear; print_color "===== 系统维护与更新 =====" "$COLOR_BLUE"; echo " 1. 强制重构镜像"; echo " 2. 更新所有运行中节点"; echo " 3. 清理所有数据"; echo " 0. 返回"; read -rp "请输入选项: " choice; case $choice in 1) build_image "--force";; 2) if confirm_action "确认更新所有运行中节点?"; then build_image "--force"; for id in $(docker ps --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//"); do run_container "$id"; done; fi;; 3) if confirm_action "【警告】将删除所有节点、镜像、日志和builder！确定吗?"; then docker rm -f $(docker ps -a -q --filter "name=${BASE_CONTAINER_NAME}-") >/dev/null 2>&1 || true; if docker image inspect "$IMAGE_NAME" &>/dev/null; then docker rmi -f "$IMAGE_NAME"; fi; if docker buildx ls | grep -q "$BUILDER_NAME"; then docker buildx rm -f "$BUILDER_NAME"; fi; print_success "清理完成。"; fi;; 0) break;; *) print_error "无效选项。";; esac; read -n 1 -s -r -p "按任意键返回..."; done; }
 
 # --- 主入口 ---
 main_menu() {
     if [ "$(id -u)" -ne 0 ]; then print_error "错误: 脚本需要root权限运行。"; exit 1; fi
-    check_network_and_dns
     check_core_utils
+    check_network_and_dns
     ensure_docker_ready
     while true; do
         clear; print_color "===== Nexus 管理脚本 ${SCRIPT_VERSION} =====" "$COLOR_BLUE"; list_nodes;
