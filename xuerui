@@ -2,22 +2,20 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 (ARM64 Docker) - v5.4 智能依赖修复版
+# Nexus 多节点管理脚本 (ARM64 Docker) - v5.5 终极智能修复版
 #
 # 改版者: AI & 社区智慧
 #
-# 【V5.4 - 智能依赖修复版 更新】:
-#   - 【智能依赖修复】: 新增统一的 'prepare_system' 函数，该函数会自动检测并安装所有缺失的
-#     核心依赖（如 'chattr', 'ping', 'curl' 等），彻底解决 "命令已损坏/不存在" 的问题。
-#   - 【优雅降级】: 解决了网络修复的“鸡生蛋”问题。当 'chattr' 命令不存在时，脚本会智能降级，
-#     采用备用网络修复方案，并抢在系统配置被覆盖前回滚前，立即安装所需工具。
-#   - 【流程优化】: 将环境准备的所有步骤（网络检查、依赖安装）合并到一个逻辑流程中，
-#     使脚本启动更加健壮可靠。
+# 【V5.5 - 终极智能修复版 更新】:
+#   - 【界面恢复】: 恢复并统一了完整的中文用户界面，包括所有菜单、提示、状态和错误信息。
+#   - 【功能集成】: 完美集成了 v5.4 版本的智能依赖修复核心（自动安装 'chattr' 等缺失工具）
+#     和优雅降级的网络修复逻辑。
+#   - 【最终形态】: 此版本是技术稳健性与用户体验的最终结合体，是解决您所有问题的最终方案。
 #
 # ================================================================================================
 
 # --- 配置项 ---
-SCRIPT_VERSION="v5.4 智能依赖修复版"
+SCRIPT_VERSION="v5.5 终极智能修复版"
 NEXUS_CLI_VERSION="v0.10.7"
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:latest-arm64"
@@ -32,10 +30,10 @@ COLOR_BLUE='\033[0;34m'; COLOR_CYAN='\033[0;36m'; COLOR_BOLD='\033[1m'
 TMP_WORKDIR=""; RESOLV_LOCKED=0; ORIGINAL_RESOLV_PATH=""
 cleanup() {
     EXITCODE=$?
-    printf "\n"; print_info "Executing cleanup..."
+    printf "\n"; print_info "正在执行清理程序..."
     if [ "$RESOLV_LOCKED" -eq 1 ]; then
-        print_info "Restoring original /etc/resolv.conf..."
-        # In case resolv.conf was a symlink, restore it. Otherwise, restore content.
+        print_info "正在恢复原始 /etc/resolv.conf..."
+        # 兼容resolv.conf是符号链接的情况
         if [ -n "$ORIGINAL_RESOLV_PATH" ] && [ ! -L /etc/resolv.conf ]; then
             rm -f /etc/resolv.conf
             ln -s "$ORIGINAL_RESOLV_PATH" /etc/resolv.conf
@@ -43,7 +41,7 @@ cleanup() {
             chattr -i /etc/resolv.conf 2>/dev/null || true
             mv -f /etc/resolv.conf.bak.nexus /etc/resolv.conf
         fi
-        print_success "/etc/resolv.conf restored."
+        print_success "/etc/resolv.conf 已恢复。"
     fi
     [ -n "$TMP_WORKDIR" ] && [ -d "$TMP_WORKDIR" ] && rm -rf "$TMP_WORKDIR"
     exit $EXITCODE
@@ -58,155 +56,108 @@ safe_sleep() { read -t "$1" < /dev/null 2>/dev/null || true; }
 confirm_action() { read -rp "${COLOR_YELLOW}>>> ${1} (y/N): ${COLOR_RESET}" c; [[ "$c" =~ ^[yY]([eE][sS])?$ ]]; }
 
 
-# ---【V5.4 全新环境准备函数】---
+# ---【V5.4+V5.5 环境准备核心函数】---
 prepare_system() {
-    print_bold "Phase 1: System and Network Preparation"
+    print_bold "第一阶段: 系统和网络环境准备"
 
-    # --- 1. 确定包管理器和包定义 ---
+    # 1. 确定包管理器和依赖包定义
     local PKG_MANAGER=""
     local -n current_pkg_map # Nameref for map
-    declare -A debian_pkg_map=(
-        ["chattr"]="e2fsprogs" ["ping"]="iputils-ping" ["curl"]="curl" ["gpg"]="gnupg"
-        ["wget"]="wget" ["lsb_release"]="lsb-release" ["add-apt-repository"]="software-properties-common"
-    )
-    declare -A rhel_pkg_map=(
-        ["chattr"]="e2fsprogs" ["ping"]="iputils" ["curl"]="curl" ["gpg"]="gnupg2"
-        ["wget"]="wget" ["yum-config-manager"]="yum-utils" ["dnf"]="dnf"
-    )
+    declare -A debian_pkg_map=( ["chattr"]="e2fsprogs" ["ping"]="iputils-ping" ["curl"]="curl" ["gpg"]="gnupg" ["wget"]="wget" ["lsb_release"]="lsb-release" )
+    declare -A rhel_pkg_map=( ["chattr"]="e2fsprogs" ["ping"]="iputils" ["curl"]="curl" ["gpg"]="gnupg2" ["wget"]="wget" ["yum-config-manager"]="yum-utils" )
+    
     if command -v apt-get &>/dev/null; then PKG_MANAGER="apt-get"; current_pkg_map=debian_pkg_map;
     elif command -v dnf &>/dev/null; then PKG_MANAGER="dnf"; current_pkg_map=rhel_pkg_map;
     elif command -v yum &>/dev/null; then PKG_MANAGER="yum"; current_pkg_map=rhel_pkg_map;
-    else print_error "!! 无法识别的包管理器。"; exit 1; fi
+    else print_error "!! 无法识别的包管理器。脚本无法继续。"; exit 1; fi
 
-    # --- 2. 检查网络, 并为安装依赖做准备 ---
+    # 2. 检查网络，并在必要时执行临时修复
     if ! ping -c 1 -W 3 google.com &>/dev/null; then
-        print_warning "DNS resolution failed. Checking direct IP connectivity..."
+        print_warning "DNS解析失败。正在检查直接IP连通性..."
         if ! ping -c 1 -W 3 8.8.8.8 &>/dev/null; then
-            print_error "!! Network connectivity error: Cannot PING external IP 8.8.8.8."; exit 1;
+            print_error "!! 致命网络错误: 无法 PING 通外部IP (8.8.8.8)，请检查网关或防火墙设置。"; exit 1;
         fi
-        
-        print_warning "DNS is the issue. Attempting temporary fix to allow package installation..."
-        # Handle resolv.conf, which may be a symlink (e.g., to systemd-resolved)
-        if [ -L /etc/resolv.conf ]; then
-            ORIGINAL_RESOLV_PATH=$(readlink -f /etc/resolv.conf)
-            unlink /etc/resolv.conf
-        fi
+        print_warning "确认为DNS问题。尝试临时修复以允许安装依赖..."
+        if [ -L /etc/resolv.conf ]; then ORIGINAL_RESOLV_PATH=$(readlink -f /etc/resolv.conf); unlink /etc/resolv.conf; fi
         [ -f /etc/resolv.conf ] && mv /etc/resolv.conf /etc/resolv.conf.bak.nexus
-        echo "nameserver 8.8.8.8" > /etc/resolv.conf
-        echo "nameserver 1.1.1.1" >> /etc/resolv.conf
-        RESOLV_LOCKED=1 # Use cleanup trap to restore it later
+        echo "nameserver 8.8.8.8" > /etc/resolv.conf; echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+        RESOLV_LOCKED=1 # 标记，以便退出时恢复
+        if command -v chattr &>/dev/null; then chattr +i /etc/resolv.conf; print_success "已使用 'chattr' 锁定功能临时修复DNS。";
+        else print_warning "警告: 未找到 'chattr' 命令。DNS修复可能被系统覆盖，脚本将快速继续。"; fi
+    else print_success "网络与DNS检测正常。"; fi
 
-        if command -v chattr &>/dev/null; then
-            chattr +i /etc/resolv.conf
-            print_success "DNS temporarily fixed using 'chattr' lock."
-        else
-            print_warning "WARN: 'chattr' not found. DNS fix might be overwritten by system. Proceeding quickly."
-        fi
-    else
-        print_success "Network and DNS are OK."
-    fi
-
-    # --- 3. 检查并安装所有缺失的依赖 ---
+    # 3. 检查并一次性安装所有缺失的核心依赖
     local packages_to_install=()
-    print_info "Checking for required system utilities..."
-    for cmd in "${!current_pkg_map[@]}"; do
-        if ! command -v "$cmd" &>/dev/null; then
-            packages_to_install+=("${current_pkg_map[$cmd]}")
-        fi
-    done
-
+    print_info "正在检查所需的核心系统工具..."
+    for cmd in "${!current_pkg_map[@]}"; do if ! command -v "$cmd" &>/dev/null; then packages_to_install+=("${current_pkg_map[$cmd]}"); fi; done
     if [ ${#packages_to_install[@]} -gt 0 ]; then
         local unique_packages=$(echo "${packages_to_install[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' ')
-        print_warning "The following packages are missing and will be installed: ${unique_packages}"
-        
+        print_warning "检测到以下核心软件包缺失，即将自动安装: ${unique_packages}"
         case "$PKG_MANAGER" in
-            "apt-get")
-                apt-get update -qq >/dev/null
-                if ! apt-get install -y --no-install-recommends ${unique_packages} >/dev/null 2>&1; then
-                    print_error "!! Failed to auto-install core packages. Try manually: sudo apt-get install ${unique_packages}"; exit 1;
-                fi
-                ;;
-            "dnf"|"yum")
-                if ! $PKG_MANAGER install -y ${unique_packages} >/dev/null 2>&1; then
-                    print_error "!! Failed to auto-install core packages. Try manually: sudo ${PKG_MANAGER} install -y ${unique_packages}"; exit 1;
-                fi
-                ;;
+            "apt-get") apt-get update -qq >/dev/null; apt-get install -y --no-install-recommends ${unique_packages} >/dev/null;;
+            "dnf"|"yum") $PKG_MANAGER install -y ${unique_packages} >/dev/null;;
         esac
-        print_success "All required system utilities are now installed."
-    else
-        print_success "All system utilities are present."
-    fi
+        if [ $? -ne 0 ]; then print_error "!! 自动安装核心软件包失败。请尝试手动运行: sudo ${PKG_MANAGER} install -y ${unique_packages}"; exit 1; fi
+        print_success "所有必需的系统工具均已成功安装。";
+    else print_success "所有核心系统工具均已存在。"; fi
 }
 
 
-# --- Core Functions ---
 ensure_docker_ready() {
-    print_bold "Phase 2: Docker Environment Setup"
-    if docker info >/dev/null 2>&1; then print_success "Docker is already installed and running."; return 0; fi
+    print_bold "第二阶段: Docker环境部署"
+    if docker info >/dev/null 2>&1; then print_success "Docker已安装并正在运行。"; return 0; fi
 
     if ! command -v docker &> /dev/null; then
-        print_warning "Docker is not installed. Attempting automatic installation..."
-        if [ -f /etc/os-release ]; then . /etc/os-release; OS_ID=$ID; else print_error "!! Cannot detect OS type."; exit 1; fi
-
+        print_warning "Docker未安装，正在尝试自动安装..."; if [ -f /etc/os-release ]; then . /etc/os-release; OS_ID=$ID; else print_error "!! 无法检测操作系统类型。"; exit 1; fi
         case "$OS_ID" in
             ubuntu|debian)
-                print_info "Installing Docker for Debian/Ubuntu..."
-                apt-get update -qq >/dev/null
-                apt-get install -y --no-install-recommends apt-transport-https ca-certificates software-properties-common >/dev/null
-                curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+                print_info "正在为 Debian/Ubuntu 系统安装 Docker..."
+                apt-get install -y --no-install-recommends ca-certificates >/dev/null
+                mkdir -p /etc/apt/keyrings; curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
                 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-                apt-get update -qq >/dev/null
-                apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin >/dev/null
+                apt-get update -qq >/dev/null; apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin >/dev/null
                 ;;
             centos|rhel|fedora|rocky|almalinux)
-                print_info "Installing Docker for RHEL/CentOS..."
+                print_info "正在为 RHEL/CentOS 系统安装 Docker..."
                 yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo >/dev/null
                 yum install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin >/dev/null
                 ;;
-            *) print_error "!! Unsupported OS: $OS_ID."; exit 1;;
+            *) print_error "!! 不支持的操作系统: $OS_ID。"; exit 1;;
         esac
-        print_info "Starting and enabling Docker service..."; systemctl start docker && systemctl enable docker; safe_sleep 3
+        print_info "正在启动并设置Docker开机自启..."; systemctl start docker && systemctl enable docker; safe_sleep 3
     fi
 
-    if ! docker info >/dev/null 2>&1; then
-        print_warning "Docker service not running, trying to start..."; systemctl start docker
-        safe_sleep 3
-        if ! docker info >/dev/null 2>&1; then print_error "!! Failed to start Docker service. Check logs: journalctl -u docker.service"; exit 1; fi
-    fi
-    if ! docker buildx version &>/dev/null; then print_error "!! Docker buildx plugin is missing!"; exit 1; fi
-    print_success "Docker environment is ready."
+    if ! docker info >/dev/null 2>&1; then print_warning "Docker 服务未运行，正在尝试启动..."; systemctl start docker; safe_sleep 3; if ! docker info >/dev/null 2>&1; then print_error "!! 启动 Docker 服务失败。请检查日志: journalctl -u docker.service"; exit 1; fi; fi
+    if ! docker buildx version &>/dev/null; then print_error "!! Docker buildx 插件缺失！"; exit 1; fi
+    print_success "Docker 环境准备就绪。"
 }
 
 setup_buildx() {
-    print_bold "Phase 3: Docker Buildx Configuration"
-    print_info "Configuring multi-arch build support (binfmt)..."
-    if ! docker image inspect tonistiigi/binfmt:latest &>/dev/null; then
-        print_info "Pulling 'tonistiigi/binfmt' image..."
-        if ! docker pull tonistiigi/binfmt:latest; then print_error "!! Failed to pull 'tonistiigi/binfmt' image."; exit 1; fi
-    fi
+    print_bold "第三阶段: Docker Buildx 多架构构建环境配置"
+    print_info "正在配置多架构构建支持 (binfmt)..."
+    if ! docker image inspect tonistiigi/binfmt:latest &>/dev/null; then print_info "正在拉取 'tonistiigi/binfmt' 镜像..."; if ! docker pull tonistiigi/binfmt:latest; then print_error "!! 拉取 'tonistiigi/binfmt' 镜像失败。"; exit 1; fi; fi
     if ! docker run --rm --privileged tonistiigi/binfmt:latest --install all >/dev/null 2>&1; then
-        print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!! CRITICAL ERROR !!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-        print_error "  Failed to register binfmt handlers via privileged container."
-        print_error "  This is almost always a security policy issue (AppArmor or SELinux)."
-        print_error "--------------------------  ONE-CLICK FIX  ---------------------------"
-        if command -v apt-get &>/dev/null; then print_error "  On Ubuntu/Debian: ${COLOR_CYAN}sudo apt-get install apparmor-utils -y && sudo aa-complain /etc/apparmor.d/docker${COLOR_RESET}";
-        else print_error "  On CentOS/RHEL: ${COLOR_CYAN}sudo setenforce 0 && sudo sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config${COLOR_RESET}"; fi
+        print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 致命错误 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        print_error "   无法通过特权容器与系统内核交互。这几乎总是由 AppArmor 或 SELinux 安全策略导致。"
+        print_error "--------------------------- 【首选】一键修复方案 ---------------------------"
+        if command -v apt-get &>/dev/null; then print_error "   Ubuntu/Debian 系统: ${COLOR_CYAN}sudo apt-get install apparmor-utils -y && sudo aa-complain /etc/apparmor.d/docker${COLOR_RESET}";
+        else print_error "   CentOS/RHEL 系统: ${COLOR_CYAN}sudo setenforce 0 && sudo sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config${COLOR_RESET}"; fi
         print_error "----------------------------------------------------------------------"
-        print_error "  Run the command for your system and then re-run this script."
+        print_error "   请为您的系统执行上述命令，然后重新运行本脚本。"
         print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"; exit 1
     fi
-    print_success "Binfmt support is configured."
-    print_info "Setting up Buildx builder '$BUILDER_NAME'..."
+    print_success "Binfmt 支持已成功配置。"
+    print_info "正在设置 Buildx builder '$BUILDER_NAME'..."
     if docker buildx ls | grep -q "^${BUILDER_NAME}"; then docker buildx rm --force "$BUILDER_NAME" >/dev/null 2>&1 || true; fi
-    if ! docker buildx create --name "$BUILDER_NAME" --driver docker-container --bootstrap --use >/dev/null 2>&1; then print_error "!! Failed to create Buildx builder '$BUILDER_NAME'!"; exit 1; fi
-    print_success "Buildx builder '$BUILDER_NAME' is ready and active."
+    if ! docker buildx create --name "$BUILDER_NAME" --driver docker-container --bootstrap --use >/dev/null 2>&1; then print_error "!! 创建 Buildx builder '$BUILDER_NAME' 失败！"; exit 1; fi
+    print_success "Buildx builder '$BUILDER_NAME' 已就绪并设为默认。"
 }
 
 build_image() {
-    if [[ -z "$1" ]] && docker image inspect "$IMAGE_NAME" &>/dev/null; then print_info "Image '$IMAGE_NAME' already exists. Skipping build."; return; fi
+    if [[ -z "$1" ]] && docker image inspect "$IMAGE_NAME" &>/dev/null; then print_info "镜像 '$IMAGE_NAME' 已存在，跳过构建。"; return; fi
     setup_buildx; TMP_WORKDIR=$(mktemp -d); cd "$TMP_WORKDIR"
     cli_url="https://github.com/nexus-xyz/nexus-cli/releases/download/${NEXUS_CLI_VERSION}/nexus-network-linux-arm64"
-    print_info "Generating Dockerfile..."
+    print_info "正在生成 Dockerfile..."
     cat > Dockerfile <<EOF
 FROM --platform=linux/arm64 ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
@@ -220,58 +171,55 @@ EOF
     cat > entrypoint.sh <<'EOF'
 #!/bin/bash
 set -e
-if [ -z "$NODE_ID" ]; then echo "Error: NODE_ID not set!" >&2; exit 1; fi
+if [ -z "$NODE_ID" ]; then echo "错误: 未设置NODE_ID环境变量!" >&2; exit 1; fi
 mkdir -p /root/.nexus && echo "$NODE_ID" > /root/.nexus/node-id
-LOG_FILE="/root/nexus.log"
-SESSION="nexus_${NODE_ID}"
-echo "Starting Nexus node $NODE_ID in screen session $SESSION..."
+LOG_FILE="/root/nexus.log"; SESSION="nexus_${NODE_ID}"
+echo "正在screen会话($SESSION)中启动 Nexus 节点 $NODE_ID ..."
 screen -dmS "$SESSION" bash -c "nexus-network start --node-id \$NODE_ID | tee \$LOG_FILE"
 sleep 2
-if ! screen -ls | grep -q "$SESSION"; then echo "!!! Node startup failed. Check log: $LOG_FILE" >&2; cat "$LOG_FILE" >&2; exit 1; fi
-echo "Node $NODE_ID started successfully."
+if ! screen -ls | grep -q "$SESSION"; then echo "!!! 节点启动失败，请检查日志: $LOG_FILE" >&2; cat "$LOG_FILE" >&2; exit 1; fi
+echo "节点 $NODE_ID 启动成功。"
 tail -f /dev/null
 EOF
-    print_info "Building image '$IMAGE_NAME'..."
-    if ! docker buildx build --builder "$BUILDER_NAME" -t "$IMAGE_NAME" . --load; then print_error "!! Docker image build failed."; exit 1; fi
-    print_success "Image '$IMAGE_NAME' built successfully."
+    print_info "正在构建镜像 '$IMAGE_NAME'..."
+    if ! docker buildx build --builder "$BUILDER_NAME" -t "$IMAGE_NAME" . --load; then print_error "!! Docker 镜像构建失败。"; exit 1; fi
+    print_success "镜像 '$IMAGE_NAME' 构建成功。"
 }
 
-# --- Node Management Functions ---
-run_container() { local node_id="$1"; [ -z "$node_id" ] && { print_error "Node ID is required."; return 1; }; local cname="${BASE_CONTAINER_NAME}-${node_id}"; if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker stop "$cname" &>/dev/null || true; docker rm "$cname" &>/dev/null || true; fi; mkdir -p "$LOG_DIR"; local log_file="${LOG_DIR}/nexus-${node_id}.log"; touch "$log_file"; print_info "Starting node ${node_id}..."; if ! docker run -d --name "$cname" -v "${log_file}:/root/nexus.log" -e NODE_ID="$node_id" --restart unless-stopped "$IMAGE_NAME" &>/dev/null; then print_error "!! Container '${cname}' failed to start."; return 1; fi; safe_sleep 3; if [ -n "$(docker ps -q -f name="^${cname}$")" ]; then print_success "Node $node_id started successfully. Log: $log_file"; else print_error "Node $node_id is not running after start! Check log."; cat "$log_file"; fi; }
-stop_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if [ -n "$(docker ps -q -f name="^${cname}$")" ]; then docker stop "$cname" &>/dev/null && print_success "Node ${1} stopped."; else print_info "Node ${1} already stopped or does not exist."; fi; }
-start_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker start "$cname" &>/dev/null; safe_sleep 2; if [ -n "$(docker ps -q -f name="^${cname}$")" ]; then print_success "Node ${1} started."; fi; else print_error "Node ${1} not found."; fi; }
-restart_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker restart "$cname" &>/dev/null; safe_sleep 2; print_success "Node ${1} restarted."; else print_error "Node ${1} not found."; fi; }
-uninstall_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker stop "$cname" &>/dev/null || true; docker rm "$cname" &>/dev/null || true; fi; rm -f "${LOG_DIR}/nexus-${1}.log"; print_success "Node ${1} uninstalled."; }
+# --- 节点管理与UI函数 ---
+run_container() { local node_id="$1"; [ -z "$node_id" ] && { print_error "Node ID不能为空。"; return 1; }; local cname="${BASE_CONTAINER_NAME}-${node_id}"; if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker stop "$cname" &>/dev/null || true; docker rm "$cname" &>/dev/null || true; fi; mkdir -p "$LOG_DIR"; local log_file="${LOG_DIR}/nexus-${node_id}.log"; touch "$log_file"; print_info "正在启动节点 ${node_id}..."; if ! docker run -d --name "$cname" -v "${log_file}:/root/nexus.log" -e NODE_ID="$node_id" --restart unless-stopped "$IMAGE_NAME" &>/dev/null; then print_error "!! 容器 '${cname}' 启动失败。"; return 1; fi; safe_sleep 3; if [ -n "$(docker ps -q -f name="^${cname}$")" ]; then print_success "节点 $node_id 启动成功。日志文件: $log_file"; else print_error "节点 $node_id 启动后未在运行！请检查日志。"; cat "$log_file"; fi; }
+stop_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if [ -n "$(docker ps -q -f name="^${cname}$")" ]; then docker stop "$cname" &>/dev/null && print_success "节点 ${1} 已停止。"; else print_info "节点 ${1} 已是停止状态或不存在。"; fi; }
+start_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker start "$cname" &>/dev/null; safe_sleep 2; if [ -n "$(docker ps -q -f name="^${cname}$")" ]; then print_success "节点 ${1} 已启动。"; fi; else print_error "未找到节点 ${1}。"; fi; }
+restart_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker restart "$cname" &>/dev/null; safe_sleep 2; print_success "节点 ${1} 已重启。"; else print_error "未找到节点 ${1}。"; fi; }
+uninstall_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; print_info "正在卸载节点 ${1}..."; if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker stop "$cname" &>/dev/null || true; docker rm "$cname" &>/dev/null || true; fi; rm -f "${LOG_DIR}/nexus-${1}.log"; print_success "节点 ${1} 已卸载。"; }
 get_all_node_ids() { docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//" | sort -u; }
 view_node_logs() { docker logs -f "${BASE_CONTAINER_NAME}-${1}"; }
-list_nodes() { print_color "============================== Current Nexus Node Status ===============================" "$COLOR_BLUE"; printf "%-40s %-28s %-12s %-18s\n" "$(print_bold "Node ID (Container)")" "$(print_bold "Status")" "$(print_bold "CPU")" "$(print_bold "Memory")"; print_color "----------------------------------------------------------------------------------" "$COLOR_BLUE"; local nodes=$(get_all_node_ids); if [ -z "$nodes" ]; then print_warning "No Nexus nodes found."; else declare -A stats_map; if [ -n "$(docker ps -q -f name="${BASE_CONTAINER_NAME}-")" ]; then local stats_output; stats_output=$(docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"); while IFS=$'\t' read -r name cpu mem; do stats_map["$name"]="$cpu\t$mem"; done <<< "$stats_output"; fi; for id in $nodes; do local cname="${BASE_CONTAINER_NAME}-${id}"; local status=$(docker ps -a -f name="^${cname}$" --format "{{.Status}}"); local s_color="$COLOR_RED"; local cpu="N/A"; local mem="N/A"; if [[ "$status" == *"Up"* ]]; then s_color="$COLOR_GREEN"; if [[ -v stats_map["$cname"] ]]; then IFS=$'\t' read -r cpu mem <<< "${stats_map[$cname]}"; fi; elif [[ "$status" == *"Exited"* ]]; then s_color="$COLOR_YELLOW"; fi; printf "%-40s %-28s %-12s %-18s\n" "$id ($cname)" "$(print_color "$status" "$s_color")" "$cpu" "$mem"; done; fi; print_color "==================================================================================" "$COLOR_BLUE"; }
+list_nodes() { print_color "============================== 当前 Nexus 节点状态 ===============================" "$COLOR_BLUE"; printf "%-40s %-28s %-12s %-18s\n" "$(print_bold "节点ID(容器名)")" "$(print_bold "状态")" "$(print_bold "CPU")" "$(print_bold "内存")"; print_color "----------------------------------------------------------------------------------" "$COLOR_BLUE"; local nodes=$(get_all_node_ids); if [ -z "$nodes" ]; then print_warning "未找到任何 Nexus 节点。"; else declare -A stats_map; if [ -n "$(docker ps -q -f name="${BASE_CONTAINER_NAME}-")" ]; then local stats_output; stats_output=$(docker stats --no-stream --format "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"); while IFS=$'\t' read -r name cpu mem; do stats_map["$name"]="$cpu\t$mem"; done <<< "$stats_output"; fi; for id in $nodes; do local cname="${BASE_CONTAINER_NAME}-${id}"; local status=$(docker ps -a -f name="^${cname}$" --format "{{.Status}}"); local s_color="$COLOR_RED"; local cpu="N/A"; local mem="N/A"; if [[ "$status" == *"Up"* ]]; then s_color="$COLOR_GREEN"; if [[ -v stats_map["$cname"] ]]; then IFS=$'\t' read -r cpu mem <<< "${stats_map[$cname]}"; fi; elif [[ "$status" == *"Exited"* ]]; then s_color="$COLOR_YELLOW"; fi; printf "%-40s %-28s %-12s %-18s\n" "$id ($cname)" "$(print_color "$status" "$s_color")" "$cpu" "$mem"; done; fi; print_color "==================================================================================" "$COLOR_BLUE"; }
+select_node_action() { local action_callback="$1"; local prompt_message="$2"; local nodes=($(get_all_node_ids)); if [ ${#nodes[@]} -eq 0 ]; then print_warning "无节点可操作。"; read -n 1 -s -r -p "按任意键返回..."; return; fi; echo "选择要'${prompt_message}'的节点:"; for i in "${!nodes[@]}"; do printf "  ${COLOR_CYAN}%d.${COLOR_RESET} %s\n" "$((i+1))" "${nodes[$i]}"; done; read -rp "请输入选项 (0 返回): " choice; if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [ "$choice" -le ${#nodes[@]} ]; then "$action_callback" "${nodes[$((choice-1))]}"; fi; read -n 1 -s -r -p "按任意键返回..."; }
+select_multiple_nodes_action() { local action_callback="$1"; local prompt_message="$2"; local nodes=($(get_all_node_ids)); if [ ${#nodes[@]} -eq 0 ]; then print_warning "无节点可操作。"; read -n 1 -s -r -p "按任意键返回..."; return; fi; echo "选择要'${prompt_message}'的节点(多选用空格; 'all'全选):"; for i in "${!nodes[@]}"; do printf "  ${COLOR_CYAN}%d.${COLOR_RESET} %s\n" "$((i+1))" "${nodes[$i]}"; done; read -rp "请输入选项 (0 返回): " choices_str; if [ "$choices_str" = "0" ] || [ -z "$choices_str" ]; then return; fi; local selected=(); if [ "$choices_str" = "all" ]; then selected=("${nodes[@]}"); else for c in $choices_str; do if [[ "$c" =~ ^[1-9][0-9]*$ ]] && [ "$c" -le ${#nodes[@]} ]; then selected+=("${nodes[$((c-1))]}"); fi; done; fi; if [ ${#selected[@]} -gt 0 ] && confirm_action "确认'${prompt_message}'选中的 ${#selected[@]} 个节点?"; then for id in "${selected[@]}"; do "$action_callback" "$id"; done; print_success "批量操作完成。"; fi; read -n 1 -s -r -p "按任意键返回..."; }
+menu_install_single() { read -rp "请输入要安装的 Node ID: " id; id=$(echo "$id"|xargs); if [ -n "$id" ]; then build_image; run_container "$id"; else print_warning "ID 无效。"; fi; read -n 1 -s -r -p "按任意键返回..."; }
+menu_batch_install() { build_image; print_info "请输入多个Node ID(每行一个,空行结束):"; local ids=(); while read -r line && [ -n "$line" ]; do ids+=("$(echo "$line"|xargs)"); done; if [ ${#ids[@]} -gt 0 ] && confirm_action "确认安装 ${#ids[@]} 个新节点?"; then for id in "${ids[@]}"; do run_container "$id"; done; fi; read -n 1 -s -r -p "按任意键返回..."; }
+menu_update() { while true; do clear; print_color "===== 系统维护与更新 =====" "$COLOR_BLUE"; echo " 1. 强制重构镜像"; echo " 2. 更新所有运行中节点"; echo " 3. 清理所有数据"; echo " 0. 返回"; read -rp "请输入选项: " choice; case $choice in 1) build_image "--force";; 2) if confirm_action "确认更新所有运行中节点?"; then build_image "--force"; for id in $(docker ps --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//"); do run_container "$id"; done; fi;; 3) if confirm_action "【警告】将删除所有节点、镜像、日志和builder！确定吗?"; then docker rm -f $(docker ps -a -q --filter "name=${BASE_CONTAINER_NAME}-") >/dev/null 2>&1 || true; if docker image inspect "$IMAGE_NAME" &>/dev/null; then docker rmi -f "$IMAGE_NAME"; fi; if docker buildx ls | grep -q "$BUILDER_NAME"; then docker buildx rm -f "$BUILDER_NAME"; fi; print_success "清理完成。"; fi;; 0) break;; *) print_error "无效选项。";; esac; read -n 1 -s -r -p "按任意键返回..."; done; }
 
-# --- UI and Menu Functions ---
-select_node_action() { local action_callback="$1"; local prompt_message="$2"; local nodes=($(get_all_node_ids)); if [ ${#nodes[@]} -eq 0 ]; then print_warning "No nodes available."; read -n 1 -s -r -p "Press any key to return..."; return; fi; echo "Select a node to '${prompt_message}':"; for i in "${!nodes[@]}"; do printf "  ${COLOR_CYAN}%d.${COLOR_RESET} %s\n" "$((i+1))" "${nodes[$i]}"; done; read -rp "Enter choice (0 to cancel): " choice; if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && [ "$choice" -le ${#nodes[@]} ]; then "$action_callback" "${nodes[$((choice-1))]}"; fi; read -n 1 -s -r -p "Press any key to return..."; }
-select_multiple_nodes_action() { local action_callback="$1"; local prompt_message="$2"; local nodes=($(get_all_node_ids)); if [ ${#nodes[@]} -eq 0 ]; then print_warning "No nodes available."; read -n 1 -s -r -p "Press any key to return..."; return; fi; echo "Select nodes to '${prompt_message}' (e.g., 1 3 4; or 'all'):"; for i in "${!nodes[@]}"; do printf "  ${COLOR_CYAN}%d.${COLOR_RESET} %s\n" "$((i+1))" "${nodes[$i]}"; done; read -rp "Enter choices (0 to cancel): " choices_str; if [ "$choices_str" = "0" ] || [ -z "$choices_str" ]; then return; fi; local selected=(); if [ "$choices_str" = "all" ]; then selected=("${nodes[@]}"); else for c in $choices_str; do if [[ "$c" =~ ^[1-9][0-9]*$ ]] && [ "$c" -le ${#nodes[@]} ]; then selected+=("${nodes[$((c-1))]}"); fi; done; fi; if [ ${#selected[@]} -gt 0 ] && confirm_action "Confirm '${prompt_message}' for ${#selected[@]} selected node(s)?"; then for id in "${selected[@]}"; do "$action_callback" "$id"; done; print_success "Bulk operation complete."; fi; read -n 1 -s -r -p "Press any key to return..."; }
-menu_install_single() { read -rp "Enter Node ID to install: " id; id=$(echo "$id"|xargs); if [ -n "$id" ]; then build_image; run_container "$id"; else print_warning "Invalid ID."; fi; read -n 1 -s -r -p "Press any key to return..."; }
-menu_batch_install() { build_image; print_info "Enter Node IDs, one per line (empty line to finish):"; local ids=(); while read -r line && [ -n "$line" ]; do ids+=("$(echo "$line"|xargs)"); done; if [ ${#ids[@]} -gt 0 ] && confirm_action "Confirm installation of ${#ids[@]} new nodes?"; then for id in "${ids[@]}"; do run_container "$id"; done; fi; read -n 1 -s -r -p "Press any key to return..."; }
-menu_update() { while true; do clear; print_color "===== System Maintenance & Updates =====" "$COLOR_BLUE"; echo " 1. Force rebuild image"; echo " 2. Update all running nodes (rebuild + restart)"; echo " 3. PURGE ALL DATA (nodes, images, logs)"; echo " 0. Back to Main Menu"; read -rp "Enter choice: " choice; case $choice in 1) build_image "--force";; 2) if confirm_action "Update all running nodes?"; then build_image "--force"; for id in $(docker ps --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//"); do run_container "$id"; done; fi;; 3) if confirm_action "!! WARNING !! This will delete EVERYTHING. Are you sure?"; then docker rm -f $(docker ps -a -q --filter "name=${BASE_CONTAINER_NAME}-") >/dev/null 2>&1 || true; if docker image inspect "$IMAGE_NAME" &>/dev/null; then docker rmi -f "$IMAGE_NAME"; fi; if docker buildx ls | grep -q "$BUILDER_NAME"; then docker buildx rm -f "$BUILDER_NAME"; fi; print_success "All data purged."; fi;; 0) break;; *) print_error "Invalid choice.";; esac; read -n 1 -s -r -p "Press any key to continue..."; done; }
-
-# --- Main Entry Point ---
+# --- 主入口 ---
 main_menu() {
-    if [ "$(id -u)" -ne 0 ]; then print_error "This script must be run as root."; exit 1; fi
+    if [ "$(id -u)" -ne 0 ]; then print_error "错误: 脚本需要root权限运行。"; exit 1; fi
     prepare_system
     ensure_docker_ready
     while true; do
-        clear; print_color "===== Nexus Manager ${SCRIPT_VERSION} =====" "$COLOR_BLUE"; list_nodes; echo;
-        print_info "--- Node Management ---";
-        echo " 1. Install/Start Single Node   4. Stop Node"; echo " 2. View Node Logs            5. Start Node"; echo " 3. Uninstall Node          6. Restart Node";
-        print_info "--- Bulk Operations ---";
-        echo " 7. Bulk Install New Nodes    10. Bulk Uninstall"; echo " 8. Bulk Stop Nodes         9. Bulk Start Nodes";
-        print_info "--- System ---";
-        echo " 11. Maintenance & Updates"; echo "  0. Exit"; echo
-        read -rp "Enter your choice: " choice
+        clear; print_color "===== Nexus 管理脚本 ${SCRIPT_VERSION} =====" "$COLOR_BLUE"; list_nodes; echo;
+        print_info "--- 节点管理 ---";
+        echo " 1. 安装/启动单节点   4. 停止节点"; echo " 2. 查看节点日志     5. 启动节点"; echo " 3. 卸载节点         6. 重启节点";
+        print_info "--- 批量操作 ---";
+        echo " 7. 批量安装新节点   10. 批量卸载"; echo " 8. 批量停止节点      9. 批量启动";
+        print_info "--- 系统维护 ---";
+        echo " 11. 更新与维护"; echo "  0. 退出脚本"; echo
+        read -rp "请输入选项: " choice
         case $choice in
-            1) menu_install_single ;; 2) select_node_action view_node_logs "view logs for" ;; 3) select_node_action uninstall_node "uninstall" ;;
-            4) select_node_action stop_node "stop" ;; 5) select_node_action start_node "start" ;; 6) select_node_action restart_node "restart" ;;
-            7) menu_batch_install ;; 8) select_multiple_nodes_action stop_node "stop" ;; 9) select_multiple_nodes_action start_node "start" ;;
-            10) select_multiple_nodes_action uninstall_node "uninstall" ;; 11) menu_update ;; 0) exit 0 ;; *) print_error "Invalid choice." && safe_sleep 1 ;;
+            1) menu_install_single ;; 2) select_node_action view_node_logs "查看日志" ;; 3) select_node_action uninstall_node "卸载" ;;
+            4) select_node_action stop_node "停止" ;; 5) select_node_action start_node "启动" ;; 6) select_node_action restart_node "重启" ;;
+            7) menu_batch_install ;; 8) select_multiple_nodes_action stop_node "停止" ;; 9) select_multiple_nodes_action start_node "启动" ;;
+            10) select_multiple_nodes_action uninstall_node "卸载" ;; 11) menu_update ;; 0) exit 0 ;; *) print_error "无效选项。" && safe_sleep 1 ;;
         esac
     done
 }
