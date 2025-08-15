@@ -2,29 +2,25 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 (ARM64 Docker) - v4.1.20 最终系统兼容版
+# Nexus 多节点管理脚本 (ARM64 Docker) - v4.1.21 最终系统兼容版
 #
 # 改版者: AI & 社区智慧
 #
-# 【V4.1.20 更新】:
-#   - 【修复/增强】: 重构 Docker 检查逻辑。脚本现在会自动尝试启动未运行的 Docker 服务，
-#     而不是直接报错退出，解决了用户报告的“Docker服务不活跃”问题。
-#   - 【优化】: 将 `check_docker` 和 `check_docker_daemon` 函数合并为更健壮的
-#     `ensure_docker_ready` 函数，使环境检查流程更清晰、更可靠。
+# 【V4.1.21 更新】:
+#   - 【致命修复】: 增加核心系统组件健全性检查。脚本启动时会优先检测`grep`等命令是否损坏。
+#   - 【精准诊断】: 解决了用户报告的 'grep: Too many levels of symbolic links' 错误。
+#     现在脚本能识别出是操作系统组件损坏，并提供正确的 `apt-get install --reinstall` 修复命令，
+#     而不是错误地引导用户去检查 AppArmor。
+#   - 【健壮性】: 替换了脚本内部部分简单的`grep`用法，以增强在轻度损坏系统下的兼容性。
 #
-# 【V4.1.19 更新】:
-#   - 【最终确认】: 此版本代码旨在解决用户系统级问题。
-#   - 【问题诊断】: 用户报告的 'wget: Too many levels of symbolic links' 错误表明
-#     其宿主机操作系统核心组件 (coreutils, wget) 已损坏。
-#   - 【解决方案】:
-#     1. 本脚本已完全不依赖外部的 `sleep` 和 `wget` 命令，可在该损坏环境下运行。
-#     2. 强烈建议用户立即运行 `sudo apt-get install --reinstall coreutils wget` 来修复其操作系统。
+# 【V4.1.20 更新】:
+#   - 【修复/增强】: 重构 Docker 检查逻辑。脚本现在会自动尝试启动未运行的 Docker 服务。
 #
 # ... (保留之前的版本更新说明) ...
 # ================================================================================================
 
 # --- 配置项 (可在此处自定义) ---
-SCRIPT_VERSION="v4.1.20 最终系统兼容版"
+SCRIPT_VERSION="v4.1.21 最终系统兼容版"
 NEXUS_CLI_VERSION="v0.10.7"
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:latest-arm64"
@@ -54,6 +50,33 @@ confirm_action() { read -rp "${COLOR_YELLOW}>>> ${1} (y/N): ${COLOR_RESET}" c; [
 TMP_WORKDIR=""; trap 'EXITCODE=$?; printf "\n"; print_info "Executing cleanup..."; [ -n "$TMP_WORKDIR" ] && [ -d "$TMP_WORKDIR" ] && rm -rf "$TMP_WORKDIR"; exit $EXITCODE' EXIT HUP INT QUIT TERM
 
 # --- Core Functions ---
+
+# 新增：检查核心系统组件是否损坏
+check_core_utils() {
+    print_info "正在执行系统核心组件健全性检查..."
+    local stderr
+    # 测试 grep 命令是否能正常工作
+    stderr=$(echo "test" | grep "test" 2>&1 >/dev/null)
+    local exit_code=$?
+
+    if [[ "$stderr" == *"symbolic links"* || $exit_code -ne 0 ]]; then
+        print_error "!!!!!!!!!!!!!!!!!!!!!!!!!! 致命系统错误 !!!!!!!!!!!!!!!!!!!!!!!!!! "
+        print_error "   检测到核心系统命令 'grep' 已损坏，无法正常运行。"
+        print_error "   具体错误: 'Too many levels of symbolic links'"
+        print_error "   这表明您的操作系统底层存在严重问题，脚本无法继续。"
+        print_error "---------------------- 请立即执行以下修复命令 ----------------------"
+        print_error "   此命令将强制重新安装系统核心工具包和 grep。"
+        print_error ""
+        print_error "   ${COLOR_CYAN}sudo apt-get install --reinstall coreutils grep${COLOR_RESET}"
+        print_error ""
+        print_error "   修复后，请重新运行本脚本。"
+        print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! "
+        exit 1
+    fi
+    print_success "核心组件检查通过。"
+}
+
+
 ensure_docker_ready() {
     print_info "正在检查并准备 Docker 环境..."
     # 步骤 1: 检查 Docker 是否已安装。如果未安装，则进行安装。
@@ -147,41 +170,47 @@ setup_buildx() {
     if ! docker image inspect tonistiigi/binfmt:latest &>/dev/null; then
         print_info "正在拉取 'tonistiigi/binfmt' 镜像..."; docker pull tonistiigi/binfmt:latest >/dev/null;
     fi
-    if docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null | grep -q "supported"; then
-        print_success "Binfmt 支持已正确配置。"
-    else
-        print_warning "Binfmt 支持未激活。启动多层修复策略..."
-        local binfmt_ok=false
-        if install_host_qemu_and_setup_binfmt; then
-            safe_sleep 2
-            if docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null | grep -q "supported"; then
-                print_success "通过宿主机配置，Binfmt 支持已成功激活。"
-                binfmt_ok=true
-            fi
-        fi
-        if ! $binfmt_ok; then
-            if register_binfmt_manually_hardcoded; then
+
+    # 使用case语句代替grep来提高健壮性
+    local binfmt_check_output
+    binfmt_check_output=$(docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null)
+    case "$binfmt_check_output" in
+        *"supported"*)
+            print_success "Binfmt 支持已正确配置。"
+            ;;
+        *)
+            print_warning "Binfmt 支持未激活。启动多层修复策略..."
+            local binfmt_ok=false
+            if install_host_qemu_and_setup_binfmt; then
                 safe_sleep 2
-                if docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null | grep -q "supported"; then
-                    print_success "通过硬编码注册，Binfmt 支持已成功激活。"
-                    binfmt_ok=true
+                case "$(docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null)" in
+                    *"supported"*) print_success "通过宿主机配置，Binfmt 支持已成功激活。"; binfmt_ok=true ;;
+                esac
+            fi
+            if ! $binfmt_ok; then
+                if register_binfmt_manually_hardcoded; then
+                    safe_sleep 2
+                    case "$(docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null)" in
+                         *"supported"*) print_success "通过硬编码注册，Binfmt 支持已成功激活。"; binfmt_ok=true ;;
+                    esac
                 fi
             fi
-        fi
-        if ! $binfmt_ok; then
-            print_error "!!!!!!!!!!!!!!!!!!!!!!!!!! 致命错误 !!!!!!!!!!!!!!!!!!!!!!!!!! "
-            print_error "   所有自动修复 binfmt 的方法均已失败。"
-            print_error "   这几乎 100% 是由于您的系统启用了 AppArmor 或 SELinux 等安全策略。"
-            print_error "------------------------ 请执行以下修复命令 ------------------------"
-            print_error "   这会将 Docker 的 AppArmor 配置文件切换到“抱怨”模式，"
-            print_error "   它会记录违规行为但不会阻止它们。这是一个安全的临时解决方案。"
-            print_error ""
-            print_error "   ${COLOR_CYAN}sudo apt-get install apparmor-utils -y && sudo aa-complain /etc/apparmor.d/docker${COLOR_RESET}"
-            print_error ""
-            print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! "
-            exit 1
-        fi
-    fi
+            if ! $binfmt_ok; then
+                print_error "!!!!!!!!!!!!!!!!!!!!!!!!!! 致命错误 !!!!!!!!!!!!!!!!!!!!!!!!!! "
+                print_error "   所有自动修复 binfmt 的方法均已失败。"
+                print_error "   如果排除系统组件损坏的因素，这可能是由于 AppArmor 或 SELinux 等安全策略。"
+                print_error "------------------------ 请执行以下修复命令 ------------------------"
+                print_error "   这会将 Docker 的 AppArmor 配置文件切换到“抱怨”模式，"
+                print_error "   它会记录违规行为但不会阻止它们。这是一个安全的临时解决方案。"
+                print_error ""
+                print_error "   ${COLOR_CYAN}sudo apt-get install apparmor-utils -y && sudo aa-complain /etc/apparmor.d/docker${COLOR_RESET}"
+                print_error ""
+                print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! "
+                exit 1
+            fi
+            ;;
+    esac
+
 
     IFS=' ' read -r current_status _ <<< "$(get_builder_info "$BUILDER_NAME")"
     if [ "$current_status" != "NOT_FOUND" ]; then
@@ -230,12 +259,18 @@ safe_sleep() { read -t "$1" < /dev/null 2>/dev/null || true; }
 echo "Starting Nexus node $NODE_ID in screen session $SESSION..."
 screen -dmS "$SESSION" bash -c "nexus-network start --node-id \$NODE_ID | tee \$LOG_FILE"
 safe_sleep 2
-if ! screen -ls | grep -q "$SESSION"; then
-    echo "!!! Node startup failed. Check log: $LOG_FILE" >&2
-    cat "$LOG_FILE" >&2
-    exit 1
-fi
-echo "Node $NODE_ID started successfully."
+# 使用 case 语句替换 grep -q
+screen_check=$(screen -ls)
+case "$screen_check" in
+    *"$SESSION"*)
+        echo "Node $NODE_ID started successfully."
+        ;;
+    *)
+        echo "!!! Node startup failed. Check log: $LOG_FILE" >&2
+        cat "$LOG_FILE" >&2
+        exit 1
+        ;;
+esac
 tail -f /dev/null
 EOF
     print_info "正在构建镜像 '$IMAGE_NAME'..."
@@ -248,7 +283,7 @@ EOF
 run_container() {
     local node_id="$1"; [ -z "$node_id" ] && { print_error "Node ID is required."; return 1; }
     local cname="${BASE_CONTAINER_NAME}-${node_id}"
-    if docker ps -a -q -f name="^${cname}$" | grep -q .; then
+    if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then
         docker stop "$cname" &>/dev/null || true
         docker rm "$cname" &>/dev/null || true
     fi
@@ -258,13 +293,13 @@ run_container() {
         print_error "!! 容器 '${cname}' 启动失败。"; return 1
     fi
     safe_sleep 3
-    if docker ps -q -f name="^${cname}$" | grep -q .; then print_success "节点 $node_id 启动成功。日志: $log_file"; else print_error "节点 $node_id 启动后未在运行！请检查日志。"; cat "$log_file"; fi
+    if [ -n "$(docker ps -q -f name="^${cname}$")" ]; then print_success "节点 $node_id 启动成功。日志: $log_file"; else print_error "节点 $node_id 启动后未在运行！请检查日志。"; cat "$log_file"; fi
 }
 
-stop_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if docker ps -q -f name="^${cname}$" | grep -q .; then docker stop "$cname" &>/dev/null && print_success "节点 ${1} 已停止。"; else print_info "节点 ${1} 已是停止状态或不存在。"; fi; }
-start_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if docker ps -a -q -f name="^${cname}$" | grep -q .; then docker start "$cname" &>/dev/null; safe_sleep 2; if docker ps -q -f name="^${cname}$" | grep -q .; then print_success "节点 ${1} 已启动。"; fi; else print_error "未找到节点 ${1}。"; fi; }
-restart_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if docker ps -a -q -f name="^${cname}$" | grep -q .; then docker restart "$cname" &>/dev/null; safe_sleep 2; print_success "节点 ${1} 已重启。"; else print_error "未找到节点 ${1}。"; fi; }
-uninstall_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; print_info "正在卸载节点 ${1}..."; if docker ps -a -q -f name="^${cname}$" | grep -q .; then docker stop "$cname" &>/dev/null || true; docker rm "$cname" &>/dev/null || true; fi; rm -f "${LOG_DIR}/nexus-${1}.log"; print_success "节点 ${1} 已卸载。"; }
+stop_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if [ -n "$(docker ps -q -f name="^${cname}$")" ]; then docker stop "$cname" &>/dev/null && print_success "节点 ${1} 已停止。"; else print_info "节点 ${1} 已是停止状态或不存在。"; fi; }
+start_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker start "$cname" &>/dev/null; safe_sleep 2; if [ -n "$(docker ps -q -f name="^${cname}$")" ]; then print_success "节点 ${1} 已启动。"; fi; else print_error "未找到节点 ${1}。"; fi; }
+restart_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker restart "$cname" &>/dev/null; safe_sleep 2; print_success "节点 ${1} 已重启。"; else print_error "未找到节点 ${1}。"; fi; }
+uninstall_node() { local cname="${BASE_CONTAINER_NAME}-${1}"; print_info "正在卸载节点 ${1}..."; if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker stop "$cname" &>/dev/null || true; docker rm "$cname" &>/dev/null || true; fi; rm -f "${LOG_DIR}/nexus-${1}.log"; print_success "节点 ${1} 已卸载。"; }
 get_all_node_ids() { docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//" | sort -u; }
 view_node_logs() { docker logs -f "${BASE_CONTAINER_NAME}-${1}"; }
 
@@ -335,7 +370,8 @@ menu_update() {
 
 main_menu() {
     if [ "$(id -u)" -ne 0 ]; then print_error "错误: 脚本需要root权限运行。"; exit 1; fi
-    ensure_docker_ready # 使用新的、更健壮的检查函数
+    check_core_utils # **新增**：在一切开始前，检查系统环境
+    ensure_docker_ready
     while true; do
         clear; print_color "===== Nexus 管理脚本 ${SCRIPT_VERSION} =====" "$COLOR_BLUE"; list_nodes;
         echo; print_info "--- 节点管理 ---";
