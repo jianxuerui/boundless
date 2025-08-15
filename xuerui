@@ -2,23 +2,27 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 (ARM64 Docker) - v5.0 终极诊断版
+# Nexus 多节点管理脚本 (ARM64 Docker) - v5.1 跨平台兼容版
 #
 # 改版者: AI & 社区智慧
+#
+# 【V5.1 - 跨平台兼容版 更新】:
+#   - 【跨平台修复】: 重写了 'ensure_docker_ready' 函数，使其能够自动检测操作系统是基于 Debian
+#     (如 Ubuntu) 还是 RHEL (如 CentOS, Rocky, AlmaLinux)，并调用相应的包管理器 ('apt-get' 或
+#     'yum'/'dnf') 来安装 Docker。这彻底解决了 'apt-get: command not found' 的错误。
 #
 # 【V5.0 - 终极诊断版 更新】:
 #   - 【最终修复】: 锁定了最后的故障点——Docker与主机内核的特权交互。为 'docker run binfmt'
 #     命令添加了最强大的错误捕获和诊断机制。
 #   - 【终极指南】: 如果脚本在此步骤失败，它会打印一个详细的、分步骤的修复指南，
-#     直指问题的根源（通常是AppArmor安全策略），并提供一键修复命令。
+#     直指问题的根源（通常是AppArmor/SELinux安全策略），并提供一键修复命令。
 #   - 【最终建议】: 此版本是解决您这类深度系统问题的最终方案。如果此版本提供的修复指南
 #     仍无法解决问题，则强烈建议重装操作系统以获得稳定环境。
 #
-# ... (保留之前的版本更新说明) ...
 # ================================================================================================
 
 # --- 配置项 (可在此处自定义) ---
-SCRIPT_VERSION="v5.0 终极诊断版"
+SCRIPT_VERSION="v5.1 跨平台兼容版"
 NEXUS_CLI_VERSION="v0.10.7"
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:latest-arm64"
@@ -49,7 +53,14 @@ TMP_WORKDIR=""; trap 'EXITCODE=$?; printf "\n"; print_info "Executing cleanup...
 check_core_utils() {
     print_info "正在执行系统核心组件健全性检查..."
     local broken_utils=()
-    local packages_to_reinstall=("coreutils" "ca-certificates")
+    # 根据系统决定要重新安装的包
+    if command -v apt-get &>/dev/null; then
+        local packages_to_reinstall=("coreutils" "ca-certificates")
+    elif command -v yum &>/dev/null || command -v dnf &>/dev/null; then
+        local packages_to_reinstall=("coreutils" "ca-certificates")
+    else
+        packages_to_reinstall=()
+    fi
     declare -A utils_map
     utils_map=( ["grep"]="grep" ["wget"]="wget" ["curl"]="curl" )
 
@@ -66,30 +77,100 @@ check_core_utils() {
         local unique_packages=$(echo "${packages_to_reinstall[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' ')
         print_error "!! 致命系统错误: 检测到核心系统命令 (${broken_utils[*]}) 已损坏。"
         print_error "---------------------- 请立即执行以下综合修复命令 ----------------------"
-        print_error "   ${COLOR_CYAN}sudo apt-get update && sudo apt-get install --reinstall ${unique_packages}${COLOR_RESET}"
+        if command -v apt-get &>/dev/null; then
+            print_error "   ${COLOR_CYAN}sudo apt-get update && sudo apt-get install --reinstall ${unique_packages}${COLOR_RESET}"
+        elif command -v dnf &>/dev/null; then
+            print_error "   ${COLOR_CYAN}sudo dnf reinstall -y ${unique_packages}${COLOR_RESET}"
+        elif command -v yum &>/dev/null; then
+            print_error "   ${COLOR_CYAN}sudo yum reinstall -y ${unique_packages}${COLOR_RESET}"
+        fi
         print_error "----------------------------------------------------------------------"
         exit 1
     fi
     print_success "核心组件检查通过。"
 }
 
+# ---【已修复的函数】---
 ensure_docker_ready() {
     print_info "正在检查并准备 Docker 环境..."
+    # 检查 Docker 服务是否能正常通信
+    if docker info >/dev/null 2>&1; then
+        print_success "Docker 环境已就绪且运行正常。"
+        return 0
+    fi
+
+    # 如果 Docker 命令不存在，则开始安装流程
     if ! command -v docker &> /dev/null; then
-        print_warning "Docker 未安装，正在自动安装..."
-        apt-get update -qq >/dev/null && apt-get install -y --no-install-recommends apt-transport-https ca-certificates curl gnupg lsb-release >/dev/null
-        mkdir -p /etc/apt/keyrings; curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-        apt-get update -qq >/dev/null; apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin >/dev/null
-        systemctl start docker && systemctl enable docker; print_success "Docker 已成功安装并启动。"; safe_sleep 3
+        print_warning "Docker 未安装，正在尝试自动安装..."
+        
+        # 检测操作系统
+        if [ -f /etc/os-release ]; then
+            . /etc/os-release
+            OS_ID=$ID
+        else
+            print_error "!! 无法检测到操作系统类型。请根据您系统的官方文档手动安装 Docker。"
+            exit 1
+        fi
+
+        case "$OS_ID" in
+            ubuntu|debian)
+                print_info "检测到 Debian/Ubuntu 系统，使用 apt-get 安装..."
+                apt-get update -qq >/dev/null
+                apt-get install -y --no-install-recommends apt-transport-https ca-certificates curl gnupg lsb-release >/dev/null
+                mkdir -p /etc/apt/keyrings
+                curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+                echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+                apt-get update -qq >/dev/null
+                apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io docker-buildx-plugin >/dev/null
+                ;;
+            centos|rhel|fedora|rocky|almalinux)
+                print_info "检测到 RHEL/CentOS/Fedora 系统，使用 yum/dnf 安装..."
+                # 某些老系统可能没有 dnf，yum 更通用
+                if command -v dnf &>/dev/null; then
+                    PKG_MANAGER="dnf"
+                else
+                    PKG_MANAGER="yum"
+                fi
+                $PKG_MANAGER install -y yum-utils >/dev/null
+                yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo >/dev/null
+                $PKG_MANAGER install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin >/dev/null
+                ;;
+            *)
+                print_error "!! 不支持的操作系统: $OS_ID。请根据您系统的官方文档手动安装 Docker。"
+                exit 1
+                ;;
+        esac
+        
+        print_info "正在启动并启用 Docker 服务..."
+        systemctl start docker && systemctl enable docker
+        safe_sleep 3
     fi
+
+    # 再次检查 Docker 服务状态
     if ! docker info >/dev/null 2>&1; then
-        print_warning "Docker 服务未运行，正在尝试启动..."; if systemctl start docker; then print_success "Docker 服务启动成功。"; safe_sleep 3; else print_error "!! 尝试启动 Docker 服务失败。"; exit 1; fi
+        print_warning "Docker 服务未运行，正在尝试启动..."
+        if systemctl start docker; then
+            print_success "Docker 服务启动成功。"
+            safe_sleep 3
+        else
+            print_error "!! 尝试启动 Docker 服务失败，请检查 Docker 日志: journalctl -u docker.service"
+            exit 1
+        fi
     fi
-    if ! docker info >/dev/null 2>&1; then print_error "!! 致命错误: Docker 服务无法访问。"; exit 1; fi
-    if ! docker buildx version &>/dev/null; then print_error "!! Docker buildx 插件缺失！"; exit 1; fi
+    
+    # 最终检查
+    if ! docker info >/dev/null 2>&1; then
+        print_error "!! 致命错误: Docker 服务仍然无法访问。"
+        exit 1
+    fi
+
+    if ! docker buildx version &>/dev/null; then
+        print_error "!! Docker buildx 插件缺失！请检查安装。"
+        exit 1
+    fi
     print_success "Docker 环境准备就绪。"
 }
+
 
 setup_buildx() {
     print_info "正在检查和配置 Buildx builder '$BUILDER_NAME'..."
@@ -109,15 +190,21 @@ setup_buildx() {
     if ! binfmt_check_output=$(docker run --rm --privileged tonistiigi/binfmt:latest --print 2>/dev/null); then
         print_error "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 致命错误 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
         print_error "   脚本在最关键的一步失败了：无法通过特权容器与系统内核进行交互。"
-        print_error "   这几乎总是由宿主机的【AppArmor 安全策略】阻止了 Docker 导致。"
+        print_error "   这几乎总是由宿主机的【AppArmor 或 SELinux 安全策略】阻止了 Docker 导致。"
         print_error ""
         print_error "--------------------------- 【首选】一键修复方案 ---------------------------"
-        print_error "   请复制并执行以下命令来修复 AppArmor 策略。这通常能立即解决问题。"
-        print_error "   此命令是安全的，它只是将 Docker 的安全策略从“强制”改为“记录”模式。"
+        print_error "   请复制并执行以下命令来修复安全策略。这通常能立即解决问题。"
         print_error ""
-        print_error "   ${COLOR_CYAN}sudo apt-get install apparmor-utils -y && sudo aa-complain /etc/apparmor.d/docker${COLOR_RESET}"
+        if command -v apt-get &>/dev/null; then
+             print_warning "   对于 Ubuntu/Debian 系统 (检测到 AppArmor):"
+             print_error "   ${COLOR_CYAN}sudo apt-get install apparmor-utils -y && sudo aa-complain /etc/apparmor.d/docker${COLOR_RESET}"
+        elif command -v yum &>/dev/null || command -v dnf &>/dev/null; then
+             print_warning "   对于 CentOS/RHEL 系统 (可能是 SELinux):"
+             print_error "   ${COLOR_CYAN}sudo setenforce 0 && sudo sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config${COLOR_RESET}"
+             print_warning "   (此命令会临时禁用SELinux并设置为下次开机为宽容模式，相对安全)"
+        fi
         print_error ""
-        print_error "   执行完上述命令后，请【重新运行本脚本】。"
+        print_error "   执行完上述对应命令后，请【重新运行本脚本】。"
         print_error "--------------------------------------------------------------------------"
         print_error ""
         print_error "-------------------------- 如果问题依旧，手动诊断 --------------------------"
@@ -198,7 +285,6 @@ EOF
 
 
 # ... 以下其他函数 (run_container, list_nodes, main_menu 等) 保持不变 ...
-
 run_container() {
     local node_id="$1"; [ -z "$node_id" ] && { print_error "Node ID is required."; return 1; }
     local cname="${BASE_CONTAINER_NAME}-${node_id}"
