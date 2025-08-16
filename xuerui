@@ -25,7 +25,7 @@ BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:stable-arm64-emu" # 'emu' for emulated
 BUILDER_NAME="nexus_builder"
 HOST_CONFIG_DIR="/root/nexus_config"
-WALLET_ADDRESS="0x62250580AeC82545bD5c3133c4e293780391813c"
+WALLET_ADDRESS="0x62250580AeC82545bD5c3133c4e293780391813c" # <--- 请确保这里是您自己的钱包地址
 
 # --- 其他配置 ---
 NODE_CPU_LIMIT="0"; NODE_MEM_LIMIT="0";
@@ -110,7 +110,7 @@ check_and_initialize_config() {
     print_bold "零阶段: 检查并初始化核心配置"
     if [ -f "${HOST_CONFIG_DIR}/config.json" ]; then print_success "核心配置文件已存在。"; return 0; fi
     print_warning "未找到核心配置，即将开始自动注册..."
-    if [ -z "$WALLET_ADDRESS" ] || [[ "$WALLET_ADDRESS" =~ YOUR_WALLET_ADDRESS ]]; then print_error "!! 致命错误: 脚本中 WALLET_ADDRESS 未配置！"; exit 1; fi
+    if [ -z "$WALLET_ADDRESS" ] || [[ "$WALLET_ADDRESS" =~ YOUR_WALLET_ADDRESS|0x62250580AeC82545bD5c3133c4e293780391813c ]]; then print_error "!! 致命错误: 脚本中 WALLET_ADDRESS 未配置为你自己的钱包地址！"; exit 1; fi
     print_info "步骤1: 确保基础镜像存在..."; build_image;
     print_info "步骤2: 使用内置钱包地址进行一次性注册..."; mkdir -p "$HOST_CONFIG_DIR"
     if ! docker run --rm --platform linux/arm64 -v "${HOST_CONFIG_DIR}:/root/.nexus" "${IMAGE_NAME}" \
@@ -137,10 +137,11 @@ run_container() {
         print_error "!! 节点 $node_id 未能保持运行！"; print_warning "查看日志:"; docker logs "$cname";
     fi
 }
-list_nodes() { print_color "=============================== 当前 Nexus 节点状态 ===============================" "$COLOR_BLUE"; printf "%-38s %s\n" "$(print_bold "节点ID(容器名)")" "$(print_bold "状态")"; print_color "---------------------------------------------------------------------------------" "$COLOR_BLUE"; local nodes=$(docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//" | sort -u); if [ -z "$nodes" ]; then print_warning "未找到任何 Nexus 节点。"; else for id in $nodes; do local cname="${BASE_CONTAINER_NAME}-${id}"; local raw_status=$(docker ps -a -f name="^${cname}$" --format "{{.Status}}"); local s_color="$COLOR_RED"; local status_text=""; if [[ "$raw_status" == *"Up"* ]]; then if [[ "$raw_status" == *"(healthy)"* ]]; then s_color="$COLOR_GREEN"; status_text="运行中 (健康)"; elif [[ "$raw_status" == *"(unhealthy)"* ]]; then s_color="$COLOR_RED"; status_text="运行中 (不健康!)"; elif [[ "$raw_status" == *"(health: starting)"* ]]; then s_color="$COLOR_YELLOW"; status_text="启动中 (检查..)"; else s_color="$COLOR_GREEN"; status_text="运行中"; fi; elif [[ "$raw_status" == *"Exited"* ]]; then s_color="$COLOR_YELLOW"; status_text="已退出"; else status_text="$raw_status"; fi; printf "%-38s %s\n" "$id ($cname)" "$(print_color "$status_text" "$s_color")"; done; fi; print_color "=================================================================================" "$COLOR_BLUE"; }
+list_nodes() { print_color "=============================== 当前 Nexus 节点状态 ===============================" "$COLOR_BLUE"; printf "%-38s %s\n" "$(print_bold "节点ID(容器名)")" "$(print_bold "状态")"; print_color "---------------------------------------------------------------------------------" "$COLOR_BLUE"; local nodes=$(docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//" | sort -u); if [ -z "$nodes" ]; then print_warning "未找到任何 Nexus 节点。"; else for id in $nodes; do local cname="${BASE_CONTAINER_NAME}-${id}"; local raw_status=$(docker ps -a -f name="^${cname}$" --format "{{.Status}}"); local s_color="$COLOR_RED"; local status_text=""; if [[ "$raw_status" == *"Up"* ]]; then if [[ "$raw_status" == *"(healthy)"* ]]; then s_color="$COLOR_GREEN"; status_text="运行中 (健康)"; elif [[ "$raw_status" == *"(unhealthy)"* ]]; then s_color="$COLOR_RED"; status_text="运行中 (不健康!)"; elif [[ "$raw_status" == *"(health: starting)"* ]]; then s_color="$COLOR_YELLOW"; status_text="启动中 (检查..)"; else s_color="$COLOR_GREEN"; status_text="运行中"; fi; elif [[ "$raw_status" == *"Exited"* ]]; then s_color="$COLOR_YELLOW"; status_text="已退出"; elif [[ "$raw_status" == *"Restarting"* ]]; then s_color="$COLOR_RED"; status_text="重启循环!"; else status_text="$raw_status"; fi; printf "%-38s %s\n" "$id ($cname)" "$(print_color "$status_text" "$s_color")"; done; fi; print_color "=================================================================================" "$COLOR_BLUE"; }
 menu_install_single() { read -rp "请输入要安装的 Node ID: " id; id=$(echo "$id"|xargs); if [ -n "$id" ]; then run_container "$id"; else print_warning "ID 无效。"; fi; read -n 1 -s -r -p "按任意键返回..."; }
-menu_update_and_cleanup() { while true; do clear; print_color "===== 系统维护与清理 =====" "$COLOR_BLUE"; echo " 1. 强制重构镜像"; echo " 2. 【危险】彻底清理所有数据"; echo " 0. 返回主菜单"; read -rp "请输入选项: " choice; case $choice in 1) build_image "--force";; 2) if read -rp "${COLOR_YELLOW}【警告】将删除所有容器,所有镜像,buildx,及共享配置! 确定吗? (y/N): ${COLOR_RESET}" c && [[ "$c" =~ ^[yY]$ ]]; then docker rm -f $(docker ps -a -q --filter "name=nexus-node-") >/dev/null 2>&1 || true; docker rmi -f $(docker images -q "nexus-node*") >/dev/null 2>&1 || true; docker buildx rm -f "$BUILDER_NAME" >/dev/null 2>&1 || true; rm -rf "$HOST_CONFIG_DIR"; print_success "彻底清理完成。脚本将退出，请重新运行。"; exit 0; fi;; 0) break;; *) print_error "无效选项。";; esac; read -n 1 -s -r -p "按任意键返回..."; done; }
-view_node_logs() { local nodes=($(docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//" | sort -u)); if [ ${#nodes[@]} -eq 0 ]; then print_warning "无节点可操作。"; else print_info "按 Ctrl+C 退出日志。"; docker logs -f "${BASE_CONTAINER_NAME}-${nodes[0]}"; fi; read -n 1 -s -r -p "按任意键返回..."; }
+menu_update_and_cleanup() { while true; do clear; print_color "===== 系统维护与清理 =====" "$COLOR_BLUE"; echo " 1. 强制重构镜像"; echo " 2. 【危险】彻底清理所有数据"; echo " 0. 返回主菜单"; read -rp "请输入选项: " choice; case $choice in 1) build_image "--force";; 2) if read -rp "${COLOR_YELLOW}【警告】将删除所有容器,所有镜像,buildx,及共享配置! 确定吗? (y/N): ${COLOR_RESET}" c && [[ "$c" =~ ^[yY]$ ]]; then docker stop $(docker ps -a -q --filter "name=nexus-node-") >/dev/null 2>&1 || true; docker rm -f $(docker ps -a -q --filter "name=nexus-node-") >/dev/null 2>&1 || true; docker rmi -f $(docker images -q "nexus-node*") >/dev/null 2>&1 || true; docker buildx rm -f "$BUILDER_NAME" >/dev/null 2>&1 || true; rm -rf "$HOST_CONFIG_DIR"; print_success "彻底清理完成。脚本将退出，请重新运行。"; exit 0; fi;; 0) break;; *) print_error "无效选项。";; esac; read -n 1 -s -r -p "按任意键返回..."; done; }
+view_node_logs() { local nodes_arr=($(docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//" | sort -u)); if [ ${#nodes_arr[@]} -eq 0 ]; then print_warning "无节点可操作。"; read -n 1 -s -r -p "按任意键返回..."; return; fi; local i=1; echo "请选择要查看日志的节点:"; for n in "${nodes_arr[@]}"; do echo " ${i}) ${n}"; i=$((i+1)); done; echo " 0) 返回"; read -rp "请输入选项: " choice; if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -gt 0 ] && [ "$choice" -le "${#nodes_arr[@]}" ]; then local selected_node="${nodes_arr[$((choice-1))]}"; print_info "按 Ctrl+C 退出日志查看..."; safe_sleep 2; docker logs -f "${BASE_CONTAINER_NAME}-${selected_node}"; else print_warning "无效选择或返回。"; fi; read -n 1 -s -r -p "按任意键返回..."; }
+
 
 main_menu() {
     if [ "$(id -u)" -ne 0 ]; then print_error "错误: 脚本需root权限。"; exit 1; fi
@@ -150,7 +151,7 @@ main_menu() {
     while true; do
         clear; print_color "===== Nexus 管理脚本 ${SCRIPT_VERSION} =====" "$COLOR_BLUE"; list_nodes; echo;
         print_info "--- 节点管理 ---";
-        echo " 1. 安装/启动单节点     2. 查看最近节点日志";
+        echo " 1. 安装/启动单节点     2. 查看节点日志";
         print_info "--- 系统维护 ---";
         echo " 3. 系统维护与清理";
         echo "  0. 退出脚本";
