@@ -2,22 +2,24 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 - v5.9.7 跨平台模拟终极版
+# Nexus 多节点管理脚本 - v5.9.8 智能入口终极版
 #
 # 改版者: AI & 社区智慧
 #
-# 【V5.9.7 - 跨平台模拟终极版】:
-#   - 【根本性修复】: 经查证，Nexus官方仅提供 'arm64' 架构的Linux二进制文件。
-#     本脚本现已完全回归 arm64 路线，并在 amd64 主机上通过 Docker (QEMU)
-#     模拟 arm64 环境来运行节点。这解决了因官方缺少 amd64 文件导致的 '404 Not Found' 错误。
-#   - 【环境配置】: 脚本将确保 Docker 的 binfmt_misc/QEMU 支持已正确安装，
-#     这是在 amd64 主机上运行 arm64 容器的先决条件。
-#   - 【代码稳定】: 恢复 v5.9.5 的全自动注册等所有优化逻辑。
+# 【V5.9.8 - 智能入口终极版】:
+#   - 【最终修复】: 重写了容器的 'entrypoint.sh' 脚本。新的入口点能智能判断运行意图：
+#       1. 当执行 'register-user' 等特定命令时，直接运行该命令。
+#       2. 当没有指定命令时，才执行默认的“启动节点”流程。
+#     这彻底解决了因入口脚本逻辑僵化，导致自动注册失败的根本性问题。
+#
+# 【V5.9.7 - 跨平台模拟】:
+#   - 【根本性修复】: 确认官方仅提供 arm64 二进制文件，脚本回归 arm64 路线，在
+#     amd64 主机上通过 Docker (QEMU) 模拟执行。
 #
 # ================================================================================================
 
 # --- 配置项 ---
-SCRIPT_VERSION="v5.9.7 跨平台模拟 (arm64 on amd64)"
+SCRIPT_VERSION="v5.9.8 智能入口终极版"
 NEXUS_CLI_VERSION="v0.10.8"
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:stable-arm64-emu" # 'emu' for emulated
@@ -53,12 +55,10 @@ build_image() {
     setup_cross_platform_env
     TMP_WORKDIR=$(mktemp -d); cd "$TMP_WORKDIR"
     
-    # 【核心修复】使用官方唯一提供的 arm64 版本下载链接
     cli_url="https://github.com/nexus-xyz/nexus-cli/releases/download/${NEXUS_CLI_VERSION}/nexus-network-linux-arm64"
-    print_info "正在生成 Dockerfile (v5.9.7 - arm64)...";
+    print_info "正在生成 Dockerfile (v5.9.8)...";
     
     cat > Dockerfile <<EOF
-# 【核心修复】强制指定平台为 linux/arm64，将在 amd64 主机上通过QEMU模拟运行
 FROM --platform=linux/arm64 ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -73,13 +73,30 @@ VOLUME /root/.nexus
 ENTRYPOINT ["/entrypoint.sh"]
 HEALTHCHECK --interval=1m --timeout=10s --retries=3 CMD pgrep -x nexus-network >/dev/null || exit 1
 EOF
+
+    # 【最终修复】智能的 entrypoint.sh 脚本
     cat > entrypoint.sh <<'EOF'
 #!/bin/bash
 set -e
-if [ -z "$NODE_ID" ]; then echo "错误: NODE_ID未设置!" >&2; exit 1; fi
-echo "$NODE_ID" > /root/.nexus/node-id
-echo ">>> 即将启动 Nexus 节点 $NODE_ID... (在模拟环境中) <<<"
-exec nexus-network start
+
+# 如果第一个参数是 nexus-cli 或 nexus-network (通常由 docker run ... [command] 传递)
+# 或者第一个参数是可执行的 nexus 二进制文件，则直接执行该命令。
+if [ "$1" = "nexus-cli" ] || [ "$1" = "nexus-network" ] || [ -x "$(command -v "$1")" ]; then
+    # 直接执行用户传入的命令 (例如: nexus-cli register-user ...)
+    exec "$@"
+else
+    # 否则，执行默认的启动节点流程
+    # 检查环境变量
+    if [ -z "$NODE_ID" ]; then
+        echo "错误: 未设置NODE_ID环境变量用于启动节点!" >&2
+        exit 1
+    fi
+    # 写入ID文件
+    echo "$NODE_ID" > /root/.nexus/node-id
+    echo ">>> 即将启动 Nexus 节点 $NODE_ID... (在模拟环境中) <<<"
+    # 启动节点主程序
+    exec nexus-network start
+fi
 EOF
 
     print_info "正在为 arm64 平台构建镜像 '$IMAGE_NAME' (这可能需要一些时间)...";
@@ -90,7 +107,7 @@ EOF
 }
 
 check_and_initialize_config() {
-    print_bold "零阶段: 检查核心配置文件"
+    print_bold "零阶段: 检查并初始化核心配置"
     if [ -f "${HOST_CONFIG_DIR}/config.json" ]; then print_success "核心配置文件已存在。"; return 0; fi
     print_warning "未找到核心配置，即将开始自动注册..."
     if [ -z "$WALLET_ADDRESS" ] || [[ "$WALLET_ADDRESS" =~ YOUR_WALLET_ADDRESS ]]; then print_error "!! 致命错误: 脚本中 WALLET_ADDRESS 未配置！"; exit 1; fi
@@ -98,7 +115,7 @@ check_and_initialize_config() {
     print_info "步骤2: 使用内置钱包地址进行一次性注册..."; mkdir -p "$HOST_CONFIG_DIR"
     if ! docker run --rm --platform linux/arm64 -v "${HOST_CONFIG_DIR}:/root/.nexus" "${IMAGE_NAME}" \
       nexus-cli register-user --wallet-address "${WALLET_ADDRESS}"; then
-        print_error "!! 自动注册失败！"; rm -rf "${HOST_CONFIG_DIR}"; exit 1
+        print_error "!! 自动注册失败！请检查上方日志输出。"; rm -rf "${HOST_CONFIG_DIR}"; exit 1
     fi
     print_success "自动注册成功！核心配置文件已生成于 ${HOST_CONFIG_DIR}"
     safe_sleep 2
@@ -120,10 +137,9 @@ run_container() {
         print_error "!! 节点 $node_id 未能保持运行！"; print_warning "查看日志:"; docker logs "$cname";
     fi
 }
-# --- 菜单和列表函数 (保持简洁) ---
 list_nodes() { print_color "=============================== 当前 Nexus 节点状态 ===============================" "$COLOR_BLUE"; printf "%-38s %s\n" "$(print_bold "节点ID(容器名)")" "$(print_bold "状态")"; print_color "---------------------------------------------------------------------------------" "$COLOR_BLUE"; local nodes=$(docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//" | sort -u); if [ -z "$nodes" ]; then print_warning "未找到任何 Nexus 节点。"; else for id in $nodes; do local cname="${BASE_CONTAINER_NAME}-${id}"; local raw_status=$(docker ps -a -f name="^${cname}$" --format "{{.Status}}"); local s_color="$COLOR_RED"; local status_text=""; if [[ "$raw_status" == *"Up"* ]]; then if [[ "$raw_status" == *"(healthy)"* ]]; then s_color="$COLOR_GREEN"; status_text="运行中 (健康)"; elif [[ "$raw_status" == *"(unhealthy)"* ]]; then s_color="$COLOR_RED"; status_text="运行中 (不健康!)"; elif [[ "$raw_status" == *"(health: starting)"* ]]; then s_color="$COLOR_YELLOW"; status_text="启动中 (检查..)"; else s_color="$COLOR_GREEN"; status_text="运行中"; fi; elif [[ "$raw_status" == *"Exited"* ]]; then s_color="$COLOR_YELLOW"; status_text="已退出"; else status_text="$raw_status"; fi; printf "%-38s %s\n" "$id ($cname)" "$(print_color "$status_text" "$s_color")"; done; fi; print_color "=================================================================================" "$COLOR_BLUE"; }
 menu_install_single() { read -rp "请输入要安装的 Node ID: " id; id=$(echo "$id"|xargs); if [ -n "$id" ]; then run_container "$id"; else print_warning "ID 无效。"; fi; read -n 1 -s -r -p "按任意键返回..."; }
-menu_update() { while true; do clear; print_color "===== 系统维护与更新 =====" "$COLOR_BLUE"; echo " 1. 强制重构镜像"; echo " 2. 【危险】彻底清理所有数据"; echo " 0. 返回"; read -rp "请输入选项: " choice; case $choice in 1) build_image "--force";; 2) if confirm_action "【警告】将删除所有容器,所有镜像,buildx,及共享配置! 确定吗?"; then docker rm -f $(docker ps -a -q --filter "name=nexus-node-") >/dev/null 2>&1 || true; docker rmi -f $(docker images -q "nexus-node*") >/dev/null 2>&1 || true; docker buildx rm -f "$BUILDER_NAME" >/dev/null 2>&1 || true; rm -rf "$HOST_CONFIG_DIR"; print_success "彻底清理完成。"; fi;; 0) break;; *) print_error "无效选项。";; esac; read -n 1 -s -r -p "按任意键返回..."; done; }
+menu_update_and_cleanup() { while true; do clear; print_color "===== 系统维护与清理 =====" "$COLOR_BLUE"; echo " 1. 强制重构镜像"; echo " 2. 【危险】彻底清理所有数据"; echo " 0. 返回主菜单"; read -rp "请输入选项: " choice; case $choice in 1) build_image "--force";; 2) if read -rp "${COLOR_YELLOW}【警告】将删除所有容器,所有镜像,buildx,及共享配置! 确定吗? (y/N): ${COLOR_RESET}" c && [[ "$c" =~ ^[yY]$ ]]; then docker rm -f $(docker ps -a -q --filter "name=nexus-node-") >/dev/null 2>&1 || true; docker rmi -f $(docker images -q "nexus-node*") >/dev/null 2>&1 || true; docker buildx rm -f "$BUILDER_NAME" >/dev/null 2>&1 || true; rm -rf "$HOST_CONFIG_DIR"; print_success "彻底清理完成。脚本将退出，请重新运行。"; exit 0; fi;; 0) break;; *) print_error "无效选项。";; esac; read -n 1 -s -r -p "按任意键返回..."; done; }
 view_node_logs() { local nodes=($(docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//" | sort -u)); if [ ${#nodes[@]} -eq 0 ]; then print_warning "无节点可操作。"; else print_info "按 Ctrl+C 退出日志。"; docker logs -f "${BASE_CONTAINER_NAME}-${nodes[0]}"; fi; read -n 1 -s -r -p "按任意键返回..."; }
 
 main_menu() {
@@ -133,10 +149,33 @@ main_menu() {
     check_and_initialize_config
     while true; do
         clear; print_color "===== Nexus 管理脚本 ${SCRIPT_VERSION} =====" "$COLOR_BLUE"; list_nodes; echo;
-        print_info "--- 节点管理 ---"; echo " 1. 安装/启动单节点     2. 查看节点日志"; echo " 3. 【危险】彻底清理所有数据"; echo "  0. 退出脚本";
+        print_info "--- 节点管理 ---";
+        echo " 1. 安装/启动单节点     2. 查看最近节点日志";
+        print_info "--- 系统维护 ---";
+        echo " 3. 系统维护与清理";
+        echo "  0. 退出脚本";
         echo; read -rp "请输入选项: " choice
-        case $choice in 1) menu_install_single ;; 2) view_node_logs ;; 3) menu_update ;; 0) break ;; *) print_error "无效选项。" && safe_sleep 1 ;; esac
+        case $choice in
+            1) menu_install_single ;;
+            2) view_node_logs ;;
+            3) menu_update_and_cleanup ;;
+            0) break ;;
+            *) print_error "无效选项。" && safe_sleep 1 ;;
+        esac
     done
 }
+
+# --- 脚本主入口 ---
+
+# 推荐在运行前进行一次彻底清理，以防有残留的错误镜像
+if [[ "$1" == "--clean-first" ]]; then
+    print_bold "执行首次彻底清理..."
+    docker stop $(docker ps -a -q --filter "name=nexus-node-") &>/dev/null || true
+    docker rm $(docker ps -a -q --filter "name=nexus-node-") &>/dev/null || true
+    docker rmi -f $(docker images -q "nexus-node*") &>/dev/null || true
+    docker buildx rm nexus_builder &>/dev/null || true
+    rm -rf /root/nexus_config &>/dev/null || true
+    print_success "首次清理完成。"
+fi
 
 main_menu
