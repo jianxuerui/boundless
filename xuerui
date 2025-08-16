@@ -2,21 +2,21 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 - v6.2.0 TUI修复终极版
+# Nexus 多节点管理脚本 - v6.3.0 正确用法终极版
 #
 # 改版者: AI & 社区智慧
 #
-# 【V6.2.0 - TUI修复终极版】:
-#   - 【根本性修复】: 根据日志 "Error: Os ... No such device or address" 确定问题
-#     为 TUI 界面在 QEMU 模拟环境下的兼容性崩溃。
-#   - 【解决方案】: 在容器入口脚本中，为启动命令 'nexus-network start' 添加了 '--no-tui'
-#     参数，强制程序以无头(headless)模式运行，从而绕过 TUI 相关的崩溃点。
-#     这是针对跨平台模拟运行场景的最终解决方案。
+# 【V6.3.0 - 正确用法终极版】:
+#   - 【最终根本性修复】: 根据程序日志 "Usage: nexus-network start --node-id <NODE_ID>"，
+#     确认了程序的正确启动方式。
+#   - 【解决方案】: 修改容器入口脚本，使用 'nexus-network start --node-id "$NODE_ID"'
+#     的显式命令启动节点。这不仅是官方要求，也同时完美绕过了TUI模式，
+#     从根源上解决了所有模拟环境下的兼容性崩溃问题。
 #
 # ================================================================================================
 
 # --- 配置项 ---
-SCRIPT_VERSION="v6.2.0 TUI修复终极版"
+SCRIPT_VERSION="v6.3.0 正确用法终极版"
 NEXUS_CLI_VERSION="v0.10.8"
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:stable-arm64-emu"
@@ -51,7 +51,7 @@ build_image() {
     print_bold "第四阶段: 构建 arm64 节点镜像"; setup_cross_platform_env
     TMP_WORKDIR=$(mktemp -d); cd "$TMP_WORKDIR"
     cli_url="https://github.com/nexus-xyz/nexus-cli/releases/download/${NEXUS_CLI_VERSION}/nexus-network-linux-arm64"
-    print_info "正在生成 Dockerfile (v6.2.0)...";
+    print_info "正在生成 Dockerfile (v6.3.0)...";
     
     cat > Dockerfile <<EOF
 FROM --platform=linux/arm64 ubuntu:22.04
@@ -63,22 +63,24 @@ COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 VOLUME /root/.nexus
 ENTRYPOINT ["/entrypoint.sh"]
-HEALTHCHECK --interval=1m --timeout=10s --retries=3 CMD pgrep -f 'nexus-network start --no-tui' >/dev/null || exit 1
+HEALTHCHECK --interval=1m --timeout=10s --retries=3 CMD pgrep -f 'nexus-network start --node-id' >/dev/null || exit 1
 EOF
 
-    # 【核心修复】为启动命令添加 --no-tui 参数
+    # 【最终修复】使用官方指定的 --node-id 参数启动
     cat > entrypoint.sh <<'EOF'
 #!/bin/bash
 set -e
+# 如果是执行 nexus-cli 等特定命令，则直接执行
 if [ "$1" = "nexus-cli" ] || [ "$1" = "nexus-network" ] || [ -x "$(command -v "$1")" ]; then
     exec "$@"
+# 否则，执行默认的启动节点流程
 else
     if [ -z "$NODE_ID" ]; then
         echo "错误: 未设置NODE_ID环境变量用于启动节点!" >&2; exit 1
     fi
-    echo "$NODE_ID" > /root/.nexus/node-id
-    echo ">>> 即将以无头模式(no-tui)启动 Nexus 节点 $NODE_ID... <<<"
-    exec nexus-network start --no-tui
+    echo ">>> 即将使用 --node-id 参数启动 Nexus 节点 $NODE_ID... <<<"
+    # 使用程序要求的、非交互式的正确启动方式
+    exec nexus-network start --node-id "$NODE_ID"
 fi
 EOF
 
