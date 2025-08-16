@@ -2,19 +2,21 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 - v6.1.0 节点注册修复版 (最终版)
+# Nexus 多节点管理脚本 - v6.2.0 TUI修复终极版
 #
 # 改版者: AI & 社区智慧
 #
-# 【V6.1.0 - 最终修复版】:
-#   - 【根本性修复】: 根据日志 "Node registration required"，重构了节点安装逻辑。
-#     现在安装节点时，脚本会先自动检查并为该Node ID执行一次性的'register-node'操作，
-#     将节点信息正式写入 config.json。这彻底解决了因缺少节点注册信息导致的启动失败和重启循环问题。
+# 【V6.2.0 - TUI修复终极版】:
+#   - 【根本性修复】: 根据日志 "Error: Os ... No such device or address" 确定问题
+#     为 TUI 界面在 QEMU 模拟环境下的兼容性崩溃。
+#   - 【解决方案】: 在容器入口脚本中，为启动命令 'nexus-network start' 添加了 '--no-tui'
+#     参数，强制程序以无头(headless)模式运行，从而绕过 TUI 相关的崩溃点。
+#     这是针对跨平台模拟运行场景的最终解决方案。
 #
 # ================================================================================================
 
 # --- 配置项 ---
-SCRIPT_VERSION="v6.1.0 节点注册修复版 (最终版)"
+SCRIPT_VERSION="v6.2.0 TUI修复终极版"
 NEXUS_CLI_VERSION="v0.10.8"
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:stable-arm64-emu"
@@ -49,7 +51,7 @@ build_image() {
     print_bold "第四阶段: 构建 arm64 节点镜像"; setup_cross_platform_env
     TMP_WORKDIR=$(mktemp -d); cd "$TMP_WORKDIR"
     cli_url="https://github.com/nexus-xyz/nexus-cli/releases/download/${NEXUS_CLI_VERSION}/nexus-network-linux-arm64"
-    print_info "正在生成 Dockerfile (v6.1.0)...";
+    print_info "正在生成 Dockerfile (v6.2.0)...";
     
     cat > Dockerfile <<EOF
 FROM --platform=linux/arm64 ubuntu:22.04
@@ -61,9 +63,10 @@ COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 VOLUME /root/.nexus
 ENTRYPOINT ["/entrypoint.sh"]
-HEALTHCHECK --interval=1m --timeout=10s --retries=3 CMD pgrep -x nexus-network >/dev/null || exit 1
+HEALTHCHECK --interval=1m --timeout=10s --retries=3 CMD pgrep -f 'nexus-network start --no-tui' >/dev/null || exit 1
 EOF
 
+    # 【核心修复】为启动命令添加 --no-tui 参数
     cat > entrypoint.sh <<'EOF'
 #!/bin/bash
 set -e
@@ -74,8 +77,8 @@ else
         echo "错误: 未设置NODE_ID环境变量用于启动节点!" >&2; exit 1
     fi
     echo "$NODE_ID" > /root/.nexus/node-id
-    echo ">>> 即将启动 Nexus 节点 $NODE_ID... (在模拟环境中) <<<"
-    exec nexus-network start
+    echo ">>> 即将以无头模式(no-tui)启动 Nexus 节点 $NODE_ID... <<<"
+    exec nexus-network start --no-tui
 fi
 EOF
 
@@ -100,7 +103,7 @@ run_container() {
     local node_id="$1"; [ -z "$node_id" ] && { print_error "ID不能为空"; return 1; };
     local cname="${BASE_CONTAINER_NAME}-${node_id}";
 
-    # --- 【核心修复】检查并注册节点 ---
+    # 检查并注册节点
     if [ -f "${HOST_CONFIG_DIR}/config.json" ] && ! grep -q "\"id\": \"${node_id}\"" "${HOST_CONFIG_DIR}/config.json"; then
         print_warning "节点 ${node_id} 未在配置中注册，现在开始自动注册..."
         if ! docker run --rm --platform linux/arm64 -v "${HOST_CONFIG_DIR}:/root/.nexus" "${IMAGE_NAME}" \
@@ -109,7 +112,6 @@ run_container() {
         fi
         print_success "节点 ${node_id} 注册成功！"
     fi
-    # --- 修复结束 ---
 
     if [ -n "$(docker ps -a -q -f name="^${cname}$")" ]; then docker stop "$cname" &>/dev/null || true; docker rm "$cname" &>/dev/null || true; fi
     
@@ -117,16 +119,17 @@ run_container() {
     if [[ "$NODE_MEM_LIMIT" != "0" && -n "$NODE_MEM_LIMIT" ]]; then run_opts+=" --memory=${NODE_MEM_LIMIT}"; fi
     if [[ "$NODE_CPU_LIMIT" != "0" && -n "$NODE_CPU_LIMIT" ]]; then run_opts+=" --cpus=${NODE_CPU_LIMIT}"; fi
     
-    print_info "正在启动节点 ${id} (CPU: ${NODE_CPU_LIMIT:-不限}, Mem: ${NODE_MEM_LIMIT:-不限})..."; 
-    if ! docker run -d --name "$cname" --platform linux/arm64 -e NODE_ID="$id" -v "${HOST_CONFIG_DIR}:/root/.nexus" $run_opts --restart unless-stopped "$IMAGE_NAME" &>/dev/null; then
+    print_info "正在启动节点 ${node_id} (CPU: ${NODE_CPU_LIMIT:-不限}, Mem: ${NODE_MEM_LIMIT:-不限})..."; 
+    if ! docker run -d --name "$cname" --platform linux/arm64 -e NODE_ID="$node_id" -v "${HOST_CONFIG_DIR}:/root/.nexus" $run_opts --restart unless-stopped "$IMAGE_NAME" &>/dev/null; then
         print_error "!! 容器 '${cname}' 启动失败。"; return 1
     fi
     print_info "等待容器稳定 (10秒)..." && safe_sleep 10
-    if [ -n "$(docker ps -q -f name="^${cname}$")" ]; then print_success "节点 $id 启动成功。"; else
-        print_error "!! 节点 $id 未能保持运行！"; print_warning "查看日志:"; docker logs "$cname";
+    if [ -n "$(docker ps -q -f name="^${cname}$")" ]; then print_success "节点 $node_id 启动成功。"; else
+        print_error "!! 节点 $node_id 未能保持运行！"; print_warning "查看日志:"; docker logs "$cname";
     fi
 }
 
+# --- 菜单及其他函数保持不变 ---
 list_nodes() { print_color "=============================== 当前 Nexus 节点状态 ===============================" "$COLOR_BLUE"; printf "%-38s %s\n" "$(print_bold "节点ID(容器名)")" "$(print_bold "状态")"; print_color "---------------------------------------------------------------------------------" "$COLOR_BLUE"; local nodes=$(docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sed "s/^${BASE_CONTAINER_NAME}-//" | sort -u); if [ -z "$nodes" ]; then print_warning "未找到任何 Nexus 节点。"; else for id in $nodes; do local cname="${BASE_CONTAINER_NAME}-${id}"; local raw_status=$(docker ps -a -f name="^${cname}$" --format "{{.Status}}"); local s_color="$COLOR_RED"; local status_text=""; if [[ "$raw_status" == *"Up"* ]]; then if [[ "$raw_status" == *"(healthy)"* ]]; then s_color="$COLOR_GREEN"; status_text="运行中 (健康)"; elif [[ "$raw_status" == *"(unhealthy)"* ]]; then s_color="$COLOR_RED"; status_text="运行中 (不健康!)"; elif [[ "$raw_status" == *"(health: starting)"* ]]; then s_color="$COLOR_YELLOW"; status_text="启动中 (检查..)"; else s_color="$COLOR_GREEN"; status_text="运行中"; fi; elif [[ "$raw_status" == *"Exited"* ]]; then s_color="$COLOR_YELLOW"; status_text="已退出"; elif [[ "$raw_status" == *"Restarting"* ]]; then s_color="$COLOR_RED"; status_text="重启循环!"; else status_text="$raw_status"; fi; printf "%-38s %s\n" "$id ($cname)" "$(print_color "$status_text" "$s_color")"; done; fi; print_color "=================================================================================" "$COLOR_BLUE"; }
 menu_install_single() { read -rp "请输入要安装的新节点 ID: " id; id=$(echo "$id"|xargs); if [ -n "$id" ]; then run_container "$id"; else print_warning "ID 无效。"; fi; }
 perform_node_action() { local action=$1; local node_id=$2; local cname="${BASE_CONTAINER_NAME}-${node_id}"; case $action in stop) print_info "正在停止节点 $node_id..."; docker stop "$cname" >/dev/null && print_success "已停止。" || print_error "停止失败。";; restart) print_info "正在重启节点 $node_id..."; docker restart "$cname" >/dev/null && print_success "已重启。" || print_error "重启失败。";; remove) if read -rp "${COLOR_YELLOW}【警告】确定要移除节点 '$node_id' 吗? (y/N): ${COLOR_RESET}" c && [[ "$c" =~ ^[yY]$ ]]; then print_info "正在移除节点 $node_id..."; docker stop "$cname" >/dev/null 2>&1 && docker rm "$cname" >/dev/null 2>&1 && print_success "已移除。" || print_error "移除失败。"; else print_warning "操作已取消。"; fi ;; logs) print_info "按 Ctrl+C 退出日志查看..."; safe_sleep 1; docker logs -f "$cname";; esac }
@@ -136,4 +139,4 @@ menu_maintenance() { while true; do clear; print_bold "--- 系统与维护 ---";
 main_menu() { if [ "$(id -u)" -ne 0 ]; then print_error "错误: 脚本需root权限。"; exit 1; fi; prepare_system; ensure_docker_ready; check_and_initialize_config; while true; do clear; print_color "===== Nexus 管理脚本 ${SCRIPT_VERSION} =====" "$COLOR_BLUE"; list_nodes; echo; print_info "--- 单节点管理 ---"; echo -e "  ${COLOR_YELLOW}1.${COLOR_RESET} 安装新节点"; echo -e "  ${COLOR_YELLOW}2.${COLOR_RESET} 管理现有节点 (停止/重启/移除/日志)"; print_info "--- 批量操作 ---"; echo -e "  ${COLOR_YELLOW}3.${COLOR_RESET} 启动所有节点   ${COLOR_YELLOW}4.${COLOR_RESET} 停止所有节点   ${COLOR_YELLOW}5.${COLOR_RESET} 重启所有节点"; print_info "--- 系统与维护 ---"; echo -e "  ${COLOR_YELLOW}8.${COLOR_RESET} 系统维护 (重构镜像/清理数据)"; echo -e "  ${COLOR_YELLOW}0.${COLOR_RESET} 退出脚本"; echo; read -rp "请输入选项: " choice; case $choice in 1) menu_install_single; press_any_key ;; 2) menu_manage_existing_nodes ;; 3) perform_batch_action start; press_any_key ;; 4) perform_batch_action stop; press_any_key ;; 5) perform_batch_action restart; press_any_key ;; 8) menu_maintenance ;; 0) break ;; *) print_error "无效选项。" && safe_sleep 1 ;; esac; done; }
 
 # --- 脚本主入口 ---
-if [[ "$1" == "--clean-first" ]]; then print_bold "执行首次彻底清理..."; docker stop $(docker ps -a -q --filter "name=nexus-node-") &>/dev/null || true; docker rm $(docker ps -a -q --filter "name=nexus-node-") &>/dev/null || true; docker rmi -f $(docker images -q "${IMAGE_NAME}") &>/dev/null || true; docker buildx rm nexus_builder &>/dev/null || true; rm -rf "$HOST_CONFIG_DIR" &>/dev/null || true; print_success "首次清理完成。"; fi; main_menu
+if [[ "$1" == "--clean-first" ]]; then print_bold "执行首次彻底清理..."; docker stop $(docker ps -a -q --filter "name=nexus-node-") &>/dev/null || true; docker rm -f $(docker ps -a -q --filter "name=nexus-node-") &>/dev/null || true; docker rmi -f $(docker images -q "${IMAGE_NAME}") &>/dev/null || true; docker buildx rm -f nexus_builder &>/dev/null || true; rm -rf "$HOST_CONFIG_DIR" &>/dev/null || true; print_success "首次清理完成。"; fi; main_menu
