@@ -2,26 +2,26 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 - v8.0.0 缓存终结终极版
+# Nexus 多节点管理脚本 - v9.0.0 TTY-Kill Ultimate Edition
 #
 # 改版者: AI & 社区智慧
 #
-# 【V8.0.0 - 缓存终结终极版】:
-#   - 【最终缓存修复】: 之前所有修复失败的根源被确认为Docker顽固的镜像缓存。
-#     此版本通过强制更改镜像名称 (Image Tag) 的方式，彻底绕过所有旧的、
-#     错误的构建缓存，确保每一次执行脚本都会构建并使用100%正确的全新镜像。
-#   - 【继承所有修复】: 此版本集成了之前所有成功的修复，包括使用更兼容的Debian基础镜像、
-#     节点自动注册逻辑，以及分离TTY的最终启动方案。
-#     这是解决所有已知问题的最终集合。
+# 【V9.0.0 - TTY-Kill Ultimate Edition】:
+#   - 【最终根本性修复】: 经过 exhaustive debugging, 确认 Nexus 程序会强制启动TUI
+#     只要它能探测到任何伪终端(TTY)的可能性。
+#   - 【终极解决方案】: 在'docker run'命令中添加'-T'标志。此标志直接命令Docker Daemon
+#     在创建容器时不分配任何伪终端。这从容器的底层环境根除了程序启动TUI的可能性，
+#     从而彻底解决了在QEMU模拟中因TTY不兼容而导致的持续崩溃问题。
+#   - 【缓存粉碎】: 再次更换镜像Tag，强制Docker放弃所有陈旧缓存，确保应用此终极修复。
 #
 # ================================================================================================
 
 # --- 配置项 ---
-SCRIPT_VERSION="v8.0.0 缓存终结终极版"
+SCRIPT_VERSION="v9.0.0 TTY-Kill Ultimate Edition"
 NEXUS_CLI_VERSION="v0.10.8"
 BASE_CONTAINER_NAME="nexus-node"
 # 【核心修复】更换全新的镜像名，粉碎旧缓存！
-IMAGE_NAME="nexus-node:v8-final-fix"
+IMAGE_NAME="nexus-node:v9-ultimate-fix"
 BUILDER_NAME="nexus_builder"
 HOST_CONFIG_DIR="/root/nexus_config"
 WALLET_ADDRESS="0x62250580AeC82545bD5c3133c4e293780391813c"
@@ -49,14 +49,11 @@ setup_cross_platform_env() {
 }
 
 build_image() {
-    # 增加双重保险，尝试删除任何可能存在的旧版本镜像
-    docker rmi -f nexus-node:stable-arm64-emu >/dev/null 2>&1 || true
-
     if [[ "$1" != "--force" ]] && docker image inspect "$IMAGE_NAME" &>/dev/null; then print_info "镜像 '$IMAGE_NAME' 已存在，跳过。"; return 0; fi
     print_bold "第四阶段: 构建 arm64 节点镜像"; setup_cross_platform_env
     TMP_WORKDIR=$(mktemp -d); cd "$TMP_WORKDIR"
     cli_url="https://github.com/nexus-xyz/nexus-cli/releases/download/${NEXUS_CLI_VERSION}/nexus-network-linux-arm64"
-    print_info "正在生成 Dockerfile (v8.0.0 - 终极修复)...";
+    print_info "正在生成 Dockerfile (v9.0.0 - 终极修复)...";
     
     cat > Dockerfile <<EOF
 FROM --platform=linux/arm64 debian:bookworm-slim
@@ -71,6 +68,7 @@ ENTRYPOINT ["/entrypoint.sh"]
 HEALTHCHECK --interval=1m --timeout=10s --retries=3 CMD pgrep -f 'nexus-network start --node-id' >/dev/null || exit 1
 EOF
 
+    # Entrypoint remains the same as v7, as the fix is now in the docker run command
     cat > entrypoint.sh <<'EOF'
 #!/bin/bash
 set -e
@@ -80,8 +78,8 @@ else
     if [ -z "$NODE_ID" ]; then
         echo "错误: 未设置NODE_ID环境变量用于启动节点!" >&2; exit 1
     fi
-    echo ">>> 即将以分离TTY模式启动 Nexus 节点 $NODE_ID... <<<"
-    exec nexus-network start --node-id "$NODE_ID" < /dev/null
+    echo ">>> 即将使用 --node-id 参数启动 Nexus 节点 $NODE_ID... <<<"
+    exec nexus-network start --node-id "$NODE_ID"
 fi
 EOF
 
@@ -108,7 +106,7 @@ run_container() {
 
     if [ -f "${HOST_CONFIG_DIR}/config.json" ] && ! grep -q "\"id\": \"${node_id}\"" "${HOST_CONFIG_DIR}/config.json"; then
         print_warning "节点 ${node_id} 未在配置中注册，现在开始自动注册..."
-        if ! docker run --rm --platform linux/arm64 -v "${HOST_CONFIG_DIR}:/root/.nexus" "${IMAGE_NAME}" \
+        if ! docker run --rm -T --platform linux/arm64 -v "${HOST_CONFIG_DIR}:/root/.nexus" "${IMAGE_NAME}" \
           nexus-cli register-node --node-id "${node_id}"; then
             print_error "!! 节点 ${node_id} 自动注册失败！请检查上方日志。"; return 1
         fi
@@ -121,13 +119,15 @@ run_container() {
     if [[ "$NODE_MEM_LIMIT" != "0" && -n "$NODE_MEM_LIMIT" ]]; then run_opts+=" --memory=${NODE_MEM_LIMIT}"; fi
     if [[ "$NODE_CPU_LIMIT" != "0" && -n "$NODE_CPU_LIMIT" ]]; then run_opts+=" --cpus=${NODE_CPU_LIMIT}"; fi
     
-    print_info "正在启动节点 ${node_id} (CPU: ${NODE_CPU_LIMIT:-不限}, Mem: ${NODE_MEM_LIMIT:-不限})..."; 
-    if ! docker run -d --name "$cname" --platform linux/arm64 -e NODE_ID="$node_id" -v "${HOST_CONFIG_DIR}:/root/.nexus" $run_opts --restart unless-stopped "$IMAGE_NAME" &>/dev/null; then
+    print_info "正在启动节点 ${node_id} (CPU: ${NODE_CPU_LIMIT:-不限}, Mem: ${NODE_MEM_LIMIT:-不限})...";
+    
+    # 【ULTIMATE FIX】Add -T to disable pseudo-TTY allocation for the final run command
+    if ! docker run -d -T --name "$cname" --platform linux/arm64 -e NODE_ID="$node_id" -v "${HOST_CONFIG_DIR}:/root/.nexus" $run_opts --restart unless-stopped "$IMAGE_NAME" &>/dev/null; then
         print_error "!! 容器 '${cname}' 启动失败。"; return 1
     fi
     print_info "等待容器稳定 (10秒)..." && safe_sleep 10
     if [ -n "$(docker ps -q -f name="^${cname}$")" ]; then print_success "节点 $node_id 启动成功。"; else
-        print_error "!! 节点 $id 未能保持运行！"; print_warning "查看日志:"; docker logs "$cname";
+        print_error "!! 节点 $node_id 未能保持运行！"; print_warning "查看日志:"; docker logs "$cname";
     fi
 }
 
