@@ -1,20 +1,17 @@
 #!/bin/bash
 # ==========================================================================================
 # Script Modificato: Gestore Multi-Nodo Nexus
-# Versione: 1.1
+# Versione: 1.3
+# Novità: Il menu principale ora mostra una panoramica dello stato attuale dei nodi.
 # Adattato per: CentOS 8
+# Correzione: Risolto il problema del repository CentOS 8 EOL puntando a vault.centos.org
 # Versione Nexus: v0.10.8 (Hardcoded)
 # Ottimizzazioni per Prestazioni: Rete Host, Politica di Riavvio, Rotazione dei Log
-#
-# Note:
-# - Lo script installa automaticamente Docker e Node.js/PM2 se non vengono trovati.
-# - La rete in modalità Host (--network host) offre le migliori prestazioni ma espone direttamente 
-#   le porte del contenitore sull'host.
 # ==========================================================================================
 set -e
 
 BASE_CONTAINER_NAME="nexus-node"
-IMAGE_NAME="nexus-node-centos:v0.10.8"
+IMAGE_NAME="nexus-node-centos:v0.10.8-fixed"
 LOG_DIR="/root/nexus_logs"
 
 # 检查 Docker 是否安装 (适配 CentOS)
@@ -44,14 +41,25 @@ function check_pm2() {
     fi
 }
 
-# 构建docker镜像函数 (使用 CentOS 8 和指定 Nexus 版本)
+# 构建docker镜像函数 (修复 CentOS 8 EOL 问题)
 function build_image() {
+    # 检查镜像是否已存在，如果存在则跳过构建
+    if docker image inspect "$IMAGE_NAME" &>/dev/null; then
+        echo "镜像 ${IMAGE_NAME} 已存在，跳过构建。"
+        return
+    fi
+
     echo "正在构建镜像 ${IMAGE_NAME}..."
     WORKDIR=$(mktemp -d)
     cd "$WORKDIR"
 
     cat > Dockerfile <<EOF
 FROM centos:8
+
+# [FIX] CentOS 8 EOL Repository Issue: Switch to vault.centos.org
+RUN cd /etc/yum.repos.d/ && \
+    sed -i 's/mirrorlist/#mirrorlist/g' CentOS-* && \
+    sed -i 's|#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' CentOS-*
 
 # 安装必要的工具
 RUN dnf install -y curl screen bash && dnf clean all
@@ -78,7 +86,6 @@ if [ -z "\$NODE_ID" ]; then
     exit 1
 fi
 
-# 确保目录存在
 mkdir -p /root/.nexus
 echo "\$NODE_ID" > "\$PROVER_ID_FILE"
 echo "使用的 node-id: \$NODE_ID"
@@ -91,17 +98,13 @@ fi
 screen -S nexus -X quit >/dev/null 2>&1 || true
 
 echo "启动 nexus-network 节点..."
-# 将日志直接输出到标准输出，由 docker logs 管理
 screen -dmS nexus bash -c "nexus-network start --node-id \$NODE_ID"
 
 sleep 5
 
-# 检查 screen 会话是否存在来判断是否启动成功
 if screen -list | grep -q "nexus"; then
     echo "节点已在后台启动。"
     echo "请使用 'docker logs -f \$HOSTNAME' 命令查看实时日志"
-    # 让容器持续运行并捕获 nexus-network 的日志
-    # screen -r nexus
     tail -f /dev/null
 else
     echo "节点启动失败，请检查配置或使用 'docker logs \$HOSTNAME' 查看启动错误。"
@@ -121,10 +124,9 @@ function run_container() {
     local node_id=$1
     local container_name="${BASE_CONTAINER_NAME}-${node_id}"
     
-    # 因为日志由 Docker 直接管理，不再挂载宿主机文件，但保留日志目录结构用于其他目的
     mkdir -p "$LOG_DIR"
 
-    if docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
+    if docker ps -a --format '{{.Names}}' | grep -qw "^${container_name}$"; then
         echo "检测到旧容器 $container_name，正在删除..."
         docker rm -f "$container_name"
     fi
@@ -150,7 +152,7 @@ function uninstall_node() {
     local container_name="${BASE_CONTAINER_NAME}-${node_id}"
     
     echo "正在停止并删除容器 $container_name..."
-    if docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
+    if docker ps -a --format '{{.Names}}' | grep -qw "^${container_name}$"; then
         docker rm -f "$container_name"
         echo "容器 $container_name 已删除。"
     else
@@ -159,7 +161,7 @@ function uninstall_node() {
     echo "节点 $node_id 已卸载完成。"
 }
 
-# 批量节点轮换启动（适配新版run_container）
+# 批量节点轮换启动
 function batch_rotate_nodes() {
     check_pm2
     echo "请输入多个 node-id，每行一个，输入空行结束："
@@ -246,56 +248,41 @@ EOF
     read -p "按任意键返回菜单"
 }
 
-# 其他辅助函数（与原脚本基本保持一致，无需大改）
-# 显示所有运行中的节点
-function list_nodes() {
-    echo "当前节点状态："
-    echo "------------------------------------------------------------------------------------------------------------------------"
-    printf "%-6s %-20s %-12s %-15s %-15s %-20s %-20s\n" "序号" "节点ID" "CPU %" "内存使用" "内存限制" "状态" "启动时间"
-    echo "------------------------------------------------------------------------------------------------------------------------"
+# 其他辅助函数
+# (详细列表)显示所有运行中的节点
+function list_nodes_detailed() {
+    clear
+    echo "==================================== 详细节点状态 ======================================"
+    echo "------------------------------------------------------------------------------------------------------------"
+    printf "%-6s %-30s %-12s %-20s %-25s %-20s\n" "序号" "节点ID (容器名)" "CPU %" "内存使用/限制" "状态" "创建时间"
+    echo "------------------------------------------------------------------------------------------------------------"
     
-    local all_node_ids=($(get_all_nodes))
-    if [ ${#all_node_ids[@]} -eq 0 ]; then
+    local all_nodes_names=($(docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}" | sort))
+    if [ ${#all_nodes_names[@]} -eq 0 ]; then
         echo "未找到任何 Nexus 节点容器。"
-        echo "------------------------------------------------------------------------------------------------------------------------"
-        read -p "按任意键返回菜单"
-        return
-    fi
-    
-    local container_names=""
-    for node_id in "${all_node_ids[@]}"; do
-        container_names+="${BASE_CONTAINER_NAME}-${node_id} "
-    done
-
-    docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.Status}}\t{{.CreatedAt}}" $container_names | tail -n +2 | sort | while read -r line; do
-        local name=$(echo $line | awk '{print $1}')
-        local node_id=${name#${BASE_CONTAINER_NAME}-}
-        local cpu=$(echo $line | awk '{print $2}')
-        local mem_usage_full=$(echo $line | awk '{print $3" "$4" "$5}')
-        # 从 docker ps 获取状态和创建时间
-        local status_created=$(docker ps -a --filter "name=$name" --format "{{.Status}}\t{{.CreatedAt}}")
-        local status=$(echo -e "$status_created" | awk -F'\t' '{print $1}')
-        local created_time=$(echo -e "$status_created" | awk -F'\t' '{print $2}')
-
-        # 查找 node_id 在数组中的索引以获取序号
-        local index=-1
-        for i in "${!all_node_ids[@]}"; do
-            if [[ "${all_node_ids[$i]}" == "$node_id" ]]; then
-                index=$((i+1))
-                break
+    else
+        local i=1
+        for name in "${all_nodes_names[@]}"; do
+            local container_info=$(docker ps -a --filter "name=^/${name}$" --format "{{.Status}}\t{{.CreatedAt}}")
+            local status=$(echo -e "$container_info" | cut -f1)
+            local created_at=$(echo -e "$container_info" | cut -f2)
+            local stats
+            if [[ $status == Up* ]]; then
+                 stats=$(docker stats --no-stream --format "{{.CPUPerc}}\t{{.MemUsage}}" "$name")
+                 printf "%-6s %-30s %-12s %-20s %-25s %-20s\n" "$i" "$name" "$(echo -e "$stats" | awk '{print $1}')" "$(echo -e "$stats" | awk '{print $2 " " $3 " " $4}')" "$status" "$created_at"
+            else
+                 printf "%-6s %-30s %-12s %-20s %-25s %-20s\n" "$i" "$name" "N/A" "N/A" "$status" "$created_at"
             fi
+            ((i++))
         done
-        
-        printf "%-6s %-20s %-12s %-30s %-20s %-20s\n" "$index" "$node_id" "$cpu" "$mem_usage_full" "$status" "$created_time"
-    done
-    echo "------------------------------------------------------------------------------------------------------------------------"
+    fi
+    echo "------------------------------------------------------------------------------------------------------------"
     read -p "按任意键返回菜单"
 }
 
-
-# 获取所有节点ID（包括已停止的）
+# 获取所有节点ID
 function get_all_nodes() {
-    docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}" | sed "s/${BASE_CONTAINER_NAME}-//"
+    docker ps -a --filter "name=${BASE_CONTAINER_NAME}" --format "{{.Names}}" | sed "s/${BASE_CONTAINER_NAME}-//" | sort
 }
 
 # 查看节点日志
@@ -303,7 +290,7 @@ function view_node_logs() {
     local node_id=$1
     local container_name="${BASE_CONTAINER_NAME}-${node_id}"
     
-    if docker ps -a --format '{{.Names}}' | grep -qw "$container_name"; then
+    if docker ps -a --format '{{.Names}}' | grep -qw "^${container_name}$"; then
         echo "显示容器 $container_name 的日志，按 Ctrl+C 退出。"
         docker logs -f "$container_name"
     else
@@ -376,21 +363,45 @@ function uninstall_all_nodes() {
     read -p "按任意键返回菜单"
 }
 
-# 主菜单
-while true; do
+# ==================== [NEW] 主菜单显示函数 ====================
+function display_main_menu() {
     clear
     echo "脚本由哈哈哈哈编写，推特 @ferdie_jhovie，免费开源，请勿相信收费"
-    echo "经魔改适配CentOS 8，并优化单节点性能"
-    echo "================ Nexus 多节点管理 (CentOS-v0.10.8) ================"
-    echo "1. 安装并启动新节点"
-    echo "2. 显示所有节点状态"
-    echo "3. 批量停止并卸载指定节点"
-    echo "4. 查看指定节点日志"
-    echo "5. 批量节点轮换启动"
-    echo "6. 删除全部节点"
-    echo "7. 退出"
-    echo "==================================================================="
+    echo "经魔改适配CentOS 8，并优化单节点性能 (v1.3)"
+    echo
+    echo "======================= 当前节点概览 ======================="
+    
+    # 获取所有节点名称和状态
+    local nodes_info=$(docker ps -a --filter "name=${BASE_CONTAINER_NAME}-" --format "{{.Names}}\t{{.Status}}" | sort)
 
+    if [ -z "$nodes_info" ]; then
+        echo "                      当前没有配置任何节点"
+    else
+        printf "  %-35s | %s\n" "容器名" "状态"
+        echo "  ----------------------------------------------------------"
+        # 使用 while read 逐行处理，以防节点名称中含有特殊字符
+        while IFS=$'\t' read -r name status; do
+            printf "  %-35s | %s\n" "$name" "$status"
+        done <<< "$nodes_info"
+    fi
+    echo "============================================================"
+    echo
+    echo "=========================== 主菜单 ==========================="
+    echo " 1. 安装并启动新节点"
+    echo " 2. 显示所有节点详细状态 (含CPU/内存)"
+    echo " 3. 批量停止并卸载指定节点"
+    echo " 4. 查看指定节点日志"
+    echo " 5. 批量节点轮换启动"
+    echo " 6. 删除全部节点"
+    echo " 7. 退出"
+    echo "============================================================"
+}
+
+
+# ========================== 主循环 ==========================
+while true; do
+    display_main_menu # 调用新函数来显示菜单和状态
+    
     read -rp "请输入选项(1-7): " choice
 
     case $choice in
@@ -404,7 +415,7 @@ while true; do
             run_container "$NODE_ID"
             read -p "按任意键返回菜单"
             ;;
-        2) list_nodes ;;
+        2) list_nodes_detailed ;;
         3) batch_uninstall_nodes ;;
         4) select_node_to_view ;;
         5) check_docker; batch_rotate_nodes ;;
