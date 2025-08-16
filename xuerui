@@ -1,24 +1,23 @@
 #!/bin/bash
 
 #================================================================================
-# Nexus Network 魔改管理脚本 v4.0 - 终极智能版
+# Nexus Network 魔改管理脚本 v5.0 - 节点中心版
 #
 # 功能:
-#   - 自动检测系统架构 (x86_64 / aarch64) 并下载对应的正确程序
-#   - 解决了 x86_64 版本下载链接 404 的问题 (感谢用户提供正确链接)
-#   - 自动安装、配置、并注册为 systemd 服务
-#   - 提供完整的服务管理功能和一键卸载
+#   - 菜单界面优化，突出“节点”概念。
+#   - 新增“配置/上线节点”指引选项。
+#   - 自动检测架构 (x86_64 / aarch64) 并下载对应程序。
+#   - 提供完整的节点软件安装、卸载及服务管理功能。
 #
 # 作者: Your Name/AI Assistant
-# 版本: 4.0
+# 版本: 5.0
 #================================================================================
 
 # --- 全局变量定义 ---
-# 不同架构的下载链接 (已更新为正确的 x86_64 链接)
 readonly URL_ARM64="https://github.com/nexus-xyz/nexus-cli/releases/download/v0.10.8/nexus-network-linux-arm64"
 readonly URL_X86_64="https://github.com/nexus-xyz/nexus-cli/releases/download/v0.10.8/nexus-network-linux-x86_64"
 
-# 动态变量，将在环境检查时被赋值
+# 动态变量
 URL=""
 DETECTED_ARCH=""
 
@@ -38,130 +37,82 @@ readonly C_BLUE='\033[0;34m'
 readonly C_NC='\033[0m' # No Color
 
 # --- 辅助函数 ---
+_log() { local color="$1"; local message="$2"; echo -e "${color}${message}${C_NC}"; }
+pause() { read -rp "按 [Enter] 键返回菜单..."; }
+check_root() { if [[ "$(id -u)" -ne 0 ]]; then _log "$C_RED" "错误: 此脚本必须以 root 权限运行。"; exit 1; fi; }
+is_installed() { if [[ -f "$SERVICE_FILE" ]]; then return 0; else return 1; fi; }
 
-# 打印信息
-_log() {
-    local color="$1"
-    local message="$2"
-    echo -e "${color}${message}${C_NC}"
-}
-
-# 暂停脚本，等待用户按回车键
-pause() {
-    read -rp "按 [Enter] 键返回菜单..."
-}
-
-# 检查是否以 root 用户身份运行
-check_root() {
-    if [[ "$(id -u)" -ne 0 ]]; then
-        _log "$C_RED" "错误: 此脚本必须以 root 权限运行。请使用 'sudo'。"
-        exit 1
-    fi
-}
-
-# 检查操作系统和架构，并设置正确的下载URL
+# 检查环境并设置URL
 check_env() {
-    # 检查操作系统
     if ! grep -q -i "centos stream release 8" /etc/centos-release; then
-        _log "$C_YELLOW" "警告: 此脚本专为 CentOS 8 设计。您的系统可能不兼容。"
+        _log "$C_YELLOW" "警告: 此脚本专为 CentOS 8 设计，您的系统可能不兼容。"
     fi
-
-    # 检查并设置架构
-    local arch
-    arch=$(uname -m)
-    DETECTED_ARCH="$arch"
-
-    case "$arch" in
-        "aarch64")
-            _log "$C_GREEN" "检测到系统架构: aarch64 (ARM64)。将使用对应的二进制文件。"
-            URL="$URL_ARM64"
-            ;;
-        "x86_64")
-            _log "$C_GREEN" "检测到系统架构: x86_64。将使用对应的二进制文件。"
-            URL="$URL_X86_64"
-            ;;
-        *)
-            _log "$C_RED" "错误: 暂不支持您的系统架构 '$arch'。"
-            _log "$C_YELLOW" "此脚本仅支持 'aarch64' 和 'x86_64' 架构。"
-            exit 1
-            ;;
+    DETECTED_ARCH=$(uname -m)
+    case "$DETECTED_ARCH" in
+        "aarch64") URL="$URL_ARM64" ;;
+        "x86_64") URL="$URL_X86_64" ;;
+        *) _log "$C_RED" "错误: 不支持的系统架构 '$DETECTED_ARCH'。"; exit 1 ;;
     esac
-}
-
-# 检查服务是否已安装
-is_installed() {
-    if [[ -f "$SERVICE_FILE" ]] || [[ -f "${INSTALL_DIR}/${BINARY_NAME}" ]]; then
-        return 0 # 已安装
-    else
-        return 1 # 未安装
-    fi
 }
 
 # --- 核心功能函数 ---
 
-# 1. 安装 Nexus Network
+# 1. 安装节点软件
 install_nexus() {
-    _log "$C_BLUE" "--- 开始安装 Nexus Network ---"
-    
-    if is_installed; then
-        _log "$C_YELLOW" "检测到 Nexus Network 已安装。如果需要重新安装，请先卸载。"
-        return
-    fi
-
-    # 1. 安装依赖
-    _log "$C_BLUE" "[1/7] 正在安装依赖 (wget)..."
-    dnf install -y wget > /dev/null 2>&1
-    if ! command -v wget &> /dev/null; then
-        _log "$C_RED" "错误: wget 安装失败，请手动安装。"
-        return
-    fi
-    
-    # 2. 创建运行用户
-    _log "$C_BLUE" "[2/7] 正在创建系统用户 '${RUN_USER}'..."
-    if ! id -u "${RUN_USER}" >/dev/null 2>&1; then
-        useradd -r -m -s /bin/false "${RUN_USER}"
-    else
-        _log "$C_YELLOW" "用户 '${RUN_USER}' 已存在，跳过创建。"
-    fi
-
-    # 3. 创建配置文件目录
-    _log "$C_BLUE" "[3/7] 正在创建配置目录 '${CONFIG_DIR}'..."
-    mkdir -p "${CONFIG_DIR}"
-    chown -R "${RUN_USER}:${RUN_USER}" "${CONFIG_DIR}"
-
-    # 4. 下载对应架构的二进制文件
-    _log "$C_BLUE" "[4/7] 正在从 GitHub 下载二进制文件 (架构: ${DETECTED_ARCH})..."
-    _log "$C_YELLOW" "下载链接: $URL"
-    wget --no-check-certificate -O "${INSTALL_DIR}/${BINARY_NAME}" "$URL"
-    if [[ $? -ne 0 ]]; then
-        _log "$C_RED" "错误: 文件下载失败。请检查网络或链接是否有效。"
-        return
-    fi
-    
-    # 5. 设置权限
-    _log "$C_BLUE" "[5/7] 正在设置文件权限..."
-    chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
-
-    # 6. 创建 systemd 服务文件
-    _log "$C_BLUE" "[6/7] 正在创建 systemd 服务..."
-    create_systemd_service
-
-    # 7. 重载 systemd 并启用服务
-    _log "$C_BLUE" "[7/7] 正在重载 systemd 并设置开机自启..."
-    systemctl daemon-reload
-    systemctl enable "${SERVICE_NAME}"
-
-    _log "$C_GREEN" "--- Nexus Network 安装成功！ ---"
-    _log "$C_YELLOW" "服务已设置为开机自启，但尚未运行。请使用菜单中的 '启动服务' 选项来启动它。"
+    _log "$C_BLUE" "--- 开始安装 Nexus Network 节点软件 ---"
+    if is_installed; then _log "$C_YELLOW" "节点软件已安装。如需重装，请先卸载。"; return; fi
+    _log "$C_BLUE" "[1/7] 检查并安装依赖 (wget)..."; dnf install -y wget > /dev/null 2>&1
+    _log "$C_BLUE" "[2/7] 创建系统用户 '${RUN_USER}'..."; if ! id -u "${RUN_USER}" >/dev/null 2>&1; then useradd -r -m -s /bin/false "${RUN_USER}"; fi
+    _log "$C_BLUE" "[3/7] 创建配置目录 '${CONFIG_DIR}'..."; mkdir -p "${CONFIG_DIR}"; chown -R "${RUN_USER}:${RUN_USER}" "${CONFIG_DIR}"
+    _log "$C_BLUE" "[4/7] 下载节点程序 (架构: ${DETECTED_ARCH})..."; wget --no-check-certificate -O "${INSTALL_DIR}/${BINARY_NAME}" "$URL" || { _log "$C_RED" "下载失败！"; return; }
+    _log "$C_BLUE" "[5/7] 设置文件权限..."; chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+    _log "$C_BLUE" "[6/7] 创建 systemd 服务..."; create_systemd_service
+    _log "$C_BLUE" "[7/7] 重载 systemd 并设置开机自启..."; systemctl daemon-reload; systemctl enable "${SERVICE_NAME}"
+    _log "$C_GREEN" "--- 节点软件安装成功！ ---"
+    _log "$C_YELLOW" "下一步：请使用菜单选项 '2' 查看配置指引，然后启动节点。"
 }
 
-# 创建 systemd 服务文件
+# (新功能) 2. 配置/上线节点 指引
+configure_node_guide() {
+    _log "$C_BLUE" "--- 节点配置与上线指引 ---"
+    if ! is_installed; then
+        _log "$C_RED" "错误: 节点软件尚未安装。请先执行安装。"
+        return
+    fi
+    echo
+    _log "$C_GREEN" "节点软件安装后，通常需要您手动进行配置才能成功上线。"
+    _log "$C_YELLOW" "1. 主要配置文件目录位于: ${CONFIG_DIR}"
+    _log "$C_YELLOW" "2. 请根据官方文档，编辑该目录下的配置文件 (例如 config.toml, keys.json 等)。"
+    _log "$C_YELLOW" "   - 您可能需要填入您的节点密钥、API令牌或其他身份信息。"
+    _log "$C_YELLOW" "3. 如果项目提供了 'onboarder' 或类似的注册工具，请按文档说明使用。"
+    echo
+    _log "$C_BLUE" "配置完成后，请返回主菜单，使用 '启动节点/服务' 选项来运行您的节点。"
+    echo
+}
+
+
+# 3. 卸载节点软件
+uninstall_nexus() {
+    _log "$C_BLUE" "--- 开始卸载 Nexus Network 节点软件 ---"
+    if ! is_installed; then _log "$C_YELLOW" "节点软件未安装。"; return; fi
+    read -rp "您确定要完全卸载吗？[y/N]: " confirm && [[ "${confirm,,}" != "y" ]] && { _log "$C_YELLOW" "操作已取消。"; return; }
+    systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1; systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1
+    rm -f "$SERVICE_FILE"; systemctl daemon-reload
+    rm -f "${INSTALL_DIR}/${BINARY_NAME}"
+    _log "$C_BLUE" "核心程序和服务已删除。"
+    read -rp "是否删除配置文件 (${CONFIG_DIR}) 和用户 (${RUN_USER})？[y/N]: " confirm_data
+    if [[ "${confirm_data,,}" == "y" ]]; then
+        rm -rf "${CONFIG_DIR}"; userdel -r "${RUN_USER}" >/dev/null 2>&1
+        _log "$C_BLUE" "配置文件和用户已一并删除。"
+    fi
+    _log "$C_GREEN" "--- 卸载完成 ---"
+}
+
 create_systemd_service() {
     cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=Nexus Network Service
 After=network.target
-
 [Service]
 Type=simple
 User=${RUN_USER}
@@ -170,106 +121,49 @@ ExecStart=${INSTALL_DIR}/${BINARY_NAME} --config-dir=${CONFIG_DIR}
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=65535
-
 [Install]
 WantedBy=multi-user.target
 EOF
-    _log "$C_GREEN" "systemd 服务文件已创建: ${SERVICE_FILE}"
 }
 
-# 2. 卸载 Nexus Network
-uninstall_nexus() {
-    _log "$C_BLUE" "--- 开始卸载 Nexus Network ---"
-    
-    if ! is_installed; then
-        _log "$C_YELLOW" "Nexus Network 未安装。"
-        return
-    fi
-
-    read -rp "您确定要完全卸载 Nexus Network 吗？[y/N]: " confirm
-    if [[ "${confirm,,}" != "y" ]]; then
-        _log "$C_YELLOW" "卸载操作已取消。"
-        return
-    fi
-
-    systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1
-    systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1
-    _log "$C_BLUE" "[1/4] 服务已停止并禁用。"
-
-    rm -f "$SERVICE_FILE"
-    systemctl daemon-reload
-    _log "$C_BLUE" "[2/4] systemd 服务文件已删除。"
-
-    rm -f "${INSTALL_DIR}/${BINARY_NAME}"
-    _log "$C_BLUE" "[3/4] 二进制文件已删除。"
-
-    read -rp "是否删除配置文件目录 (${CONFIG_DIR}) 和用户 (${RUN_USER})？[y/N]: " confirm_data
-    if [[ "${confirm_data,,}" == "y" ]]; then
-        rm -rf "${CONFIG_DIR}"
-        userdel -r "${RUN_USER}" >/dev/null 2>&1
-        _log "$C_BLUE" "[4/4] 配置文件和用户已删除。"
-    else
-        _log "$C_YELLOW" "[4/4] 保留了配置文件和用户。"
-    fi
-    
-    _log "$C_GREEN" "--- Nexus Network 卸载完成 ---"
-}
-
-# 3. 启动服务
-start_service() {
-    if ! is_installed; then _log "$C_RED" "错误: Nexus Network 未安装。"; return; fi
-    systemctl start "${SERVICE_NAME}"
-    _log "$C_GREEN" "启动命令已发送。请使用 '查看状态' 确认服务是否正常运行。"
-}
-
-# 4. 停止服务
-stop_service() {
-    if ! is_installed; then _log "$C_RED" "错误: Nexus Network 未安装。"; return; fi
-    systemctl stop "${SERVICE_NAME}"
-    _log "$C_GREEN" "服务已停止。"
-}
-
-# 5. 重启服务
-restart_service() {
-    if ! is_installed; then _log "$C_RED" "错误: Nexus Network 未安装。"; return; fi
-    systemctl restart "${SERVICE_NAME}"
-    _log "$C_GREEN" "重启命令已发送。"
-}
-
-# 6. 查看服务状态
-status_service() {
-    if ! is_installed; then _log "$C_RED" "错误: Nexus Network 未安装。"; return; fi
-    systemctl status "${SERVICE_NAME}"
-}
-
-# 7. 查看服务日志
-view_logs() {
-    if ! is_installed; then _log "$C_RED" "错误: Nexus Network 未安装。"; return; fi
-    journalctl -u "${SERVICE_NAME}" -n 100 --no-pager -f
-}
-
+# --- 服务管理函数 ---
+start_service()   { if is_installed; then systemctl start "${SERVICE_NAME}";   _log "$C_GREEN" "启动命令已发送。"; else _log "$C_RED" "请先安装节点软件。"; fi; }
+stop_service()    { if is_installed; then systemctl stop "${SERVICE_NAME}";    _log "$C_GREEN" "节点已停止。";     else _log "$C_RED" "请先安装节点软件。"; fi; }
+restart_service() { if is_installed; then systemctl restart "${SERVICE_NAME}"; _log "$C_GREEN" "重启命令已发送。"; else _log "$C_RED" "请先安装节点软件。"; fi; }
+status_service()  { if is_installed; then systemctl status "${SERVICE_NAME}";  else _log "$C_RED" "请先安装节点软件。"; fi; }
+view_logs()       { if is_installed; then journalctl -u "${SERVICE_NAME}" -n 100 --no-pager -f; else _log "$C_RED" "请先安装节点软件。"; fi; }
 
 # --- 菜单界面 ---
 show_menu() {
     clear
     echo "========================================================"
-    echo "       Nexus Network 魔改管理脚本 (智能架构检测)"
-    echo -e "          (当前检测到架构: ${C_GREEN}${DETECTED_ARCH}${C_NC})"
+    echo "          Nexus Network 节点管理脚本 (v5.0)"
+    echo -e "        (当前架构: ${C_GREEN}${DETECTED_ARCH}${C_NC})"
     echo "========================================================"
     if is_installed; then
-        _log "$C_GREEN" "      状态: 已安装"
+        _log "$C_GREEN" "      节点软件状态: 已安装"
+        local status
+        status=$(systemctl is-active "$SERVICE_NAME")
+        if [[ "$status" == "active" ]]; then
+             _log "$C_GREEN" "      节点运行状态: 运行中"
+        else
+             _log "$C_YELLOW" "      节点运行状态: 已停止"
+        fi
     else
-        _log "$C_YELLOW" "      状态: 未安装"
+        _log "$C_YELLOW" "      节点软件状态: 未安装"
     fi
     echo "--------------------------------------------------------"
-    echo " 1. 安装 Nexus Network (自动配置为服务)"
-    echo " 2. 卸载 Nexus Network"
+    echo " [节点部署]"
+    echo "   1. 安装节点软件 (程序和服务)"
+    echo "   2. 配置/上线节点 (提供指引)"
+    echo "   3. 卸载节点软件"
     echo "--------------------------------------------------------"
-    echo " 3. 启动服务          6. 查看服务状态"
-    echo " 4. 停止服务          7. 查看实时日志"
-    echo " 5. 重启服务"
+    echo " [节点运维]"
+    echo "   4. 启动节点/服务       7. 重启节点/服务"
+    echo "   5. 停止节点/服务       8. 查看节点日志"
+    echo "   6. 查看节点状态"
     echo "--------------------------------------------------------"
-    echo " 0. 退出脚本"
+    echo "   0. 退出脚本"
     echo "========================================================"
 }
 
@@ -280,18 +174,19 @@ main() {
     
     while true; do
         show_menu
-        read -rp "请输入选项 [0-7]: " choice
+        read -rp "请输入选项 [0-8]: " choice
 
         case "$choice" in
             1) install_nexus; pause ;;
-            2) uninstall_nexus; pause ;;
-            3) start_service; pause ;;
-            4) stop_service; pause ;;
-            5) restart_service; pause ;;
+            2) configure_node_guide; pause ;;
+            3) uninstall_nexus; pause ;;
+            4) start_service; pause ;;
+            5) stop_service; pause ;;
             6) status_service; pause ;;
-            7 | l) view_logs ;;
+            7) restart_service; pause ;;
+            8 | l) view_logs ;; # l for logs
             0) _log "$C_BLUE" "感谢使用，脚本已退出。"; exit 0 ;;
-            *) _log "$C_RED" "无效的选项，请输入 0-7 之间的数字。"; pause ;;
+            *) _log "$C_RED" "无效的选项，请输入 0-8 之间的数字。"; pause ;;
         esac
     done
 }
