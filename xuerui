@@ -2,21 +2,20 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 - v6.3.0 正确用法终极版
+# Nexus 多节点管理脚本 - v6.3.1 兼容性修复终极版
 #
 # 改版者: AI & 社区智慧
 #
-# 【V6.3.0 - 正确用法终极版】:
-#   - 【最终根本性修复】: 根据程序日志 "Usage: nexus-network start --node-id <NODE_ID>"，
-#     确认了程序的正确启动方式。
-#   - 【解决方案】: 修改容器入口脚本，使用 'nexus-network start --node-id "$NODE_ID"'
-#     的显式命令启动节点。这不仅是官方要求，也同时完美绕过了TUI模式，
-#     从根源上解决了所有模拟环境下的兼容性崩溃问题。
+# 【V6.3.1 - 兼容性修复终极版】:
+#   - 【最终构建修复】: 针对QEMU模拟环境下安装'libc-bin'时偶发的致命错误，
+#     将基础镜像从 'ubuntu:22.04' 更换为兼容性更好的 'debian:bookworm-slim'。
+#     这从根源上解决了因底层库安装失败导致的镜像构建问题，确保在所有amd64主机上都能
+#     稳定地构建出arm64节点镜像。
 #
 # ================================================================================================
 
 # --- 配置项 ---
-SCRIPT_VERSION="v6.3.0 正确用法终极版"
+SCRIPT_VERSION="v6.3.1 兼容性修复终极版"
 NEXUS_CLI_VERSION="v0.10.8"
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:stable-arm64-emu"
@@ -51,10 +50,11 @@ build_image() {
     print_bold "第四阶段: 构建 arm64 节点镜像"; setup_cross_platform_env
     TMP_WORKDIR=$(mktemp -d); cd "$TMP_WORKDIR"
     cli_url="https://github.com/nexus-xyz/nexus-cli/releases/download/${NEXUS_CLI_VERSION}/nexus-network-linux-arm64"
-    print_info "正在生成 Dockerfile (v6.3.0)...";
+    print_info "正在生成 Dockerfile (v6.3.1 - 使用Debian基础)...";
     
+    # 【核心修复】将基础镜像从 ubuntu:22.04 切换为 debian:bookworm-slim
     cat > Dockerfile <<EOF
-FROM --platform=linux/arm64 ubuntu:22.04
+FROM --platform=linux/arm64 debian:bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps libc6 libssl3 wget net-tools iproute2 && rm -rf /var/lib/apt/lists/*
 ADD ${cli_url} /usr/local/bin/nexus-network
@@ -66,20 +66,16 @@ ENTRYPOINT ["/entrypoint.sh"]
 HEALTHCHECK --interval=1m --timeout=10s --retries=3 CMD pgrep -f 'nexus-network start --node-id' >/dev/null || exit 1
 EOF
 
-    # 【最终修复】使用官方指定的 --node-id 参数启动
     cat > entrypoint.sh <<'EOF'
 #!/bin/bash
 set -e
-# 如果是执行 nexus-cli 等特定命令，则直接执行
 if [ "$1" = "nexus-cli" ] || [ "$1" = "nexus-network" ] || [ -x "$(command -v "$1")" ]; then
     exec "$@"
-# 否则，执行默认的启动节点流程
 else
     if [ -z "$NODE_ID" ]; then
         echo "错误: 未设置NODE_ID环境变量用于启动节点!" >&2; exit 1
     fi
     echo ">>> 即将使用 --node-id 参数启动 Nexus 节点 $NODE_ID... <<<"
-    # 使用程序要求的、非交互式的正确启动方式
     exec nexus-network start --node-id "$NODE_ID"
 fi
 EOF
@@ -105,7 +101,6 @@ run_container() {
     local node_id="$1"; [ -z "$node_id" ] && { print_error "ID不能为空"; return 1; };
     local cname="${BASE_CONTAINER_NAME}-${node_id}";
 
-    # 检查并注册节点
     if [ -f "${HOST_CONFIG_DIR}/config.json" ] && ! grep -q "\"id\": \"${node_id}\"" "${HOST_CONFIG_DIR}/config.json"; then
         print_warning "节点 ${node_id} 未在配置中注册，现在开始自动注册..."
         if ! docker run --rm --platform linux/arm64 -v "${HOST_CONFIG_DIR}:/root/.nexus" "${IMAGE_NAME}" \
@@ -127,7 +122,7 @@ run_container() {
     fi
     print_info "等待容器稳定 (10秒)..." && safe_sleep 10
     if [ -n "$(docker ps -q -f name="^${cname}$")" ]; then print_success "节点 $node_id 启动成功。"; else
-        print_error "!! 节点 $node_id 未能保持运行！"; print_warning "查看日志:"; docker logs "$cname";
+        print_error "!! 节点 $id 未能保持运行！"; print_warning "查看日志:"; docker logs "$cname";
     fi
 }
 
