@@ -1,32 +1,34 @@
 #!/bin/bash
 
 #================================================================================
-# Nexus Network 魔改管理脚本 for CentOS 8 (ARM64)
+# Nexus Network 魔改管理脚本 v2.0
 #
 # 功能:
+#   - 自动检测系统架构 (x86_64 / aarch64) 并下载对应程序
 #   - 自动下载、安装和配置 nexus-network
 #   - 将其注册为 systemd 服务进行管理
 #   - 提供启动、停止、重启、查看状态和日志的功能
 #   - 支持一键卸载
 #
 # 作者: Your Name/AI Assistant
-# 版本: 1.0
+# 版本: 2.0
 #================================================================================
 
 # --- 全局变量定义 ---
-# 下载链接
-readonly URL="https://github.com/nexus-xyz/nexus-cli/releases/download/v0.10.8/nexus-network-linux-arm64"
-# 二进制文件最终名称
+# 不同架构的下载链接
+readonly URL_ARM64="https://github.com/nexus-xyz/nexus-cli/releases/download/v0.10.8/nexus-network-linux-arm64"
+readonly URL_AMD64="https://github.com/nexus-xyz/nexus-cli/releases/download/v0.10.8/nexus-network-linux-amd64"
+
+# 动态变量，将在环境检查时被赋值
+URL=""
+DETECTED_ARCH=""
+
+# 固定变量
 readonly BINARY_NAME="nexus-network"
-# 安装路径
 readonly INSTALL_DIR="/usr/local/bin"
-# 配置文件目录
 readonly CONFIG_DIR="/etc/nexus-network"
-# 服务名称
 readonly SERVICE_NAME="nexus-network"
-# systemd 服务文件路径
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-# 运行服务的用户
 readonly RUN_USER="nexus-user"
 
 # --- 颜色定义 ---
@@ -58,21 +60,34 @@ check_root() {
     fi
 }
 
-# 检查操作系统和架构
-check_os_arch() {
+# 检查操作系统和架构，并设置正确的下载URL
+check_env() {
     # 检查操作系统
     if ! grep -q -i "centos stream release 8" /etc/centos-release; then
         _log "$C_RED" "警告: 此脚本专为 CentOS 8 设计。您的系统可能不兼容。"
         # exit 1 # 如果要强制限制，可以取消此行注释
     fi
 
-    # 检查架构
+    # 检查并设置架构
     local arch
     arch=$(uname -m)
-    if [[ "$arch" != "aarch64" ]]; then
-        _log "$C_RED" "错误: 您的系统架构是 '$arch'，但所需程序是为 'aarch64' (ARM64) 构建的。"
-        exit 1
-    fi
+    DETECTED_ARCH="$arch"
+
+    case "$arch" in
+        "aarch64")
+            _log "$C_GREEN" "检测到系统架构: aarch64 (ARM64)。将使用对应的二进制文件。"
+            URL="$URL_ARM64"
+            ;;
+        "x86_64")
+            _log "$C_GREEN" "检测到系统架构: x86_64 (AMD64)。将使用对应的二进制文件。"
+            URL="$URL_AMD64"
+            ;;
+        *)
+            _log "$C_RED" "错误: 暂不支持您的系统架构 '$arch'。"
+            _log "$C_YELLOW" "此脚本仅支持 'aarch64' 和 'x86_64' 架构。"
+            exit 1
+            ;;
+    esac
 }
 
 # 检查服务是否已安装
@@ -116,8 +131,9 @@ install_nexus() {
     mkdir -p "${CONFIG_DIR}"
     chown -R "${RUN_USER}:${RUN_USER}" "${CONFIG_DIR}"
 
-    # 4. 下载二进制文件
-    _log "$C_BLUE" "[4/7] 正在从 GitHub 下载二进制文件..."
+    # 4. 下载对应架构的二进制文件
+    _log "$C_BLUE" "[4/7] 正在从 GitHub 下载二进制文件 (架构: ${DETECTED_ARCH})..."
+    _log "$C_YELLOW" "下载链接: $URL"
     wget -O "${INSTALL_DIR}/${BINARY_NAME}" "$URL"
     if [[ $? -ne 0 ]]; then
         _log "$C_RED" "错误: 文件下载失败。请检查网络或链接是否有效。"
@@ -205,6 +221,8 @@ uninstall_nexus() {
     _log "$C_GREEN" "--- Nexus Network 卸载完成 ---"
 }
 
+# 其他服务管理函数保持不变...
+
 # 3. 启动服务
 start_service() {
     if ! is_installed; then _log "$C_RED" "错误: Nexus Network 未安装。"; return; fi
@@ -248,7 +266,8 @@ view_logs() {
 show_menu() {
     clear
     echo "========================================================"
-    echo "       Nexus Network 魔改管理脚本 (CentOS 8 ARM64)"
+    echo "       Nexus Network 魔改管理脚本 (CentOS 8)"
+    echo -e "        (自动检测架构: ${C_GREEN}${DETECTED_ARCH}${C_NC})"
     echo "========================================================"
     if is_installed; then
         _log "$C_GREEN" "      状态: 已安装"
@@ -272,7 +291,7 @@ show_menu() {
 # --- 主循环 ---
 main() {
     check_root
-    check_os_arch
+    check_env # 使用新的环境检查函数
     
     while true; do
         show_menu
@@ -285,7 +304,7 @@ main() {
             4) stop_service; pause ;;
             5) restart_service; pause ;;
             6) status_service; pause ;;
-            7. | f) view_logs ;; # 添加 'f' 作为快捷键，因为日志是实时跟随的
+            7 | l) view_logs ;; # l for logs
             0) _log "$C_BLUE" "感谢使用，脚本已退出。"; exit 0 ;;
             *) _log "$C_RED" "无效的选项，请输入 0-7 之间的数字。"; pause ;;
         esac
