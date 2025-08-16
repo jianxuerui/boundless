@@ -1,40 +1,34 @@
 #!/bin/bash
 
 #================================================================================
-# Nexus Network 魔改管理脚本 v5.0 - 节点中心版
+# Nexus Network 魔改管理脚本 v6.0 - 自动化配置版
 #
 # 功能:
-#   - 菜单界面优化，突出“节点”概念。
-#   - 新增“配置/上线节点”指引选项。
+#   - 新增“一键生成节点配置文件”功能，提供单节点最大性能模板。
 #   - 自动检测架构 (x86_64 / aarch64) 并下载对应程序。
 #   - 提供完整的节点软件安装、卸载及服务管理功能。
 #
 # 作者: Your Name/AI Assistant
-# 版本: 5.0
+# 版本: 6.0
 #================================================================================
 
 # --- 全局变量定义 ---
 readonly URL_ARM64="https://github.com/nexus-xyz/nexus-cli/releases/download/v0.10.8/nexus-network-linux-arm64"
 readonly URL_X86_64="https://github.com/nexus-xyz/nexus-cli/releases/download/v0.10.8/nexus-network-linux-x86_64"
-
-# 动态变量
 URL=""
 DETECTED_ARCH=""
 
-# 固定变量
+# --- 固定变量 ---
 readonly BINARY_NAME="nexus-network"
 readonly INSTALL_DIR="/usr/local/bin"
 readonly CONFIG_DIR="/etc/nexus-network"
+readonly CONFIG_FILE="${CONFIG_DIR}/config.toml"
 readonly SERVICE_NAME="nexus-network"
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 readonly RUN_USER="nexus-user"
 
 # --- 颜色定义 ---
-readonly C_RED='\033[0;31m'
-readonly C_GREEN='\033[0;32m'
-readonly C_YELLOW='\033[0;33m'
-readonly C_BLUE='\033[0;34m'
-readonly C_NC='\033[0m' # No Color
+readonly C_RED='\033[0;31m'; readonly C_GREEN='\033[0;32m'; readonly C_YELLOW='\033[0;33m'; readonly C_BLUE='\033[0;34m'; readonly C_NC='\033[0m'
 
 # --- 辅助函数 ---
 _log() { local color="$1"; local message="$2"; echo -e "${color}${message}${C_NC}"; }
@@ -42,11 +36,7 @@ pause() { read -rp "按 [Enter] 键返回菜单..."; }
 check_root() { if [[ "$(id -u)" -ne 0 ]]; then _log "$C_RED" "错误: 此脚本必须以 root 权限运行。"; exit 1; fi; }
 is_installed() { if [[ -f "$SERVICE_FILE" ]]; then return 0; else return 1; fi; }
 
-# 检查环境并设置URL
 check_env() {
-    if ! grep -q -i "centos stream release 8" /etc/centos-release; then
-        _log "$C_YELLOW" "警告: 此脚本专为 CentOS 8 设计，您的系统可能不兼容。"
-    fi
     DETECTED_ARCH=$(uname -m)
     case "$DETECTED_ARCH" in
         "aarch64") URL="$URL_ARM64" ;;
@@ -61,33 +51,82 @@ check_env() {
 install_nexus() {
     _log "$C_BLUE" "--- 开始安装 Nexus Network 节点软件 ---"
     if is_installed; then _log "$C_YELLOW" "节点软件已安装。如需重装，请先卸载。"; return; fi
-    _log "$C_BLUE" "[1/7] 检查并安装依赖 (wget)..."; dnf install -y wget > /dev/null 2>&1
-    _log "$C_BLUE" "[2/7] 创建系统用户 '${RUN_USER}'..."; if ! id -u "${RUN_USER}" >/dev/null 2>&1; then useradd -r -m -s /bin/false "${RUN_USER}"; fi
-    _log "$C_BLUE" "[3/7] 创建配置目录 '${CONFIG_DIR}'..."; mkdir -p "${CONFIG_DIR}"; chown -R "${RUN_USER}:${RUN_USER}" "${CONFIG_DIR}"
-    _log "$C_BLUE" "[4/7] 下载节点程序 (架构: ${DETECTED_ARCH})..."; wget --no-check-certificate -O "${INSTALL_DIR}/${BINARY_NAME}" "$URL" || { _log "$C_RED" "下载失败！"; return; }
-    _log "$C_BLUE" "[5/7] 设置文件权限..."; chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
-    _log "$C_BLUE" "[6/7] 创建 systemd 服务..."; create_systemd_service
-    _log "$C_BLUE" "[7/7] 重载 systemd 并设置开机自启..."; systemctl daemon-reload; systemctl enable "${SERVICE_NAME}"
+    dnf install -y wget > /dev/null 2>&1
+    if ! id -u "${RUN_USER}" >/dev/null 2>&1; then useradd -r -m -s /bin/false "${RUN_USER}"; fi
+    mkdir -p "${CONFIG_DIR}"; chown -R "${RUN_USER}:${RUN_USER}" "${CONFIG_DIR}"
+    _log "$C_BLUE" "正在下载节点程序 (架构: ${DETECTED_ARCH})..."; wget --no-check-certificate -O "${INSTALL_DIR}/${BINARY_NAME}" "$URL" || { _log "$C_RED" "下载失败！"; return; }
+    chmod +x "${INSTALL_DIR}/${BINARY_NAME}"
+    create_systemd_service
+    systemctl daemon-reload; systemctl enable "${SERVICE_NAME}"
     _log "$C_GREEN" "--- 节点软件安装成功！ ---"
-    _log "$C_YELLOW" "下一步：请使用菜单选项 '2' 查看配置指引，然后启动节点。"
+    _log "$C_YELLOW" "下一步：请使用菜单选项 '2' 生成配置文件，然后启动节点。"
 }
 
-# (新功能) 2. 配置/上线节点 指引
-configure_node_guide() {
-    _log "$C_BLUE" "--- 节点配置与上线指引 ---"
+# (新功能) 2. 自动化配置节点
+auto_configure_node() {
+    _log "$C_BLUE" "--- 生成节点配置文件 (最大性能模板) ---"
     if ! is_installed; then
         _log "$C_RED" "错误: 节点软件尚未安装。请先执行安装。"
         return
     fi
-    echo
-    _log "$C_GREEN" "节点软件安装后，通常需要您手动进行配置才能成功上线。"
-    _log "$C_YELLOW" "1. 主要配置文件目录位于: ${CONFIG_DIR}"
-    _log "$C_YELLOW" "2. 请根据官方文档，编辑该目录下的配置文件 (例如 config.toml, keys.json 等)。"
-    _log "$C_YELLOW" "   - 您可能需要填入您的节点密钥、API令牌或其他身份信息。"
-    _log "$C_YELLOW" "3. 如果项目提供了 'onboarder' 或类似的注册工具，请按文档说明使用。"
-    echo
-    _log "$C_BLUE" "配置完成后，请返回主菜单，使用 '启动节点/服务' 选项来运行您的节点。"
-    echo
+    
+    if [[ -f "$CONFIG_FILE" ]]; then
+        _log "$C_YELLOW" "警告: 配置文件 ${CONFIG_FILE} 已存在。"
+        read -rp "您确定要覆盖它吗？这会丢失现有配置！[y/N]: " confirm
+        if [[ "${confirm,,}" != "y" ]]; then
+            _log "$C_YELLOW" "操作已取消，未做任何更改。"
+            return
+        fi
+    fi
+    
+    _log "$C_BLUE" "正在创建最大性能模板配置文件..."
+    # 使用 cat 和 EOF 创建多行文件内容
+    cat > "$CONFIG_FILE" << EOF
+# ==============================================================================
+# Nexus Network 自动生成的配置文件 (config.toml)
+#
+# 由管理脚本生成，旨在提供一个针对“单节点最大性能”的配置起点。
+# 
+# !!! 重要 !!!
+# 这只是一个模板。请务必根据官方文档核对所有参数，并填入您的个人信息
+# (如密钥、钱包地址等)，否则节点可能无法正常工作。
+# ==============================================================================
+
+[node]
+# 建议为您的节点设置一个独特的名称，方便识别。
+name = "MyNexusMaxPerformanceNode"
+
+# 您可能需要在这里填入您的私钥或指向一个密钥文件。
+# private_key = "YOUR_PRIVATE_KEY_HERE"
+# key_file_path = "${CONFIG_DIR}/keys.json"
+
+[network]
+# 节点监听的网络地址和端口。'0.0.0.0' 表示监听所有网络接口。
+listen_addr = "0.0.0.0:30303"
+
+# 连接到其他节点的种子节点列表。
+# boot_nodes = [
+#   "/dns4/bootnode.nexus.xyz/tcp/30303/p2p/PEER_ID_HERE"
+# ]
+
+[performance]
+# 这是根据您的要求“单节点最大性能”设置的模板部分。
+# “mode”和“single_node_max”是示例，请根据官方文档确认确切的参数名和值。
+mode = "single_node_max"
+
+# 可能存在的其他性能相关参数（以下为示例，请取消注释并修改）:
+# max_peers = 200
+# cpu_priority = "high"
+# io_threads = 8
+
+EOF
+
+    # 设置正确的文件权限和所有权
+    chown "${RUN_USER}:${RUN_USER}" "$CONFIG_FILE"
+    chmod 644 "$CONFIG_FILE"
+    
+    _log "$C_GREEN" "配置文件已成功生成于: ${CONFIG_FILE}"
+    _log "$C_YELLOW" "请务必使用 'nano ${CONFIG_FILE}' 或其他编辑器打开并检查配置！"
 }
 
 
@@ -100,7 +139,7 @@ uninstall_nexus() {
     rm -f "$SERVICE_FILE"; systemctl daemon-reload
     rm -f "${INSTALL_DIR}/${BINARY_NAME}"
     _log "$C_BLUE" "核心程序和服务已删除。"
-    read -rp "是否删除配置文件 (${CONFIG_DIR}) 和用户 (${RUN_USER})？[y/N]: " confirm_data
+    read -rp "是否删除所有配置文件 (${CONFIG_DIR}) 和用户 (${RUN_USER})？[y/N]: " confirm_data
     if [[ "${confirm_data,,}" == "y" ]]; then
         rm -rf "${CONFIG_DIR}"; userdel -r "${RUN_USER}" >/dev/null 2>&1
         _log "$C_BLUE" "配置文件和用户已一并删除。"
@@ -117,6 +156,7 @@ After=network.target
 Type=simple
 User=${RUN_USER}
 Group=${RUN_USER}
+# 程序启动时，通过 --config-dir 参数指向我们创建的配置目录
 ExecStart=${INSTALL_DIR}/${BINARY_NAME} --config-dir=${CONFIG_DIR}
 Restart=on-failure
 RestartSec=10
@@ -137,25 +177,18 @@ view_logs()       { if is_installed; then journalctl -u "${SERVICE_NAME}" -n 100
 show_menu() {
     clear
     echo "========================================================"
-    echo "          Nexus Network 节点管理脚本 (v5.0)"
+    echo "          Nexus Network 节点管理脚本 (v6.0)"
     echo -e "        (当前架构: ${C_GREEN}${DETECTED_ARCH}${C_NC})"
     echo "========================================================"
+    is_installed && _log "$C_GREEN" "      节点软件状态: 已安装" || _log "$C_YELLOW" "      节点软件状态: 未安装"
     if is_installed; then
-        _log "$C_GREEN" "      节点软件状态: 已安装"
-        local status
-        status=$(systemctl is-active "$SERVICE_NAME")
-        if [[ "$status" == "active" ]]; then
-             _log "$C_GREEN" "      节点运行状态: 运行中"
-        else
-             _log "$C_YELLOW" "      节点运行状态: 已停止"
-        fi
-    else
-        _log "$C_YELLOW" "      节点软件状态: 未安装"
+      [[ -f "$CONFIG_FILE" ]] && _log "$C_GREEN" "      配置文件状态: 已生成" || _log "$C_YELLOW" "      配置文件状态: 待生成"
+      systemctl is-active --quiet "$SERVICE_NAME" && _log "$C_GREEN" "      节点运行状态: 运行中" || _log "$C_YELLOW" "      节点运行状态: 已停止"
     fi
     echo "--------------------------------------------------------"
     echo " [节点部署]"
     echo "   1. 安装节点软件 (程序和服务)"
-    echo "   2. 配置/上线节点 (提供指引)"
+    echo "   2. 生成节点配置文件 (最大性能模板)"
     echo "   3. 卸载节点软件"
     echo "--------------------------------------------------------"
     echo " [节点运维]"
@@ -171,20 +204,18 @@ show_menu() {
 main() {
     check_root
     check_env
-    
     while true; do
         show_menu
         read -rp "请输入选项 [0-8]: " choice
-
         case "$choice" in
             1) install_nexus; pause ;;
-            2) configure_node_guide; pause ;;
+            2) auto_configure_node; pause ;;
             3) uninstall_nexus; pause ;;
             4) start_service; pause ;;
             5) stop_service; pause ;;
             6) status_service; pause ;;
             7) restart_service; pause ;;
-            8 | l) view_logs ;; # l for logs
+            8 | l) view_logs ;;
             0) _log "$C_BLUE" "感谢使用，脚本已退出。"; exit 0 ;;
             *) _log "$C_RED" "无效的选项，请输入 0-8 之间的数字。"; pause ;;
         esac
