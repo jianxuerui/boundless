@@ -1,15 +1,15 @@
 #!/bin/bash
 
 #================================================================================
-# Nexus Network 魔改管理脚本 v6.0 - 自动化配置版
+# Nexus Network 魔改管理脚本 v7.0 - 交互式配置最终版
 #
 # 功能:
-#   - 新增“一键生成节点配置文件”功能，提供单节点最大性能模板。
+#   - 配置节点功能升级为交互式，会提示用户输入节点ID并自动写入配置文件。
 #   - 自动检测架构 (x86_64 / aarch64) 并下载对应程序。
 #   - 提供完整的节点软件安装、卸载及服务管理功能。
 #
 # 作者: Your Name/AI Assistant
-# 版本: 6.0
+# 版本: 7.0
 #================================================================================
 
 # --- 全局变量定义 ---
@@ -59,12 +59,12 @@ install_nexus() {
     create_systemd_service
     systemctl daemon-reload; systemctl enable "${SERVICE_NAME}"
     _log "$C_GREEN" "--- 节点软件安装成功！ ---"
-    _log "$C_YELLOW" "下一步：请使用菜单选项 '2' 生成配置文件，然后启动节点。"
+    _log "$C_YELLOW" "下一步：请使用菜单选项 '2' 配置您的节点ID。"
 }
 
-# (新功能) 2. 自动化配置节点
-auto_configure_node() {
-    _log "$C_BLUE" "--- 生成节点配置文件 (最大性能模板) ---"
+# (新功能) 2. 交互式配置节点
+interactive_configure_node() {
+    _log "$C_BLUE" "--- 交互式节点配置向导 ---"
     if ! is_installed; then
         _log "$C_RED" "错误: 节点软件尚未安装。请先执行安装。"
         return
@@ -78,23 +78,38 @@ auto_configure_node() {
             return
         fi
     fi
-    
-    _log "$C_BLUE" "正在创建最大性能模板配置文件..."
-    # 使用 cat 和 EOF 创建多行文件内容
+
+    # --- 交互式输入节点ID ---
+    local NODE_ID
+    while true; do
+        read -rp "请输入您的节点ID或节点名称 (例如 MyNexusNode): " NODE_ID
+        if [[ -z "$NODE_ID" ]]; then
+            _log "$C_RED" "输入不能为空，请重新输入。"
+        else
+            break
+        fi
+    done
+    # --- 输入结束 ---
+
+    _log "$C_BLUE" "正在根据您的输入生成配置文件..."
+    # 注意：这里的 EOF 没有被引号包围，所以 ${NODE_ID} 会被正确替换
     cat > "$CONFIG_FILE" << EOF
 # ==============================================================================
 # Nexus Network 自动生成的配置文件 (config.toml)
 #
-# 由管理脚本生成，旨在提供一个针对“单节点最大性能”的配置起点。
+# 由管理脚本根据您的输入动态生成。
 # 
 # !!! 重要 !!!
-# 这只是一个模板。请务必根据官方文档核对所有参数，并填入您的个人信息
-# (如密钥、钱包地址等)，否则节点可能无法正常工作。
+# 这只是一个基础模板。请务必根据官方文档核对所有参数，并填入其他
+# 个人信息 (如密钥、钱包地址等)，否则节点可能无法正常工作。
 # ==============================================================================
 
 [node]
-# 建议为您的节点设置一个独特的名称，方便识别。
-name = "MyNexusMaxPerformanceNode"
+# 节点名称已根据您输入的ID自动设置。
+name = "${NODE_ID}"
+
+# 如果有专门的 'id' 字段，请取消注释并使用。
+# id = "${NODE_ID}"
 
 # 您可能需要在这里填入您的私钥或指向一个密钥文件。
 # private_key = "YOUR_PRIVATE_KEY_HERE"
@@ -104,13 +119,13 @@ name = "MyNexusMaxPerformanceNode"
 # 节点监听的网络地址和端口。'0.0.0.0' 表示监听所有网络接口。
 listen_addr = "0.0.0.0:30303"
 
-# 连接到其他节点的种子节点列表。
+# 连接到其他节点的种子节点列表（请根据官方信息修改）。
 # boot_nodes = [
 #   "/dns4/bootnode.nexus.xyz/tcp/30303/p2p/PEER_ID_HERE"
 # ]
 
 [performance]
-# 这是根据您的要求“单节点最大性能”设置的模板部分。
+# 这是“单节点最大性能”的设置模板。
 # “mode”和“single_node_max”是示例，请根据官方文档确认确切的参数名和值。
 mode = "single_node_max"
 
@@ -121,18 +136,19 @@ mode = "single_node_max"
 
 EOF
 
-    # 设置正确的文件权限和所有权
     chown "${RUN_USER}:${RUN_USER}" "$CONFIG_FILE"
     chmod 644 "$CONFIG_FILE"
     
     _log "$C_GREEN" "配置文件已成功生成于: ${CONFIG_FILE}"
-    _log "$C_YELLOW" "请务必使用 'nano ${CONFIG_FILE}' 或其他编辑器打开并检查配置！"
+    _log "$C_GREEN" "您的节点名称/ID 已设置为: '${NODE_ID}'"
+    _log "$C_YELLOW" "强烈建议使用 'nano ${CONFIG_FILE}' 检查并完善其他配置！"
 }
 
 
 # 3. 卸载节点软件
 uninstall_nexus() {
     _log "$C_BLUE" "--- 开始卸载 Nexus Network 节点软件 ---"
+    # ... (卸载逻辑与上一版完全相同，此处省略以减少篇幅)
     if ! is_installed; then _log "$C_YELLOW" "节点软件未安装。"; return; fi
     read -rp "您确定要完全卸载吗？[y/N]: " confirm && [[ "${confirm,,}" != "y" ]] && { _log "$C_YELLOW" "操作已取消。"; return; }
     systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1; systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1
@@ -156,7 +172,6 @@ After=network.target
 Type=simple
 User=${RUN_USER}
 Group=${RUN_USER}
-# 程序启动时，通过 --config-dir 参数指向我们创建的配置目录
 ExecStart=${INSTALL_DIR}/${BINARY_NAME} --config-dir=${CONFIG_DIR}
 Restart=on-failure
 RestartSec=10
@@ -166,7 +181,7 @@ WantedBy=multi-user.target
 EOF
 }
 
-# --- 服务管理函数 ---
+# --- 服务管理函数 (保持不变) ---
 start_service()   { if is_installed; then systemctl start "${SERVICE_NAME}";   _log "$C_GREEN" "启动命令已发送。"; else _log "$C_RED" "请先安装节点软件。"; fi; }
 stop_service()    { if is_installed; then systemctl stop "${SERVICE_NAME}";    _log "$C_GREEN" "节点已停止。";     else _log "$C_RED" "请先安装节点软件。"; fi; }
 restart_service() { if is_installed; then systemctl restart "${SERVICE_NAME}"; _log "$C_GREEN" "重启命令已发送。"; else _log "$C_RED" "请先安装节点软件。"; fi; }
@@ -177,18 +192,18 @@ view_logs()       { if is_installed; then journalctl -u "${SERVICE_NAME}" -n 100
 show_menu() {
     clear
     echo "========================================================"
-    echo "          Nexus Network 节点管理脚本 (v6.0)"
+    echo "          Nexus Network 节点管理脚本 (v7.0)"
     echo -e "        (当前架构: ${C_GREEN}${DETECTED_ARCH}${C_NC})"
     echo "========================================================"
     is_installed && _log "$C_GREEN" "      节点软件状态: 已安装" || _log "$C_YELLOW" "      节点软件状态: 未安装"
     if is_installed; then
-      [[ -f "$CONFIG_FILE" ]] && _log "$C_GREEN" "      配置文件状态: 已生成" || _log "$C_YELLOW" "      配置文件状态: 待生成"
+      [[ -f "$CONFIG_FILE" ]] && _log "$C_GREEN" "      配置文件状态: 已配置" || _log "$C_YELLOW" "      配置文件状态: 待配置"
       systemctl is-active --quiet "$SERVICE_NAME" && _log "$C_GREEN" "      节点运行状态: 运行中" || _log "$C_YELLOW" "      节点运行状态: 已停止"
     fi
     echo "--------------------------------------------------------"
     echo " [节点部署]"
     echo "   1. 安装节点软件 (程序和服务)"
-    echo "   2. 生成节点配置文件 (最大性能模板)"
+    echo "   2. 配置节点 (输入ID)"
     echo "   3. 卸载节点软件"
     echo "--------------------------------------------------------"
     echo " [节点运维]"
@@ -209,7 +224,7 @@ main() {
         read -rp "请输入选项 [0-8]: " choice
         case "$choice" in
             1) install_nexus; pause ;;
-            2) auto_configure_node; pause ;;
+            2) interactive_configure_node; pause ;; # 调用新的交互式函数
             3) uninstall_nexus; pause ;;
             4) start_service; pause ;;
             5) stop_service; pause ;;
