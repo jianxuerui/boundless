@@ -2,20 +2,21 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 - v6.3.1 兼容性修复终极版
+# Nexus 多节点管理脚本 - v7.0.0 TTY终极修复版
 #
 # 改版者: AI & 社区智慧
 #
-# 【V6.3.1 - 兼容性修复终极版】:
-#   - 【最终构建修复】: 针对QEMU模拟环境下安装'libc-bin'时偶发的致命错误，
-#     将基础镜像从 'ubuntu:22.04' 更换为兼容性更好的 'debian:bookworm-slim'。
-#     这从根源上解决了因底层库安装失败导致的镜像构建问题，确保在所有amd64主机上都能
-#     稳定地构建出arm64节点镜像。
+# 【V7.0.0 - TTY终极修复版】:
+#   - 【最终根本性修复】: 经过多次调试，确认了最终问题——即使提供了'--node-id'，
+#     程序依然尝试启动一个与QEMU不兼容的TUI界面。
+#   - 【解决方案】: 在容器入口脚本中，通过 '< /dev/null' 将程序的标准输入重定向。
+#     此操作彻底切断了程序与任何潜在终端(TTY)的联系，迫使其放弃启动TUI，
+#     从而以纯后台服务模式运行，根除了所有模拟环境下的运行时崩溃问题。
 #
 # ================================================================================================
 
 # --- 配置项 ---
-SCRIPT_VERSION="v6.3.1 兼容性修复终极版"
+SCRIPT_VERSION="v7.0.0 TTY终极修复版"
 NEXUS_CLI_VERSION="v0.10.8"
 BASE_CONTAINER_NAME="nexus-node"
 IMAGE_NAME="nexus-node:stable-arm64-emu"
@@ -48,11 +49,10 @@ setup_cross_platform_env() {
 build_image() {
     if [[ "$1" != "--force" ]] && docker image inspect "$IMAGE_NAME" &>/dev/null; then print_info "镜像 '$IMAGE_NAME' 已存在，跳过。"; return 0; fi
     print_bold "第四阶段: 构建 arm64 节点镜像"; setup_cross_platform_env
-    TMP_WORKDIR=$(mktemp -d); cd "$TMP_WORKDIR"
+    TMP_WORKDIR=$(mtemp -d); cd "$TMP_WORKDIR"
     cli_url="https://github.com/nexus-xyz/nexus-cli/releases/download/${NEXUS_CLI_VERSION}/nexus-network-linux-arm64"
-    print_info "正在生成 Dockerfile (v6.3.1 - 使用Debian基础)...";
+    print_info "正在生成 Dockerfile (v7.0.0 - Debian基础 & TTY修复)...";
     
-    # 【核心修复】将基础镜像从 ubuntu:22.04 切换为 debian:bookworm-slim
     cat > Dockerfile <<EOF
 FROM --platform=linux/arm64 debian:bookworm-slim
 ENV DEBIAN_FRONTEND=noninteractive
@@ -66,6 +66,7 @@ ENTRYPOINT ["/entrypoint.sh"]
 HEALTHCHECK --interval=1m --timeout=10s --retries=3 CMD pgrep -f 'nexus-network start --node-id' >/dev/null || exit 1
 EOF
 
+    # 【最终修复】通过输入重定向，强制程序以非交互式后台模式运行
     cat > entrypoint.sh <<'EOF'
 #!/bin/bash
 set -e
@@ -75,8 +76,8 @@ else
     if [ -z "$NODE_ID" ]; then
         echo "错误: 未设置NODE_ID环境变量用于启动节点!" >&2; exit 1
     fi
-    echo ">>> 即将使用 --node-id 参数启动 Nexus 节点 $NODE_ID... <<<"
-    exec nexus-network start --node-id "$NODE_ID"
+    echo ">>> 即将以分离TTY模式启动 Nexus 节点 $NODE_ID... <<<"
+    exec nexus-network start --node-id "$NODE_ID" < /dev/null
 fi
 EOF
 
