@@ -2,26 +2,25 @@
 set -e
 
 # ================================================================================================
-# Nexus 多节点管理脚本 - v9.0.0 TTY-Kill Ultimate Edition
+# Nexus 多节点管理脚本 - v10.0.0 语法修正·最终版
 #
 # 改版者: AI & 社区智慧
 #
-# 【V9.0.0 - TTY-Kill Ultimate Edition】:
-#   - 【最终根本性修复】: 经过 exhaustive debugging, 确认 Nexus 程序会强制启动TUI
-#     只要它能探测到任何伪终端(TTY)的可能性。
-#   - 【终极解决方案】: 在'docker run'命令中添加'-T'标志。此标志直接命令Docker Daemon
-#     在创建容器时不分配任何伪终端。这从容器的底层环境根除了程序启动TUI的可能性，
-#     从而彻底解决了在QEMU模拟中因TTY不兼容而导致的持续崩溃问题。
-#   - 【缓存粉碎】: 再次更换镜像Tag，强制Docker放弃所有陈旧缓存，确保应用此终极修复。
+# 【V10.0.0 - 语法修正·最终版】:
+#   - 【最终语法修正】: 之前版本引入了一个无效的 'docker run -T' 标志，导致命令失败。
+#     这是一个严重的语法错误，现已彻底移除。
+#   - 【回归正确实践】: Docker 在 detached 模式 (-d) 下默认即为非交互式。本版本
+#     移除了所有错误的TTY相关标志，回归到最标准、最稳定的容器启动方式。
+#   - 【缓存终结】: 再次更换镜像Tag至v10，确保此最终修正版能够被100%应用。
 #
 # ================================================================================================
 
 # --- 配置项 ---
-SCRIPT_VERSION="v9.0.0 TTY-Kill Ultimate Edition"
+SCRIPT_VERSION="v10.0.0 语法修正·最终版"
 NEXUS_CLI_VERSION="v0.10.8"
 BASE_CONTAINER_NAME="nexus-node"
 # 【核心修复】更换全新的镜像名，粉碎旧缓存！
-IMAGE_NAME="nexus-node:v9-ultimate-fix"
+IMAGE_NAME="nexus-node:v10-final"
 BUILDER_NAME="nexus_builder"
 HOST_CONFIG_DIR="/root/nexus_config"
 WALLET_ADDRESS="0x62250580AeC82545bD5c3133c4e293780391813c"
@@ -53,7 +52,7 @@ build_image() {
     print_bold "第四阶段: 构建 arm64 节点镜像"; setup_cross_platform_env
     TMP_WORKDIR=$(mktemp -d); cd "$TMP_WORKDIR"
     cli_url="https://github.com/nexus-xyz/nexus-cli/releases/download/${NEXUS_CLI_VERSION}/nexus-network-linux-arm64"
-    print_info "正在生成 Dockerfile (v9.0.0 - 终极修复)...";
+    print_info "正在生成 Dockerfile (v10.0.0 - 终极修复)...";
     
     cat > Dockerfile <<EOF
 FROM --platform=linux/arm64 debian:bookworm-slim
@@ -68,7 +67,7 @@ ENTRYPOINT ["/entrypoint.sh"]
 HEALTHCHECK --interval=1m --timeout=10s --retries=3 CMD pgrep -f 'nexus-network start --node-id' >/dev/null || exit 1
 EOF
 
-    # Entrypoint remains the same as v7, as the fix is now in the docker run command
+    # Entrypoint script is correct and remains unchanged
     cat > entrypoint.sh <<'EOF'
 #!/bin/bash
 set -e
@@ -104,9 +103,11 @@ run_container() {
     local node_id="$1"; [ -z "$node_id" ] && { print_error "ID不能为空"; return 1; };
     local cname="${BASE_CONTAINER_NAME}-${node_id}";
 
+    # 检查并注册节点
     if [ -f "${HOST_CONFIG_DIR}/config.json" ] && ! grep -q "\"id\": \"${node_id}\"" "${HOST_CONFIG_DIR}/config.json"; then
         print_warning "节点 ${node_id} 未在配置中注册，现在开始自动注册..."
-        if ! docker run --rm -T --platform linux/arm64 -v "${HOST_CONFIG_DIR}:/root/.nexus" "${IMAGE_NAME}" \
+        # 【ULTIMATE FIX】Removed the invalid -T flag. A simple non-interactive run.
+        if ! docker run --rm --platform linux/arm64 -v "${HOST_CONFIG_DIR}:/root/.nexus" "${IMAGE_NAME}" \
           nexus-cli register-node --node-id "${node_id}"; then
             print_error "!! 节点 ${node_id} 自动注册失败！请检查上方日志。"; return 1
         fi
@@ -121,8 +122,8 @@ run_container() {
     
     print_info "正在启动节点 ${node_id} (CPU: ${NODE_CPU_LIMIT:-不限}, Mem: ${NODE_MEM_LIMIT:-不限})...";
     
-    # 【ULTIMATE FIX】Add -T to disable pseudo-TTY allocation for the final run command
-    if ! docker run -d -T --name "$cname" --platform linux/arm64 -e NODE_ID="$node_id" -v "${HOST_CONFIG_DIR}:/root/.nexus" $run_opts --restart unless-stopped "$IMAGE_NAME" &>/dev/null; then
+    # 【ULTIMATE FIX】Removed the invalid -T flag. Detached mode (-d) is naturally non-interactive.
+    if ! docker run -d --name "$cname" --platform linux/arm64 -e NODE_ID="$node_id" -v "${HOST_CONFIG_DIR}:/root/.nexus" $run_opts --restart unless-stopped "$IMAGE_NAME" &>/dev/null; then
         print_error "!! 容器 '${cname}' 启动失败。"; return 1
     fi
     print_info "等待容器稳定 (10秒)..." && safe_sleep 10
